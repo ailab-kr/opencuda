@@ -30,6 +30,7 @@ sys.path.insert(0, str(ROOT))
 from oracle import cases as C  # noqa: E402
 
 CHARS = {"trans", "transa", "transb", "uplo", "diag", "side"}
+REALS = {"alpha", "beta"}  # always real, even when the value is integral
 
 
 def _num(v: float) -> str:
@@ -43,16 +44,20 @@ def _num(v: float) -> str:
 def serialize(cases: list[dict]) -> str:
     out = []
     for c in cases:
+        if any(ch.isspace() for ch in c["id"]):
+            raise ValueError(f"case id with white space: {c['id']!r}")
         out.append(f"case {c['id']} {c['fn']} {c['kind']}")
         for name, v in c["args"].items():
             if name in CHARS:
                 out.append(f"c {name} {v}")
             elif isinstance(v, list):
-                out.append(f"v {name} {len(v)} " + " ".join(_num(x) for x in v))
+                out.append(f"v {name} {len(v)} " + " ".join(_num(float(x)) for x in v))
+            elif name in REALS or isinstance(v, float):
+                out.append(f"r {name} {_num(float(v))}")
             elif isinstance(v, int):
                 out.append(f"i {name} {v}")
             else:
-                out.append(f"r {name} {_num(v)}")
+                raise ValueError(f"{c['id']}: cannot encode {name}={v!r}")
         out.append("end")
     return "\n".join(out) + "\n"
 
@@ -77,6 +82,8 @@ def parse(text: str) -> dict[str, dict]:
             results[parts[1]] = cur
         elif tag == "end":
             cur = None
+        elif cur is None:
+            raise ValueError(f"driver output line outside a case: {line[:80]!r}")
         elif tag == "i":
             cur["outputs"][parts[1]] = int(parts[2])
         elif tag == "r":

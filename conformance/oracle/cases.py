@@ -275,5 +275,50 @@ def _tri_well_conditioned(rng, n, lda, uplo, kind):
     return a
 
 
+def alpha_zero_cases(seed: int = 3) -> Iterator[dict]:
+    """alpha == 0: A and B must not be read. They hold inf and NaN, so an
+    implementation that reads them anyway produces NaN."""
+    rng = random.Random(seed)
+    inf, nan = math.inf, math.nan
+    for kind, p in ((F32, "s"), (F64, "d")):
+        m, n, k = 5, 4, 3
+        poison = [inf, nan, -inf] * 20
+        for beta in (R.round_to(0.5, kind), 0.0):
+            lda, ldb, ldc = m, k, m + 1
+            c = _mat(rng, m, n, ldc, kind)
+            yield _case(f"L4.blas.{p}gemm.alpha0_b{beta:g}", f"blas-{p}gemm", "gemm", kind,
+                        {"transa": "N", "transb": "N", "m": m, "n": n, "k": k, "alpha": 0.0,
+                         "a": poison[:lda * k], "lda": lda, "b": poison[:ldb * n], "ldb": ldb,
+                         "beta": beta, "c": c, "ldc": ldc},
+                        {"c": R.gemm("N", "N", m, n, k, 0.0, poison, lda, poison, ldb, beta,
+                                     c, ldc, kind)},
+                        {"c": [abs(beta * v) if not math.isnan(v) else 0.0 for v in c]},
+                        {"c": 1})
+            y = _vals(rng, m, kind)
+            yield _case(f"L4.blas.{p}gemv.alpha0_b{beta:g}", f"blas-{p}gemv", "gemv", kind,
+                        {"trans": "N", "m": m, "n": n, "alpha": 0.0, "a": poison[:m * n],
+                         "lda": m, "x": poison[:n], "incx": 1, "beta": beta, "y": y,
+                         "incy": 1},
+                        {"y": R.gemv("N", m, n, 0.0, poison, m, poison, 1, beta, y, 1, kind)},
+                        {"y": [abs(beta * v) for v in y]}, {"y": 1})
+        if p == "s":
+            c = _mat(rng, n, n, n, kind)
+            beta = R.round_to(2.0, kind)
+            yield _case("L4.blas.ssyrk.alpha0", "blas-ssyrk", "syrk", kind,
+                        {"uplo": "U", "trans": "N", "n": n, "k": k, "alpha": 0.0,
+                         "a": poison[:n * k], "lda": n, "beta": beta, "c": c, "ldc": n},
+                        {"c": R.syrk("U", "N", n, k, 0.0, poison, n, beta, c, n, kind)},
+                        {"c": [abs(beta * v) for v in c]}, {"c": 1})
+            for side in ("L", "R"):
+                na = m if side == "L" else n
+                b = poison[:(m + 1) * n]
+                yield _case(f"L4.blas.strsm.alpha0_{side}", "blas-strsm", "trsm", kind,
+                            {"side": side, "uplo": "U", "trans": "N", "diag": "N", "m": m,
+                             "n": n, "alpha": 0.0, "a": poison[:na * na], "lda": na,
+                             "b": b, "ldb": m + 1},
+                            {"b": R.trsm(side, "U", "N", "N", m, n, 0.0, poison, na, b,
+                                         m + 1, kind)})
+
+
 def all_cases() -> list[dict]:
-    return list(level1_cases()) + list(level2_3_cases())
+    return list(level1_cases()) + list(level2_3_cases()) + list(alpha_zero_cases())

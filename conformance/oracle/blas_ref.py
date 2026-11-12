@@ -204,8 +204,11 @@ def gemv(trans: str, m: int, n: int, alpha: float, a: Sequence[float], lda: int,
     ys = gather(y, rows, incy)
     out = []
     for i in range(rows):
-        arow = [_op(a, lda, trans, i, j) for j in range(cols)]
-        s = exact_dot(arow, xs)
+        if alpha == 0:  # BLAS: alpha == 0 never reads A or x
+            s = Fraction(0)
+        else:
+            arow = [_op(a, lda, trans, i, j) for j in range(cols)]
+            s = exact_dot(arow, xs)
         out.append(_combine(alpha, s, beta, ys[i], kind))
     return scatter(list(y), rows, incy, out)
 
@@ -251,10 +254,13 @@ def gemm(transa: str, transb: str, m: int, n: int, k: int, alpha: float,
     if m <= 0 or n <= 0:
         return out
     for j in range(n):
-        bcol = [_op(b, ldb, transb, p, j) for p in range(k)]
+        bcol = [_op(b, ldb, transb, p, j) for p in range(k)] if alpha != 0 else []
         for i in range(m):
-            arow = [_op(a, lda, transa, i, p) for p in range(k)]
-            s = exact_dot(arow, bcol) if k > 0 else Fraction(0)
+            if alpha == 0 or k == 0:  # BLAS: alpha == 0 never reads A or B
+                s = Fraction(0)
+            else:
+                arow = [_op(a, lda, transa, i, p) for p in range(k)]
+                s = exact_dot(arow, bcol)
             out[i + j * ldc] = _combine(alpha, s, beta, c[i + j * ldc], kind)
     return out
 
@@ -271,13 +277,16 @@ def syrk(uplo: str, trans: str, n: int, k: int, alpha: float,
     for j in range(n):
         rows = range(0, j + 1) if uplo == "U" else range(j, n)
         for i in rows:
+            if alpha == 0 or k == 0:  # BLAS: alpha == 0 never reads A
+                out[i + j * ldc] = _combine(alpha, Fraction(0), beta, c[i + j * ldc], kind)
+                continue
             if trans == "N":
                 ai = [mat_get(a, lda, i, p) for p in range(k)]
                 aj = [mat_get(a, lda, j, p) for p in range(k)]
             else:
                 ai = [mat_get(a, lda, p, i) for p in range(k)]
                 aj = [mat_get(a, lda, p, j) for p in range(k)]
-            s = exact_dot(ai, aj) if k > 0 else Fraction(0)
+            s = exact_dot(ai, aj)
             out[i + j * ldc] = _combine(alpha, s, beta, c[i + j * ldc], kind)
     return out
 
@@ -342,6 +351,11 @@ def trsm(side: str, uplo: str, trans: str, diag: str, m: int, n: int,
     B := alpha*B*inv(op(A)) (side 'R', A n x n). Inputs must be finite."""
     out = list(b)
     if m <= 0 or n <= 0:
+        return out
+    if alpha == 0:  # BLAS: B := 0, neither A nor B is read
+        for j in range(n):
+            for i in range(m):
+                out[i + j * ldb] = 0.0
         return out
     al = _exact(alpha)
     if side == "L":

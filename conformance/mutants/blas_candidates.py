@@ -118,8 +118,11 @@ class Naive:
             return {"y": y}
         rows, cols = (n, m) if tr == "T" else (m, n)
         for i in range(rows):
-            s = _acc(((_op(a["a"], a["lda"], tr, i, j), a["x"][j]) for j in range(cols)), k)
-            v = rnd(a["alpha"] * s, k)
+            if a["alpha"] == 0:
+                v = 0.0
+            else:
+                s = _acc(((_op(a["a"], a["lda"], tr, i, j), a["x"][j]) for j in range(cols)), k)
+                v = rnd(a["alpha"] * s, k)
             if a["beta"] != 0:
                 v = rnd(v + rnd(a["beta"] * y[i], k), k)
             y[i] = v
@@ -139,9 +142,13 @@ class Naive:
         out = list(a["c"])
         for j in range(a["n"]):
             for i in range(a["m"]):
-                s = _acc(((_op(a["a"], a["lda"], a["transa"], i, p),
-                           _op(a["b"], a["ldb"], a["transb"], p, j)) for p in range(a["k"])), k)
-                v = rnd(a["alpha"] * s, k)
+                if a["alpha"] == 0:
+                    v = 0.0
+                else:
+                    s = _acc(((_op(a["a"], a["lda"], a["transa"], i, p),
+                               _op(a["b"], a["ldb"], a["transb"], p, j))
+                              for p in range(a["k"])), k)
+                    v = rnd(a["alpha"] * s, k)
                 q = i + j * a["ldc"]
                 if a["beta"] != 0:
                     v = rnd(v + rnd(a["beta"] * out[q], k), k)
@@ -159,7 +166,7 @@ class Naive:
                     pairs = ((a["a"][i + p * lda], a["a"][j + p * lda]) for p in range(kk))
                 else:
                     pairs = ((a["a"][p + i * lda], a["a"][p + j * lda]) for p in range(kk))
-                s = _acc(pairs, k)
+                s = _acc(pairs, k) if a["alpha"] != 0 else 0.0
                 q = i + j * ldc
                 out[q] = rnd(rnd(a["alpha"] * s, k) + rnd(a["beta"] * out[q], k), k)
         return {"c": out}
@@ -194,6 +201,11 @@ class Naive:
         upper = a["uplo"] == "U"
         out = list(a["b"])
         unit = a["diag"] == "U"
+        if a["alpha"] == 0:
+            for j in range(n):
+                for i in range(m):
+                    out[i + j * ldb] = 0.0
+            return {"b": out}
         if a["side"] == "L":
             lower_op = (not upper) if tr == "N" else upper
 
@@ -343,6 +355,21 @@ def _trsm_ignores_side(self, c):
     return Naive.trsm(self, c2)
 
 
+def _gemm_reads_a_when_alpha_zero(self, c):
+    a, k = c["args"], c["kind"]
+    out = list(a["c"])
+    for j in range(a["n"]):
+        for i in range(a["m"]):
+            s = _acc(((_op(a["a"], a["lda"], a["transa"], i, p),
+                       _op(a["b"], a["ldb"], a["transb"], p, j)) for p in range(a["k"])), k)
+            q = i + j * a["ldc"]
+            v = rnd(a["alpha"] * s, k)
+            if a["beta"] != 0:
+                v = rnd(v + rnd(a["beta"] * out[q], k), k)
+            out[q] = v
+    return {"c": out}
+
+
 def _asum_signed(self, c):
     a, k = c["args"], c["kind"]
     if a["n"] <= 0:
@@ -373,4 +400,5 @@ MUTANTS = [
     _mutant(Naive, "trsm_ignores_side", "trsm", _trsm_ignores_side),
     _mutant(Naive, "asum_signed", "asum", _asum_signed),
     _mutant(Naive, "swap_one_way", "swap", _swap_one_way),
+    _mutant(Naive, "gemm_reads_a_when_alpha_zero", "gemm", _gemm_reads_a_when_alpha_zero),
 ]
