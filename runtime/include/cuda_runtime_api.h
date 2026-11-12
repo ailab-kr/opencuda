@@ -500,7 +500,7 @@ template <class T>
 static inline cudaError_t cudaMemcpyToSymbolAsync(const T &symbol, const void *src,
                                                   size_t count, size_t offset = 0,
                                                   cudaMemcpyKind kind = cudaMemcpyHostToDevice,
-                                                  cudaStream_t stream = nullptr)
+                                                  cudaStream_t stream = 0)
 {
     return cudaMemcpyToSymbolAsync(static_cast<const void *>(&symbol), src, count, offset,
                                    kind, stream);
@@ -510,7 +510,7 @@ template <class T>
 static inline cudaError_t cudaMemcpyFromSymbolAsync(void *dst, const T &symbol,
                                                     size_t count, size_t offset = 0,
                                                     cudaMemcpyKind kind = cudaMemcpyDeviceToHost,
-                                                    cudaStream_t stream = nullptr)
+                                                    cudaStream_t stream = 0)
 {
     return cudaMemcpyFromSymbolAsync(dst, static_cast<const void *>(&symbol), count, offset,
                                      kind, stream);
@@ -519,17 +519,17 @@ static inline cudaError_t cudaMemcpyFromSymbolAsync(void *dst, const T &symbol,
 static inline cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count,
                                           cudaMemcpyKind kind)
 {
-    return cudaMemcpyAsync(dst, src, count, kind, static_cast<cudaStream_t>(nullptr));
+    return cudaMemcpyAsync(dst, src, count, kind, static_cast<cudaStream_t>(0));
 }
 
 static inline cudaError_t cudaMemsetAsync(void *ptr, int value, size_t count)
 {
-    return cudaMemsetAsync(ptr, value, count, static_cast<cudaStream_t>(nullptr));
+    return cudaMemsetAsync(ptr, value, count, static_cast<cudaStream_t>(0));
 }
 
 static inline cudaError_t cudaEventRecord(cudaEvent_t event)
 {
-    return cudaEventRecord(event, static_cast<cudaStream_t>(nullptr));
+    return cudaEventRecord(event, static_cast<cudaStream_t>(0));
 }
 
 static inline cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t event)
@@ -537,15 +537,18 @@ static inline cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t e
     return cudaStreamWaitEvent(stream, event, 0);
 }
 
-/* Kernel function pointers, as in the C++ overloads of the documented API. */
+/* Kernel function pointers, as in the C++ overloads of the documented API
+   (variadic: C++11 and later; older host code uses the const void * form). */
+#if __cplusplus >= 201103L
 template <typename... P>
 static inline cudaError_t cudaLaunchCooperativeKernel(void (*func)(P...), dim3 grid, dim3 block,
                                                       void **args, size_t shared_mem = 0,
-                                                      cudaStream_t stream = nullptr)
+                                                      cudaStream_t stream = 0)
 {
     return cudaLaunchCooperativeKernel(reinterpret_cast<const void *>(func), grid, block, args,
                                        shared_mem, stream);
 }
+#endif
 #endif /* __cplusplus */
 
 #endif /* OCU_CUDA_RUNTIME_API_H */

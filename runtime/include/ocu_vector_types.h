@@ -13,8 +13,13 @@
 /* Clang's CUDA mode: the constructors are host and device functions. */
 #define OCU_VT_ALIGN(n) alignas(n)
 #define OCU_VT_INLINE static inline __attribute__((host)) __attribute__((device))
-#elif defined(__cplusplus)
+#elif defined(__cplusplus) && __cplusplus >= 201103L
 #define OCU_VT_ALIGN(n) alignas(n)
+#define OCU_VT_INLINE static inline
+#elif defined(__cplusplus)
+/* Host C++ before C++11 (Apple clang++ defaults to C++98): the same
+   alignment through the compiler attribute. */
+#define OCU_VT_ALIGN(n) __attribute__((aligned(n)))
 #define OCU_VT_INLINE static inline
 #else
 #define OCU_VT_ALIGN(n) _Alignas(n)
@@ -88,11 +93,16 @@ OCU_VT_FAMILY(double, double, 8, 16, 8, 16)
 #define OCU_DIM3_DEFINED
 struct dim3 {
     unsigned int x, y, z;
-#ifdef __cplusplus
+#if defined(__cplusplus) && __cplusplus >= 201103L
     constexpr dim3(unsigned int vx = 1, unsigned int vy = 1, unsigned int vz = 1)
         : x(vx), y(vy), z(vz) {}
     constexpr dim3(uint3 v) : x(v.x), y(v.y), z(v.z) {}
     constexpr operator uint3() const { return uint3{x, y, z}; }
+#elif defined(__cplusplus)
+    dim3(unsigned int vx = 1, unsigned int vy = 1, unsigned int vz = 1)
+        : x(vx), y(vy), z(vz) {}
+    dim3(uint3 v) : x(v.x), y(v.y), z(v.z) {}
+    operator uint3() const { uint3 r; r.x = x; r.y = y; r.z = z; return r; }
 #endif
 };
 typedef struct dim3 dim3;
