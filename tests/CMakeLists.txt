@@ -327,3 +327,44 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
             -c ${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu -o ${OCU_CC_OUT}/x.o)
   set_tests_properties(ocu_cc_refuses_vendor_path PROPERTIES WILL_FAIL TRUE)
 endif()
+
+# ---- operator table (docs/spec/op-table.md) ------------------------------
+# test_ops <backend>: conformance of one backend's operator table.
+# test_npusim <mode>: the npusim profile (spec section 7), one entry per
+# environment. op_support_table: writes the support table as markdown.
+if(OCU_BACKEND_CPU OR OCU_BACKEND_NPUSIM)
+  add_library(ocu_ops_test_common STATIC ops/ops_common.c)
+  target_link_libraries(ocu_ops_test_common PUBLIC ocu_core m)
+
+  add_executable(test_ops ops/test_ops.c)
+  target_link_libraries(test_ops PRIVATE ocu_ops_test_common)
+
+  add_executable(op_support_table ops/op_support_table.c)
+  target_link_libraries(op_support_table PRIVATE ocu_core)
+  add_test(NAME op_support_table
+    COMMAND op_support_table ${CMAKE_CURRENT_BINARY_DIR}/op_support_table.md)
+endif()
+if(OCU_BACKEND_CPU)
+  add_test(NAME ops_cpu COMMAND test_ops cpu)
+  set_tests_properties(ops_cpu PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+if(OCU_BACKEND_NPUSIM)
+  add_test(NAME ops_npusim COMMAND test_ops npusim)
+  set_tests_properties(ops_npusim PROPERTIES SKIP_RETURN_CODE 77)
+
+  add_executable(test_npusim ops/test_npusim.c)
+  target_link_libraries(test_npusim PRIVATE ocu_ops_test_common)
+  add_test(NAME npusim_profile COMMAND test_npusim basic)
+  set_tests_properties(npusim_profile PROPERTIES SKIP_RETURN_CODE 77)
+  foreach(mode "scratch4;OCU_NPUSIM_SCRATCH_KB=4"
+               "scratch1;OCU_NPUSIM_SCRATCH_KB=1"
+               "tiling0;OCU_NPUSIM_TILING=0"
+               "dtypes_f16;OCU_NPUSIM_DTYPES=f16"
+               "env;OCU_NPUSIM_MEM_MB=8\;OCU_NPUSIM_PLAN_MS=40")
+    list(GET mode 0 tag)
+    list(GET mode 1 envs)
+    add_test(NAME npusim_profile_${tag} COMMAND test_npusim ${tag})
+    set_tests_properties(npusim_profile_${tag} PROPERTIES
+      SKIP_RETURN_CODE 77 ENVIRONMENT "${envs}")
+  endforeach()
+endif()
