@@ -31,9 +31,8 @@ Measured so far (details in [README.md](../../README.md)):
 | Conformance suites L1 to L3 (build, runtime, language) | each documented API call and language feature has a test; mutants show the tests catch seeded defects |
 | More Rodinia programs checked against independent references; remaining programs that need input data | every buildable program has a reference check |
 | Metal: templates, global device variables, unified memory, programs built end to end | Rodinia and the runtime test programs pass on Apple GPUs |
-| OpenCL backend | backend level B0 and B1 on at least one open OpenCL implementation |
+| OpenCL on GPU drivers (it already works on PoCL) | backend tests and Rodinia on at least one GPU OpenCL driver |
 | AMD backend (runtime on top of the vendor's public runtime layers) | B0 and B1 on real hardware |
-| Command-line driver that accepts the usual compiler flags | existing build files compile unmodified |
 | Kernel-time comparison against vendor runtimes on the same chip | speed ratio recorded in result records |
 
 ## Later

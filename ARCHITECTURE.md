@@ -3,9 +3,8 @@
 **English** · [한국어](ARCHITECTURE.ko.md)
 
 This document defines the parts of the repository, the boundaries between them, and the rules that protect those boundaries.
-The work order and schedule are in a plan file outside the repository (`../PLAN.md`).
 
-Current state (night of 2026-11-12): the device interface layer spec, backend registration, the whole CPU backend, reference answers and scoring for 20 BLAS functions, the execution API and headers with CUDA names (written from public documents only), and CPU-path compilation (preprocess, rewrite, C++ compile) all work. Of the 18 CUDA programs in the public Rodinia benchmark, 17 build on the CPU without source changes, and 9 give the same results as an independent reference. For NVIDIA and AMD, only device code compilation is confirmed (execution comes after the hardware arrives).
+Current results by area and platform are in [README.md](README.md#results-so-far).
 
 ## 1. Goal and design principles
 
@@ -53,7 +52,7 @@ code generation   headers          neural-network op APIs
 | `libs/` | Per-library compatibility layers | `libs/cublas`: a subset of `cublas_v2.h` (handle, stream, GEMM family, part of levels 1 and 2, batched strsm). A single CUDA C source passes on both CPU and NVIDIA. `libs/blas`: 20 functions (internal names); 526 reference cases pass on the CPU |
 | `compiler/` | Command compatibility, build tool integration, device math functions | Experimental driver `compiler/probe/ocu_cc.py` (the CPU path uses it to build real programs), CMake function `ocu_add_cpu_cu_executable`, nvcc-compatible command driver `compiler/driver/ocu-nvcc` and toolkit folder (CMake toolchain file `OcuCUDA.cmake`, `docs/compiler-driver.md`) |
 | `conformance/` | Conformance tests, scorer, result format | 526 reference answers for the 20 BLAS functions, error bounds, self-verification |
-| `tuning/` | Speed measurement, auto-tuning, per-chip setting tables | Benchmark tool `ocu_bench`, which follows the measurement rules (PLAN 6.4), and BLAS benchmark `bench_blas` |
+| `tuning/` | Speed measurement, auto-tuning, per-chip setting tables | Benchmark tool `ocu_bench`, which follows the measurement rules (median and slow 10 %), and BLAS benchmark `bench_blas` |
 | `cards/` | Feature cards | Template, 2 part cards, 20 BLAS cards |
 | `tests/` | Basic behavior tests of the skeleton itself | Exists |
 
@@ -158,7 +157,7 @@ This is the flow when a GPU program is built and run. Steps 2 to 4 for GPU chips
 
 On the CPU backend, the "device code bundle" is a table of functions compiled for the CPU. The rest of the flow is the same.
 
-To confirm: check on a real installation which function call the base compiler turns a launch statement into (`PLAN.md` P0-W1-11), and match the entry point in step 4 to it.
+To confirm: check on a real installation which function call the base compiler turns a launch statement into, and match the entry point in step 4 to it.
 
 ### CPU path (works now)
 
@@ -262,13 +261,13 @@ Run the full verification with the single script `tools/check.sh`. It runs gcc a
 
 If you had to change `runtime`, `libs`, or `conformance`, the spec has a gap. Fix the spec and raise `OCU_BACKEND_ABI`.
 
-## 12. Still undecided
+## 12. Decisions and open questions
 
-| Item | When to decide |
+| Item | State |
 |---|---|
-| The prefix `ocu` and public names | Before release |
-| How to write the headers users see | Before release |
-| The format of the device code bundle and the shape of the registration record | After the compiler behavior is confirmed |
-| In phase 0, on which layer of the chip vendor's runtime to build the AMD backend | After the hardware is installed |
-| How to implement the execution unit of the CPU backend | When work on the CPU backend starts |
-| The language of docs and comments | Before release |
+| Project name and code prefix | Decided: OpenCuda; identifiers keep the prefix `ocu` |
+| How the headers users see are written | Decided: CUDA-compatible names, written from public documentation only |
+| Execution unit of the CPU backend | Decided: fibers, deterministic or randomised order, warps of 32 or 64 lanes |
+| Language of docs and comments | Decided: English first; Korean companions (`*.ko.md`) for the main documents |
+| Format of the device code bundle and shape of the registration record | Open: settle after more compilers and chips are covered |
+| Which layer of a vendor runtime the AMD backend builds on | Open: settle on real hardware |
