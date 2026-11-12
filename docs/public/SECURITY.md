@@ -1,13 +1,11 @@
 # Security policy
 
-> DRAFT for review. `SECURITY_CONTACT` is a placeholder for a monitored
-> address or a private reporting form.
+> DRAFT for review.
 
 ## Reporting a vulnerability
 
-Please do not open a public issue for a security problem. Send a report to
-`SECURITY_CONTACT`, or use the repository's private vulnerability reporting
-feature once it is enabled. Include the affected version or commit, the
+Please do not open a public issue for a security problem. Use the repository's
+private vulnerability reporting (the "Security" tab, "Report a vulnerability"). Include the affected version or commit, the
 platform and backend, what you observed, and a way to reproduce it.
 
 We aim to acknowledge a report within [3] working days, give an assessment

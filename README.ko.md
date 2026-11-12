@@ -364,4 +364,7 @@ flowchart LR
 
 ## 라이선스
 
-아직 정하지 않았다. [docs/public/LICENSING-OPTIONS.md](docs/public/LICENSING-OPTIONS.md)를 본다.
+Apache License 2.0. [LICENSE](LICENSE)와 [NOTICE](NOTICE)를 본다.
+
+Apache-2.0에는 특허 사용 허가와 특허 소송 시 허가가 끝나는 조항이 명시되어 있어, 칩 회사와 그 법무팀이
+잘 알려진 조건으로 도입하고 기여할 수 있다.

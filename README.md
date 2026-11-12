@@ -380,4 +380,7 @@ vendor headers, SDK files, sources or binaries. Governance is described in
 
 ## License
 
-Not chosen yet. See [docs/public/LICENSING-OPTIONS.md](docs/public/LICENSING-OPTIONS.md).
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+Apache-2.0 includes an explicit patent licence and patent-retaliation clause, so chip makers
+and their legal teams can adopt and contribute with a well-understood set of terms.

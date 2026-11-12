@@ -1,7 +1,6 @@
 # Backend guide
 
-> DRAFT for review. Names with the `ocu` prefix are working names and will
-> change with the public project name; the structure will not.
+> DRAFT for review. Code identifiers use the short prefix `ocu` (for OpenCuda).
 
 This guide is for chip vendors and community members who want to run
 unmodified CUDA C++ programs on a new chip, GPU or NPU. A backend is one C

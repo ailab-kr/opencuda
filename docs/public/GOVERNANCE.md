@@ -109,8 +109,8 @@ claimed level for two consecutive releases without a plan, moves to an
 
 ## 8. Code of conduct, security, licence
 
-See CODE_OF_CONDUCT.md and SECURITY.md. The licence is [to be chosen; see
-LICENSING-OPTIONS.md].
+See CODE_OF_CONDUCT.md and SECURITY.md. The licence is the Apache License 2.0
+(LICENSE at the repository root).
 
 ## 9. Changing this document
 
