@@ -19,6 +19,17 @@ if(OCU_BACKEND_CPU)
   set_tests_properties(cpu_backend_64workers PROPERTIES
     ENVIRONMENT "OCU_CPU_THREADS=64")
 
+  add_executable(test_cpu_warp backend/test_cpu_warp.c)
+  target_link_libraries(test_cpu_warp PRIVATE ocu_backend_cpu)
+  foreach(mode "warp32;OCU_CPU_WARP=32" "warp64;OCU_CPU_WARP=64"
+               "warp32_random;OCU_CPU_WARP=32\;OCU_CPU_ORDER=random"
+               "warp64_random;OCU_CPU_WARP=64\;OCU_CPU_ORDER=random\;OCU_CPU_SEED=5")
+    list(GET mode 0 tag)
+    list(GET mode 1 envs)
+    add_test(NAME cpu_${tag} COMMAND test_cpu_warp)
+    set_tests_properties(cpu_${tag} PROPERTIES ENVIRONMENT "${envs}")
+  endforeach()
+
   add_executable(test_cpu_regressions backend/test_cpu_regressions.c)
   target_link_libraries(test_cpu_regressions PRIVATE ocu_backend_cpu)
   add_test(NAME cpu_regressions COMMAND test_cpu_regressions)
@@ -34,7 +45,7 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   set(OCU_PROBE_DIR ${PROJECT_SOURCE_DIR}/compiler/probe)
   set(OCU_PROBE_GEN ${CMAKE_CURRENT_BINARY_DIR}/probe_gen)
   set(OCU_PROBE_SOURCES)
-  foreach(name probe_kernel probe_features probe_review)
+  foreach(name probe_kernel probe_features probe_review probe_warp)
     set(out ${OCU_PROBE_GEN}/${name}.cpp)
     add_custom_command(
       OUTPUT ${out}
@@ -54,6 +65,9 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   add_test(NAME probe_cpu_random COMMAND test_probe_cpu)
   set_tests_properties(probe_cpu_random PROPERTIES
     ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_SEED=11")
+  add_test(NAME probe_cpu_warp64 COMMAND test_probe_cpu)
+  set_tests_properties(probe_cpu_warp64 PROPERTIES
+    ENVIRONMENT "OCU_CPU_WARP=64;OCU_CPU_ORDER=random;OCU_CPU_SEED=3")
 
   add_test(NAME probe_cpu_rewrite_unit
     COMMAND ${Python3_EXECUTABLE} -m unittest test_cpu_rewrite

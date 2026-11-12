@@ -17,6 +17,11 @@ void run_square_int(const int *in, int *out, int w, int h);
 void run_reverse(int *data, int blocks, int threads);
 void run_histogram(const int *values, int n, unsigned *bins);
 void run_affine(float *v, int n);
+// From probe_warp.cu
+void run_warp_sum(const float *in, float *out, int blocks, int threads);
+void run_group_max(const int *in, int *out, int blocks, int threads);
+void run_misc(const int *in, int *bcast, int *scan, unsigned *ballots,
+              int *any_all, int blocks, int threads);
 // From probe_review.cu
 void run_rotate(float *data, int blocks);
 void run_fill(int *a, double *b, int n);
@@ -169,6 +174,57 @@ int main()
         for (int i = 0; i < n; ++i) bad += v[i] != -3.0f * float(i);
         CHECK(bad == 0);
         dev_free(v); dev_free(f);
+    }
+
+    { // warp shuffles and votes (probe_warp.cu); warp size 32 or 64
+        const int blocks = 3, threads = 128, n = blocks * threads;
+        const int W = static_cast<int>(ocu_cpu_warp_size());
+        float *fin = dev_alloc<float>(n), *fout = dev_alloc<float>(n / 32);
+        int *iin = dev_alloc<int>(n), *imax = dev_alloc<int>(n);
+        int *bc = dev_alloc<int>(n), *scan = dev_alloc<int>(n);
+        unsigned *ballots = dev_alloc<unsigned>(n / 32);
+        int *anyall = dev_alloc<int>(2 * (n / 32));
+        for (int i = 0; i < n; ++i) { fin[i] = float(i % 13); iin[i] = (i * 37) % 101; }
+        run_warp_sum(fin, fout, blocks, threads);
+        CHECK(ocu_cpu::last_status() == OCU_OK);
+        run_group_max(iin, imax, blocks, threads);
+        CHECK(ocu_cpu::last_status() == OCU_OK);
+        run_misc(iin, bc, scan, ballots, anyall, blocks, threads);
+        CHECK(ocu_cpu::last_status() == OCU_OK);
+        int bad = 0;
+        for (int w = 0; w < n / W; ++w) { // one sum per hardware warp
+            float want = 0;
+            for (int l = 0; l < W; ++l) want += fin[w * W + l];
+            bad += fout[w] != want;
+        }
+        CHECK(bad == 0);
+        bad = 0;
+        for (int i = 0; i < n; ++i) { // explicit width 32: same for 32 and 64
+            int g = i - i % 32, mx = 0, run = 0;
+            for (int l = 0; l < 32; ++l) mx = iin[g + l] > mx ? iin[g + l] : mx;
+            for (int l = 0; l <= i % 32; ++l) run += iin[g + l];
+            bad += imax[i] != mx;
+            bad += bc[i] != iin[g + 3];
+            bad += scan[i] != run;
+        }
+        CHECK(bad == 0);
+        if (W == 32) { // votes are warp-wide: only the 32-lane case is CUDA's
+            bad = 0;
+            for (int g = 0; g < n / 32; ++g) {
+                unsigned want = 0;
+                int any7 = 0;
+                for (int l = 0; l < 32; ++l) {
+                    want |= unsigned(iin[g * 32 + l] % 3 == 0) << l;
+                    any7 |= iin[g * 32 + l] == 7;
+                }
+                bad += ballots[g] != want;
+                bad += anyall[2 * g] != any7;
+                bad += anyall[2 * g + 1] != 1;
+            }
+            CHECK(bad == 0);
+        }
+        dev_free(fin); dev_free(fout); dev_free(iin); dev_free(imax);
+        dev_free(bc); dev_free(scan); dev_free(ballots); dev_free(anyall);
     }
 
     ocu_cpu::backend()->dev_close(ocu_cpu::device());
