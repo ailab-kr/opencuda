@@ -1,0 +1,9 @@
+build/
+out/
+__pycache__/
+*.pyc
+.venv/
+conformance/results/*.json
+!conformance/results/.gitkeep
+.vscode/
+.idea/

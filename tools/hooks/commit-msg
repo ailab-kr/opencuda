@@ -1,0 +1,47 @@
+#!/bin/sh
+# commit-msg hook: enforce the commit trailers described in CONTRIBUTING.md.
+#
+#   Role: spec | tests | impl | review | perf | infra | docs
+#   Card: <card id>            required for spec, tests, impl, perf
+#   Spec-Source: <url or text> required for impl
+#
+# Install once per clone:  git config core.hooksPath tools/hooks
+
+msg_file="$1"
+# Ignore comment lines git adds to the editor buffer.
+body=$(grep -v '^#' "$msg_file")
+
+fail() {
+    echo "commit-msg: $1" >&2
+    echo "commit-msg: see CONTRIBUTING.md (commit format)" >&2
+    exit 1
+}
+
+trailer() {
+    printf '%s\n' "$body" | sed -n "s/^$1:[[:space:]]*//p" | head -n 1
+}
+
+subject=$(printf '%s\n' "$body" | sed -n '1p')
+[ -n "$subject" ] || fail "empty subject line"
+case "$subject" in
+    *:\ *) ;;
+    *) fail "subject must look like '<area>: <summary>'" ;;
+esac
+
+role=$(trailer Role)
+[ -n "$role" ] || fail "missing 'Role:' trailer"
+case "$role" in
+    spec|tests|impl|review|perf|infra|docs) ;;
+    *) fail "unknown Role '$role'" ;;
+esac
+
+case "$role" in
+    spec|tests|impl|perf)
+        [ -n "$(trailer Card)" ] || fail "Role $role needs a 'Card:' trailer" ;;
+esac
+
+if [ "$role" = "impl" ]; then
+    [ -n "$(trailer Spec-Source)" ] || fail "Role impl needs a 'Spec-Source:' trailer"
+fi
+
+exit 0

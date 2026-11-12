@@ -1,0 +1,3 @@
+add_library(ocu_backend_cpu STATIC cpu_backend.c)
+target_include_directories(ocu_backend_cpu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ocu_backend_cpu PUBLIC ocu_backend_interface)

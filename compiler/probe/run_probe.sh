@@ -1,0 +1,78 @@
+#!/bin/sh
+# Compiler probe (PLAN P0-W1-11): what does clang need to build a .cu file
+# for each target without any vendor SDK headers or libraries?
+#
+# Usage: compiler/probe/run_probe.sh [out_dir]
+# Requires: clang/clang++ and llvm-tools (tested with LLVM 18.1.3).
+# Findings are recorded in docs/compiler-probe.md.
+#
+# --cuda-path points at an empty folder so a vendor CUDA installation on the
+# machine can never be picked up, even by accident.
+
+set -u
+# LLVM helper tools (lld, llvm-readelf) are not always on PATH.
+for d in /usr/lib/llvm-18/bin /usr/lib/llvm-19/bin /usr/lib/llvm-20/bin; do
+    [ -d "$d" ] && PATH="$d:$PATH"
+done
+export PATH
+
+here=$(cd "$(dirname "$0")" && pwd)
+out=${1:-/tmp/ocu-probe}
+empty="$out/empty-cuda-path"
+rm -rf "$out"
+mkdir -p "$out" "$empty"
+src="$here/probe_kernel.cu"
+clean="-nocudainc -nocudalib --cuda-path=$empty -Wno-unknown-cuda-version"
+hipclean="-nogpuinc -nogpulib"
+
+step() { printf '\n== %s ==\n' "$1"; }
+
+# run <log name> <command...>: run, show the first lines of output, report.
+run() {
+    log="$out/$1.log"
+    shift
+    "$@" >"$log" 2>&1
+    rc=$?
+    head -n 12 "$log"
+    if [ "$rc" -eq 0 ]; then echo "result: OK"; else echo "result: FAILED ($rc)"; fi
+    return "$rc"
+}
+
+step "1. NVIDIA device code (sm_80), CUDA mode"
+if run nv_device clang++ -x cuda $clean --cuda-gpu-arch=sm_80 \
+        --cuda-device-only -S -o "$out/k_nv.ptx" "$src"; then
+    echo "kernels in PTX: $(grep -cE '\.entry' "$out/k_nv.ptx")"
+fi
+
+step "2. Host side, CUDA mode: undefined symbols the launch needs"
+if run nv_host clang++ -x cuda $clean --cuda-gpu-arch=sm_80 \
+        --cuda-host-only -c -o "$out/h_nv.o" "$src"; then
+    nm -u "$out/h_nv.o" | sed 's/^/  /'
+fi
+
+for arch in gfx1100 gfx1201; do
+    step "3. AMD device code ($arch), HIP mode on the same .cu"
+    if run "amd_$arch" clang++ -x hip $hipclean --offload-arch="$arch" \
+            --cuda-device-only --no-gpu-bundle-output -c \
+            -o "$out/k_$arch.o" "$src"; then
+        llvm-readelf -h "$out/k_$arch.o" | grep -E 'Machine|Flags' | sed 's/^/  /'
+        llvm-nm "$out/k_$arch.o" | grep ' T ' | sed 's/^/  kernel: /'
+    fi
+done
+
+step "4. Host side, HIP mode: undefined symbols the launch needs"
+if run amd_host clang++ -x hip $hipclean --offload-arch=gfx1201 \
+        --cuda-host-only -c -o "$out/h_amd.o" "$src"; then
+    nm -u "$out/h_amd.o" | sed 's/^/  /'
+fi
+
+step "5. Plain C++ for the CPU backend: is the launch syntax accepted?"
+clang++ -x c++ -std=c++17 -fdeclspec -fsyntax-only "$src" 2>&1 \
+    | grep -m 3 'error'
+echo "(errors above mean plain C++ cannot be used as-is)"
+
+step "6. CUDA host pass: is a kernel body emitted for the host?"
+if [ -f "$out/h_nv.o" ]; then
+    nm -C "$out/h_nv.o" | grep -E 'saxpy|block_sum' | sed 's/^/  /'
+fi
+echo "(only __device_stub__ symbols means the body is device-only)"

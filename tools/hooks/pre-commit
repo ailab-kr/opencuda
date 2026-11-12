@@ -1,0 +1,26 @@
+#!/bin/sh
+# pre-commit hook: keep tests and implementation in separate commits.
+#
+# Test paths:  conformance/suites/, conformance/tolerances/, conformance/oracle/
+# Impl paths:  backends/, runtime/, libs/, compiler/, tuning/
+# A commit may touch one group or the other, never both.
+
+staged=$(git diff --cached --name-only --diff-filter=ACMRD)
+[ -n "$staged" ] || exit 0
+
+tests=$(printf '%s\n' "$staged" | grep -E '^conformance/(suites|tolerances|oracle)/' || true)
+impl=$(printf '%s\n' "$staged" | grep -E '^(backends|runtime|libs|compiler|tuning)/' || true)
+
+if [ -n "$tests" ] && [ -n "$impl" ]; then
+    if [ "${OCU_ALLOW_MIXED:-}" = "1" ]; then
+        echo "pre-commit: mixed test+impl commit allowed by OCU_ALLOW_MIXED=1" >&2
+        exit 0
+    fi
+    echo "pre-commit: this commit changes both tests and implementation." >&2
+    echo "pre-commit: split it (see CONTRIBUTING.md). Test files:" >&2
+    printf '  %s\n' $tests >&2
+    echo "pre-commit: implementation files:" >&2
+    printf '  %s\n' $impl >&2
+    exit 1
+fi
+exit 0

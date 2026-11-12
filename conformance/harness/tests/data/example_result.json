@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "run": { "date": "2026-11-12", "suite_version": "0.0.1", "set": "public" },
+  "device": { "vendor": "none", "model": "example", "driver": "none", "os": "example" },
+  "impl": { "name": "example", "version": "0000000", "backend": "cpu" },
+  "tests": [
+    { "id": "L4.blas.saxpy.n1024_incx1", "card": "blas-saxpy", "level": "L4",
+      "status": "pass", "max_rel_err": 0.0, "tolerance": 1e-6,
+      "time_ms_median": 1.0, "baseline_native_ms": 0.9, "speed_ratio": 0.9 },
+    { "id": "L4.blas.sdot.n1024_incx1", "card": "blas-sdot", "level": "L4",
+      "status": "pass", "max_rel_err": 2e-7, "tolerance": 1e-6,
+      "time_ms_median": 2.0, "baseline_native_ms": 1.0, "speed_ratio": 0.5 },
+    { "id": "L2.runtime.malloc.zero_bytes", "card": "runtime-malloc", "level": "L2",
+      "status": "fail" },
+    { "id": "L2.runtime.unified.basic", "card": "runtime-unified", "level": "L2",
+      "status": "skip", "reason": "example of a skipped test" }
+  ]
+}
