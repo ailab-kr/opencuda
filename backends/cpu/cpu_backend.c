@@ -1,26 +1,18 @@
 /*
- * CPU reference backend -- skeleton.
+ * CPU reference backend: devices, modules and the backend table.
  *
  * Purpose: run device code on the CPU so correctness tests need no GPU.
- * Only device enumeration is implemented. Every other entry returns
- * OCU_ERR_NOT_IMPLEMENTED until the real implementation lands
- * (see PLAN.md P0-W3-01, P0-W3-02 and ARCHITECTURE.md "CPU reference backend").
+ * Memory lives in cpu_memory.c, queues and markers in cpu_queue.c, kernel
+ * execution in cpu_exec.c. See ARCHITECTURE.md, "CPU reference backend".
  */
 #include "ocu_backend.h"
 #include "ocu_backend_cpu.h"
+#include "cpu_internal.h"
 
 #include <stdlib.h>
 #include <string.h>
 
-/* OCU_CPU_WARP=32|64 lets tests run with either warp size without a GPU. */
-static uint32_t cpu_warp_size(void)
-{
-    const char *v = getenv("OCU_CPU_WARP");
-    if (v != NULL && strcmp(v, "64") == 0) {
-        return 64u;
-    }
-    return 32u;
-}
+static ocu_device g_device; /* the one CPU device */
 
 static ocu_status cpu_dev_count(uint32_t *count)
 {
@@ -41,103 +33,118 @@ static ocu_status cpu_dev_info(uint32_t index, ocu_dev_info *info)
     }
     memset(info, 0, sizeof(*info));
     strncpy(info->name, "OCU CPU reference device", sizeof(info->name) - 1);
-    info->total_memory_bytes = 0; /* filled in with the memory implementation */
-    info->warp_size = cpu_warp_size();
-    info->max_threads_per_block = 1024u;
-    info->max_block_dim[0] = 1024u;
-    info->max_block_dim[1] = 1024u;
-    info->max_block_dim[2] = 64u;
-    info->max_grid_dim[0] = 2147483647u;
-    info->max_grid_dim[1] = 65535u;
-    info->max_grid_dim[2] = 65535u;
-    info->max_shared_memory_per_block = 48u * 1024u;
+    info->total_memory_bytes = cpu_total_memory();
+    info->warp_size = cpu_get_config()->warp_size;
+    info->max_threads_per_block = CPU_MAX_THREADS_PER_BLOCK;
+    info->max_block_dim[0] = CPU_MAX_BLOCK_X;
+    info->max_block_dim[1] = CPU_MAX_BLOCK_Y;
+    info->max_block_dim[2] = CPU_MAX_BLOCK_Z;
+    info->max_grid_dim[0] = CPU_MAX_GRID_X;
+    info->max_grid_dim[1] = CPU_MAX_GRID_Y;
+    info->max_grid_dim[2] = CPU_MAX_GRID_Z;
+    info->max_shared_memory_per_block = CPU_MAX_SHARED_BYTES;
     info->supports_unified_memory = 1u;
     return OCU_OK;
 }
 
-/* ---- not implemented yet -------------------------------------------- */
-
 static ocu_status cpu_dev_open(uint32_t index, ocu_device **dev)
-{ (void)index; (void)dev; return OCU_ERR_NOT_IMPLEMENTED; }
+{
+    if (dev == NULL) {
+        return OCU_ERR_INVALID_VALUE;
+    }
+    if (index != 0u) {
+        return OCU_ERR_INVALID_DEVICE;
+    }
+    *dev = &g_device;
+    return OCU_OK;
+}
 
 static ocu_status cpu_dev_close(ocu_device *dev)
-{ (void)dev; return OCU_ERR_NOT_IMPLEMENTED; }
-
-static ocu_status cpu_mem_alloc(ocu_device *dev, size_t bytes, void **ptr)
-{ (void)dev; (void)bytes; (void)ptr; return OCU_ERR_NOT_IMPLEMENTED; }
-
-static ocu_status cpu_mem_free(ocu_device *dev, void *ptr)
-{ (void)dev; (void)ptr; return OCU_ERR_NOT_IMPLEMENTED; }
-
-static ocu_status cpu_mem_copy(ocu_device *dev, ocu_queue *queue, void *dst,
-                               const void *src, size_t bytes, ocu_copy_dir dir)
 {
-    (void)dev; (void)queue; (void)dst; (void)src; (void)bytes; (void)dir;
-    return OCU_ERR_NOT_IMPLEMENTED;
+    return dev == &g_device ? OCU_OK : OCU_ERR_INVALID_DEVICE;
 }
 
-static ocu_status cpu_mem_set(ocu_device *dev, ocu_queue *queue, void *dst,
-                              int value, size_t bytes)
-{
-    (void)dev; (void)queue; (void)dst; (void)value; (void)bytes;
-    return OCU_ERR_NOT_IMPLEMENTED;
-}
+/* ---- modules ----------------------------------------------------------- */
 
-static ocu_status cpu_mem_info(ocu_device *dev, uint64_t *free_bytes,
-                               uint64_t *total_bytes)
-{ (void)dev; (void)free_bytes; (void)total_bytes; return OCU_ERR_NOT_IMPLEMENTED; }
-
-static ocu_status cpu_host_alloc_pinned(ocu_device *dev, size_t bytes, void **ptr)
-{ (void)dev; (void)bytes; (void)ptr; return OCU_ERR_NOT_IMPLEMENTED; }
-
-static ocu_status cpu_host_free_pinned(ocu_device *dev, void *ptr)
-{ (void)dev; (void)ptr; return OCU_ERR_NOT_IMPLEMENTED; }
-
-static ocu_status cpu_queue_create(ocu_device *dev, ocu_queue **queue)
-{ (void)dev; (void)queue; return OCU_ERR_NOT_IMPLEMENTED; }
-
-static ocu_status cpu_queue_destroy(ocu_queue *queue)
-{ (void)queue; return OCU_ERR_NOT_IMPLEMENTED; }
-
-static ocu_status cpu_queue_sync(ocu_queue *queue)
-{ (void)queue; return OCU_ERR_NOT_IMPLEMENTED; }
-
-static ocu_status cpu_queue_query(ocu_queue *queue)
-{ (void)queue; return OCU_ERR_NOT_IMPLEMENTED; }
+typedef struct module_box {
+    ocu_module module;   /* first member: the handle points here */
+    ocu_kernel *kernels; /* one per image entry */
+} module_box;
 
 static ocu_status cpu_module_load(ocu_device *dev, const void *image,
                                   size_t bytes, ocu_module **module)
-{ (void)dev; (void)image; (void)bytes; (void)module; return OCU_ERR_NOT_IMPLEMENTED; }
+{
+    if (dev == NULL) {
+        return OCU_ERR_INVALID_DEVICE;
+    }
+    if (image == NULL || module == NULL || bytes != sizeof(ocu_cpu_image)) {
+        return OCU_ERR_INVALID_VALUE;
+    }
+    const ocu_cpu_image *img = image;
+    if (img->magic != OCU_CPU_IMAGE_MAGIC ||
+        img->version != OCU_CPU_IMAGE_VERSION) {
+        return OCU_ERR_INVALID_VALUE;
+    }
+    if (img->count > 0 && img->entries == NULL) {
+        return OCU_ERR_INVALID_VALUE;
+    }
+    for (uint32_t i = 0; i < img->count; ++i) {
+        if (img->entries[i].name == NULL || img->entries[i].fn == NULL) {
+            return OCU_ERR_INVALID_VALUE;
+        }
+    }
+    module_box *box = calloc(1, sizeof(*box));
+    if (box == NULL) {
+        return OCU_ERR_OUT_OF_MEMORY;
+    }
+    if (img->count > 0) {
+        box->kernels = calloc(img->count, sizeof(*box->kernels));
+        if (box->kernels == NULL) {
+            free(box);
+            return OCU_ERR_OUT_OF_MEMORY;
+        }
+    }
+    box->module.image = img;
+    for (uint32_t i = 0; i < img->count; ++i) {
+        box->kernels[i].module = &box->module;
+        box->kernels[i].fn = img->entries[i].fn;
+    }
+    *module = &box->module;
+    return OCU_OK;
+}
 
 static ocu_status cpu_module_unload(ocu_module *module)
-{ (void)module; return OCU_ERR_NOT_IMPLEMENTED; }
+{
+    if (module == NULL) {
+        return OCU_ERR_INVALID_HANDLE;
+    }
+    module_box *box = (module_box *)module;
+    free(box->kernels);
+    free(box);
+    return OCU_OK;
+}
 
 static ocu_status cpu_module_get_kernel(ocu_module *module, const char *name,
                                         ocu_kernel **kernel)
-{ (void)module; (void)name; (void)kernel; return OCU_ERR_NOT_IMPLEMENTED; }
+{
+    if (module == NULL) {
+        return OCU_ERR_INVALID_HANDLE;
+    }
+    if (name == NULL || kernel == NULL) {
+        return OCU_ERR_INVALID_VALUE;
+    }
+    module_box *box = (module_box *)module;
+    const ocu_cpu_image *img = module->image;
+    for (uint32_t i = 0; i < img->count; ++i) {
+        if (strcmp(img->entries[i].name, name) == 0) {
+            *kernel = &box->kernels[i];
+            return OCU_OK;
+        }
+    }
+    return OCU_ERR_NOT_FOUND;
+}
 
-static ocu_status cpu_kernel_launch(ocu_queue *queue, ocu_kernel *kernel,
-                                    const ocu_launch_params *params)
-{ (void)queue; (void)kernel; (void)params; return OCU_ERR_NOT_IMPLEMENTED; }
-
-static ocu_status cpu_marker_create(ocu_device *dev, ocu_marker **marker)
-{ (void)dev; (void)marker; return OCU_ERR_NOT_IMPLEMENTED; }
-
-static ocu_status cpu_marker_destroy(ocu_marker *marker)
-{ (void)marker; return OCU_ERR_NOT_IMPLEMENTED; }
-
-static ocu_status cpu_marker_record(ocu_marker *marker, ocu_queue *queue)
-{ (void)marker; (void)queue; return OCU_ERR_NOT_IMPLEMENTED; }
-
-static ocu_status cpu_marker_wait(ocu_marker *marker)
-{ (void)marker; return OCU_ERR_NOT_IMPLEMENTED; }
-
-static ocu_status cpu_marker_query(ocu_marker *marker)
-{ (void)marker; return OCU_ERR_NOT_IMPLEMENTED; }
-
-static ocu_status cpu_marker_elapsed_ms(ocu_marker *start, ocu_marker *end,
-                                        float *milliseconds)
-{ (void)start; (void)end; (void)milliseconds; return OCU_ERR_NOT_IMPLEMENTED; }
+/* ---- table --------------------------------------------------------------- */
 
 static const ocu_backend cpu_backend = {
     .abi = OCU_BACKEND_ABI,

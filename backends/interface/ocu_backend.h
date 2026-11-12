@@ -37,7 +37,8 @@ typedef enum ocu_status {
     OCU_ERR_LAUNCH_FAILED,
     OCU_ERR_NOT_SUPPORTED,    /* the chip cannot do this */
     OCU_ERR_NOT_IMPLEMENTED,  /* the backend does not do this yet */
-    OCU_ERR_UNKNOWN
+    OCU_ERR_UNKNOWN,
+    OCU_ERR_NOT_FOUND         /* e.g. no kernel with that name in a module */
 } ocu_status;
 
 /* ---- opaque handles (owned by the backend) -------------------------- */
@@ -106,7 +107,11 @@ typedef struct ocu_backend {
     ocu_status (*host_alloc_pinned)(ocu_device *dev, size_t bytes, void **ptr);
     ocu_status (*host_free_pinned)(ocu_device *dev, void *ptr);
 
-    /* queues: work submitted to one queue runs in submission order */
+    /*
+     * queues: work submitted to one queue runs in submission order.
+     * An error raised by queued work is reported by the next queue_sync or
+     * queue_query on that queue, then cleared.
+     */
     ocu_status (*queue_create)(ocu_device *dev, ocu_queue **queue);
     ocu_status (*queue_destroy)(ocu_queue *queue);
     ocu_status (*queue_sync)(ocu_queue *queue);
@@ -123,11 +128,22 @@ typedef struct ocu_backend {
     ocu_status (*module_get_kernel)(ocu_module *module, const char *name,
                                     ocu_kernel **kernel);
 
-    /* execution */
+    /*
+     * execution
+     * Argument values are copied before kernel_launch returns, so the caller
+     * may reuse `params->args` storage right away. `queue == NULL` runs the
+     * kernel to completion before returning.
+     */
     ocu_status (*kernel_launch)(ocu_queue *queue, ocu_kernel *kernel,
                                 const ocu_launch_params *params);
 
-    /* markers */
+    /*
+     * markers
+     * A marker that was never recorded is complete: query returns OCU_OK and
+     * wait returns at once. elapsed_ms needs two recorded, completed markers
+     * (OCU_ERR_INVALID_HANDLE if either was never recorded, OCU_ERR_NOT_READY
+     * if either is still pending).
+     */
     ocu_status (*marker_create)(ocu_device *dev, ocu_marker **marker);
     ocu_status (*marker_destroy)(ocu_marker *marker);
     ocu_status (*marker_record)(ocu_marker *marker, ocu_queue *queue);
@@ -161,6 +177,7 @@ static inline const char *ocu_status_name(ocu_status s)
     case OCU_ERR_NOT_SUPPORTED:   return "OCU_ERR_NOT_SUPPORTED";
     case OCU_ERR_NOT_IMPLEMENTED: return "OCU_ERR_NOT_IMPLEMENTED";
     case OCU_ERR_UNKNOWN:         return "OCU_ERR_UNKNOWN";
+    case OCU_ERR_NOT_FOUND:       return "OCU_ERR_NOT_FOUND";
     }
     return "OCU_ERR_UNKNOWN";
 }
