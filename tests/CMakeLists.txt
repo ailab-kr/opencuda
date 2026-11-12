@@ -46,9 +46,11 @@ if(OCU_BACKEND_CPU)
   set_tests_properties(cpu_pool_random_4workers PROPERTIES
     ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_THREADS=4")
 
-  add_executable(test_cpu_fork backend/test_cpu_fork.c)
-  target_link_libraries(test_cpu_fork PRIVATE ocu_backend_cpu)
-  add_test(NAME cpu_fork COMMAND test_cpu_fork)
+  if(NOT WIN32) # no fork() on Windows
+    add_executable(test_cpu_fork backend/test_cpu_fork.c)
+    target_link_libraries(test_cpu_fork PRIVATE ocu_backend_cpu)
+    add_test(NAME cpu_fork COMMAND test_cpu_fork)
+  endif()
 
   add_executable(test_cpu_regressions backend/test_cpu_regressions.c)
   target_link_libraries(test_cpu_regressions PRIVATE ocu_backend_cpu)
@@ -112,12 +114,18 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
     COMMAND ${Python3_EXECUTABLE} -m ocu_conf.blas_run $<TARGET_FILE:blas_driver>
             --out ${CMAKE_CURRENT_BINARY_DIR}/blas_cpu_result.json
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/conformance/harness)
-  set_tests_properties(conformance_blas_cpu PROPERTIES ENVIRONMENT "OCU_BACKEND=cpu")
+  # A cross-compiled driver runs through the emulator CMake knows (Wine).
+  set(_ocu_launch "")
+  if(CMAKE_CROSSCOMPILING_EMULATOR)
+    string(JOIN " " _ocu_emu ${CMAKE_CROSSCOMPILING_EMULATOR})
+    set(_ocu_launch ";OCU_DRIVER_LAUNCHER=${_ocu_emu}")
+  endif()
+  set_tests_properties(conformance_blas_cpu PROPERTIES ENVIRONMENT "OCU_BACKEND=cpu${_ocu_launch}")
   add_test(NAME conformance_blas_cpu_queue
     COMMAND ${Python3_EXECUTABLE} -m ocu_conf.blas_run $<TARGET_FILE:blas_driver>
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/conformance/harness)
   set_tests_properties(conformance_blas_cpu_queue PROPERTIES
-    ENVIRONMENT "OCU_BACKEND=cpu;OCU_DRIVER_QUEUE=1;OCU_CPU_ORDER=random")
+    ENVIRONMENT "OCU_BACKEND=cpu;OCU_DRIVER_QUEUE=1;OCU_CPU_ORDER=random${_ocu_launch}")
 endif()
 
 # ---- ocu_cc.py (probe driver): every target, and a CPU program end to end

@@ -342,6 +342,10 @@ static void test_stack_overflow_reported(void)
     if (kb == NULL || strcmp(kb, "16") != 0) {
         return; /* runs in the ctest variant with 16 KiB stacks */
     }
+#if defined(_WIN32)
+    return; /* Windows fibers run on system stacks: the system's guard page
+               reports an overflow as a stack-overflow exception instead */
+#endif
 #if defined(__SANITIZE_ADDRESS__)
     return; /* ASan moves locals to its heap "fake stack": no overflow */
 #elif defined(__has_feature)

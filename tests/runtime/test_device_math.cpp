@@ -76,6 +76,25 @@ int main()
         std::printf("test_device_math: SKIP (long double is no more precise than double here)\n");
         return 0;
     }
+#if defined(_WIN32)
+    // The MinGW long double functions use x87 instructions whose argument
+    // reduction near multiples of pi is not accurate enough to serve as the
+    // reference (sinl near pi is off by several double ulps). The library is
+    // measured on Linux and macOS hosts.
+    std::printf("test_device_math: SKIP (no accurate long double reference on this host)\n");
+    return 0;
+#endif
+    {
+        // The library needs an exact (single-rounding) fma, as device targets
+        // have. Some host C libraries emulate fma inexactly (seen with
+        // MinGW-w64 without hardware FMA): measuring the library there would
+        // measure that emulation.
+        volatile double a = 1.0 + 0x1p-30, b = 1.0 - 0x1p-30, c = -1.0;
+        if (__builtin_fma(a, b, c) != -0x1p-60) {
+            std::printf("test_device_math: SKIP (the host fma is not exact here)\n");
+            return 0;
+        }
+    }
     std::mt19937_64 g(2026);
     using namespace ocu_dm;
     // exp, log families
