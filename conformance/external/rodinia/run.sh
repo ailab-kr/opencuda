@@ -143,30 +143,89 @@ if (cd $C/streamcluster && build sc streamcluster_cuda_cpu.cpp streamcluster_cud
     r=$(cmp_num $C/streamcluster/ocu.txt $O/streamcluster/ref.txt 1e-5); report streamcluster "$(verdict "$r")" "$r vs OpenMP"
 else report streamcluster BUILD-FAIL "$(head -c 200 $C/streamcluster/.ocu/build.log)"; fi
 
-# Built and run to completion; no independent check yet.
-run_only() { # run_only <name> <dir> <exe> <run command> -- <build args>
-    local name=$1 dir=$2 exe=$3 cmd=$4; shift 5
-    if (cd $dir && build $exe "$@"); then
-        if (cd $dir && timeout 300 sh -c "$cmd" > .ocu/run.log 2>&1); then
-            report $name BUILT "ran to completion (no independent check yet)"
-        else report $name FAIL "run failed: $(tail -c 150 $dir/.ocu/run.log)"; fi
-    else report $name BUILD-FAIL "$(grep -m1 error $dir/.ocu/build.log | head -c 200)"; fi
-}
-run_only gaussian $C/gaussian gaussian "./gaussian -s 256 -q" -- gaussian.cu
-run_only backprop $C/backprop backprop "./backprop 65536" -- backprop_cuda.cu backprop.c facetrain.c imagenet.c
-run_only srad_v2 $C/srad/srad_v2 srad "./srad 512 512 0 127 0 127 0.5 2" -- srad.cu
-run_only particlefilter $C/particlefilter pf "./pf -x 128 -y 128 -z 10 -np 1000" -- ex_particle_CUDA_float_seq.cu
+# gaussian: the solution against a double-precision elimination with partial
+# pivoting (gaussian_ref.py, input from the program's own matrix formula). The
+# program prints its solution only in verbose mode, which no flag turns on, so
+# gaussian_dump.cpp calls the program's solver and prints the result. Tolerance
+# 2e-5: numcmp's bound is relative to max(1,|y|), so for these entries (all
+# below 0.06) it is absolute; float elimination without pivoting differs from
+# the reference by at most 1.03e-5.
+if (cd $C/gaussian && build gaussian gaussian.cu "$HERE/gaussian_dump.cpp" -- -Dmain=ocu_prog_main); then
+    python3 "$HERE/gaussian_ref.py" 256 $C/gaussian/input.txt $C/gaussian/ref.txt
+    (cd $C/gaussian && ./gaussian input.txt > ocu.txt)
+    r=$(cmp_num $C/gaussian/ocu.txt $C/gaussian/ref.txt 2e-5); report gaussian "$(verdict "$r")" "$r vs double-precision reference"
+else report gaussian BUILD-FAIL "$(head -c 200 $C/gaussian/.ocu/build.log)"; fi
 
-# Built only (they need input files this script does not generate).
+# backprop: the hidden and output layers after one training step against the
+# OpenMP version (same seed, same input size). The program prints nothing
+# about its results, so backprop_dump.cpp makes the calls its setup() makes.
+# Tolerance 1e-6: both versions sum in float in a different order; observed
+# difference 6e-8. The CUDA version does not write the input-layer weights
+# back into the network, so those are not compared.
+if (cd $C/backprop && build bp backprop_cuda.cu backprop.c facetrain.c imagenet.c "$HERE/backprop_dump.cpp" -- -Dmain=ocu_prog_main); then
+    (cd $C/backprop && ./bp 4096 > ocu.txt)
+    (cd $O/backprop && gcc -O2 -fopenmp -Dmain=ocu_prog_main -c backprop_kernel.c facetrain.c backprop.c imagenet.c 2>/dev/null \
+        && g++ -O2 -fopenmp -DOMP_REF -c "$HERE/backprop_dump.cpp" -o dump_ref.o && g++ -fopenmp -o bp_omp dump_ref.o backprop_kernel.o facetrain.o backprop.o imagenet.o -lm \
+        && ./bp_omp 4096 > ref.txt)
+    r=$(cmp_num $C/backprop/ocu.txt $O/backprop/ref.txt 1e-6); report backprop "$(verdict "$r")" "$r vs OpenMP (after one step)"
+else report backprop BUILD-FAIL "$(head -c 200 $C/backprop/.ocu/build.log)"; fi
+
+# srad_v2: the image after two iterations against the OpenMP version (same
+# seed, same input). Both print the image with 5 decimals, so the tolerance
+# 1e-5 is about two units in the last printed digit; the observed difference is 0.
+if (cd $C/srad/srad_v2 && build srad srad.cu -- -DOUTPUT); then
+    (cd $C/srad/srad_v2 && ./srad 512 512 0 127 0 127 0.5 2 | grep -E '^[0-9.]+ [0-9.]+ ' > ocu.txt)
+    (cd $O/srad/srad_v2 && g++ -O2 -fopenmp -DOUTPUT -o srad_omp srad.cpp -lm 2>/dev/null \
+        && ./srad_omp 512 512 0 127 0 127 4 0.5 2 | grep -E '^[0-9.]+ [0-9.]+ ' > ref.txt)
+    r=$(cmp_num $C/srad/srad_v2/ocu.txt $O/srad/srad_v2/ref.txt 1e-5); report srad_v2 "$(verdict "$r")" "$r vs OpenMP (image)"
+else report srad_v2 BUILD-FAIL "$(head -c 200 $C/srad/srad_v2/.ocu/build.log)"; fi
+
+# particlefilter: the estimates after one filter step against the OpenMP
+# version (same seed: time() is fixed by fixtime.so). Estimates are printed
+# with 6 decimals, so the tolerance 1e-7 relative is above the print rounding.
+# Longer runs are not compared: the two versions sum the weights in a different
+# order, which flips a resampling index now and then; at 10 frames the estimates
+# then differ by up to about 0.2 (in 48-64).
+if (cd $C/particlefilter && build pf ex_particle_CUDA_float_seq.cu); then
+    (cd $C/particlefilter && LD_PRELOAD=$TOOLS/fixtime.so ./pf -x 128 -y 128 -z 2 -np 1000 | grep -E '^(XE|YE):' > ocu.txt)
+    (cd $O/particlefilter && gcc -O2 -fopenmp ex_particle_OPENMP_seq.c -o pf_omp -lm 2>/dev/null \
+        && LD_PRELOAD=$TOOLS/fixtime.so ./pf_omp -x 128 -y 128 -z 2 -np 1000 | grep -E '^(XE|YE):' > ref.txt)
+    r=$(cmp_num $C/particlefilter/ocu.txt $O/particlefilter/ref.txt 1e-7); report particlefilter "$(verdict "$r")" "$r vs OpenMP (1 step)"
+else report particlefilter BUILD-FAIL "$(head -c 200 $C/particlefilter/.ocu/build.log)"; fi
+
+# b+tree: the batch searches of the GPU kernel (the 'k' command, 65,535 queries
+# in all) against the OpenMP version's search on the same tree and queries.
+# Integer results, tolerance 0.
+if (cd $C/b+tree && build bt main.c kernel/kernel_gpu_cuda_wrapper.cu kernel/kernel_gpu_cuda_wrapper_2.cu util/num/num.c util/timer/timer.c util/cuda/cuda.cu); then
+    python3 "$HERE/bpt_gen.py" 10000 $C/b+tree/tree.txt $C/b+tree/cmds.txt 2000 500 65535
+    (cd $C/b+tree && rm -f output.txt && ./bt file tree.txt command cmds.txt > .ocu/run.log 2>&1 \
+        && grep -E '^[0-9]+ +-?[0-9]+$' output.txt > ocu.txt)
+    (cd $O/b+tree && gcc -O2 -fopenmp -D_GNU_SOURCE -o bt_omp main.c kernel/*.c util/num/num.c util/timer/timer.c -lm 2>/dev/null \
+        && rm -f output.txt && ./bt_omp file $C/b+tree/tree.txt command $C/b+tree/cmds.txt > /dev/null 2>&1 \
+        && grep -E '^[0-9]+ +-?[0-9]+$' output.txt > ref.txt)
+    r=$(cmp_num $C/b+tree/ocu.txt $O/b+tree/ref.txt 0); report b+tree "$(verdict "$r")" "$r vs OpenMP (batch search)"
+else report b+tree BUILD-FAIL "$(head -c 200 $C/b+tree/.ocu/build.log)"; fi
+
+# huffman: the program's own check (its GPU bitstream against cpuencode.cpp,
+# the program's CPU encoder). Reported as the program reports it. On the CPU
+# path it currently FAILS: the bitstream differs from element 189,425 on for the
+# 1 MiB input, and at 4 blocks the Pack2 kernel rejects its launch configuration.
+if (cd $C/huffman && build huff main_test_cu.cu vlc_kernel_sm64huff.cu scan.cu pack_kernels.cu cpuencode.cpp -- -I.); then
+    python3 "$HERE/huffman_gen.py" 1048576 $C/huffman/data.bin
+    (cd $C/huffman && ./huff data.bin > ocu.txt 2>&1)
+    if grep -q '^PASS!' $C/huffman/ocu.txt; then report huffman ok "PASS (own check: GPU bitstream = CPU encoder)"
+    else report huffman FAIL "own check: $(grep -c '^Diff' $C/huffman/ocu.txt) differing elements vs CPU encoder"; fi
+else report huffman BUILD-FAIL "$(head -c 200 $C/huffman/.ocu/build.log)"; fi
+
+# Built only (they need input files this script does not generate, or the
+# program keeps its results inside the solver, see README.md).
 build_only() { # build_only <name> <dir> -- <build args>
     local name=$1 dir=$2; shift 3
-    if (cd $dir && build ocu_exe "$@"); then report $name BUILT "built (needs input data to run)"
+    if (cd $dir && build ocu_exe "$@"); then report $name BUILT "built only (no check yet, see README.md)"
     else report $name BUILD-FAIL "$(grep -m1 error $dir/.ocu/build.log | head -c 200)"; fi
 }
 build_only srad_v1 $C/srad/srad_v1 -- main.cu
-build_only b+tree $C/b+tree -- main.c kernel/kernel_gpu_cuda_wrapper.cu kernel/kernel_gpu_cuda_wrapper_2.cu util/num/num.c util/timer/timer.c util/cuda/cuda.cu
 build_only myocyte $C/myocyte -- main.cu
-build_only huffman $C/huffman -- main_test_cu.cu vlc_kernel_sm64huff.cu scan.cu pack_kernels.cu cpuencode.cpp -- -I.
 build_only kmeans $C/kmeans -- kmeans_cuda.cu cluster.c getopt.c kmeans.c kmeans_clustering.c rmse.c
 
 echo "summary: $total programs, $built built, $pass checked equal, $fail failed or not built"
