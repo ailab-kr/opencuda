@@ -178,6 +178,35 @@ __device__ float twice(float v) { return 2.0f * v; }
 __global__ void k(float *p) { p[0] = SQUARE(twice(p[1])); }""")
         self.assertIn("SQUARE(twice(ocu_ctx, p[1]))", img)
 
+    def test_texture_declaration_does_not_stop_the_file(self):
+        src = """
+texture<float, 1, cudaReadModeElementType> tex;
+__global__ void plain(float *p) { p[0] = 1.0f; }
+__global__ void textured(float *p) { p[0] = tex1Dfetch(tex, 0); }"""
+        rc, img, err = translate(src, "--keep-going")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("plain", img)
+        self.assertIn("texture reference 'tex' is not supported", err)
+
+    def test_constant_float3_global(self):
+        img = self.ok("""
+__constant__ float3 c[1];
+__global__ void k(float *p) { p[0] = c[0].y; }""")
+        self.assertIn("packed_float3 ocu_gt_c[1]", img)
+
+    def test_constant_struct_global_without_initializer(self):
+        self.ok("""
+struct P { float *d; int n; };
+__constant__ P cp;
+__global__ void k(float *p) { p[cp.n] = 1.0f; }""")
+
+    def test_helper_headers(self):
+        self.ok("""
+#include <helper_cuda.h>
+#include <helper_timer.h>
+__global__ void k(int *p) { p[0] = 1; }
+void host(int *p) { checkCudaErrors(cudaDeviceSynchronize()); getLastCudaError("k"); }""")
+
     def test_spaced_chevrons(self):
         self.ok("""
 __global__ void k(int *p) { p[0] = 1; }

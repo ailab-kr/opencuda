@@ -59,6 +59,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
+COMPAT = HERE / "compat"   # our own minimal helper headers (helper_cuda.h, ...)
 
 
 class TranslateError(Exception):
@@ -91,8 +92,9 @@ def device_cmd(clang: str, flags: list[str], define: str = "OCU_METAL_PATH") -> 
     rt = REPO / "runtime" / "include"
     return [clang, "-x", "cuda", "--cuda-device-only", "-nocudainc", "-nocudalib",
             f"--cuda-path={cuda_path()}", "--cuda-gpu-arch=sm_80", "-std=c++17",
-            f"-I{rt}", "-include", str(rt / "cuda_runtime.h"), f"-D{define}",
-            "-Wno-unknown-cuda-version", *flags]
+            f"-I{rt}", "-include", str(rt / "cuda_runtime.h"),
+            "-include", str(COMPAT / "ocu_metal_legacy_texture.h"), "-include", str(COMPAT / "helper_cuda.h"), f"-D{define}",
+            "-Wno-unknown-cuda-version", *flags, "-idirafter", str(COMPAT)]
 
 
 def run(cmd: list[str], what: str) -> str:
@@ -296,6 +298,7 @@ class Translator:
         self.kernels: list[dict] = []
         self.globals: dict[str, dict] = {}    # VarDecl id -> info
         self.consts: dict[str, dict] = {}     # VarDecl id -> host const variable
+        self.textures: dict[str, str] = {}    # legacy texture reference id -> name
         self.dyn_shared: dict[str, str] = {}  # file-scope extern __shared__ array -> element type
         self.items: list[dict] = []           # type / constant declarations, TU order
         self.insts: dict[tuple, Instance] = {}
@@ -303,7 +306,7 @@ class Translator:
         self.layout: dict[str, tuple[int, int]] = {}
         self.asserts: list[str] = []
         sysdirs = ["/usr/", "/Library/", "/Applications/", "/System/", "/opt/", "/nix/",
-                   str(REPO / "runtime" / "include") + os.sep, str(cuda_path()) + os.sep]
+                   str(REPO / "runtime" / "include") + os.sep, str(COMPAT) + os.sep, str(cuda_path()) + os.sep]
         sdk = clang_env().get("SDKROOT")
         if sdk:
             sysdirs.append(sdk.rstrip("/") + "/")
@@ -419,6 +422,8 @@ class Translator:
                     continue
                 for s in fns[1:]:
                     self.add_function(s, d)
+            elif k == "VarDecl" and re.match(r"\s*(const\s+)?(struct\s+)?texture\s*<", qtype(d)):
+                self.textures[d["id"]] = d["name"]
             elif k == "VarDecl":
                 written = {c.get("kind") for c in kids(d) if not c.get("implicit")}
                 if written & {"CUDAConstantAttr", "CUDADeviceAttr"}:
@@ -842,6 +847,8 @@ class Translator:
             elif k == "DeclRefExpr":
                 ref = n.get("referencedDecl", {})
                 rid = ref.get("id")
+                if rid in self.textures:
+                    raise TranslateError(f"'{fname}': texture reference '{self.textures[rid]}' is not supported yet")
                 if rid in self.globals:
                     g = self.global_info(rid)
                     g["used"] = True
@@ -1065,7 +1072,11 @@ class Translator:
         else:
             g["typedef"] = f"typedef {t} ocu_gt_{name};"
         if VEC3.search(td) or VEC3.search(t):
-            raise TranslateError(f"'{name}': 3-component vector variables are laid out differently on {self.TARGET}")
+            # a 3-component vector (or an array of them) keeps the host's 12-byte
+            # layout as the packed type; anything else with one inside is refused
+            if "*" in td or not VEC3.fullmatch(re.sub(r"\s*(const|volatile)\s*|\s*\[\d+\]", "", t).strip()):
+                raise TranslateError(f"'{name}': 3-component vector variables are laid out differently on {self.TARGET}")
+            g["typedef"] = VEC3.sub(lambda m: "packed_" + m.group(0), g["typedef"])
         g["type"] = t
         g["expr"] = f"(*(device ocu_gt_{name} *)(ocu_ctx.glob + OCU_G_{name}))"
         g["name"] = name
@@ -1111,6 +1122,8 @@ class Translator:
         init = [c for c in kids(n) if not c.get("kind", "").endswith("Attr")]
         if not init or not n.get("init"):
             return None
+        if init[0].get("kind") == "CXXConstructExpr" and not kids(init[0]):
+            return None  # default construction of a plain struct: zero bytes
         out = bytearray(size)
         self.fill(init[0], t, out, 0, n["name"])
         return bytes(out)
@@ -1237,7 +1250,7 @@ class Translator:
                     if not ft.rstrip().endswith("*") and not is_pointer(ft):
                         raise TranslateError(f"{fname}: pointer typedef fields are not handled yet")
                     fs = self.span(r)
-                    if fs is None or not self.same(fs[0], f) or "spellingLoc" in r["range"]["begin"]:
+                    if fs is None or not self.same(fs[0], f):
                         raise TranslateError(f"{fname}: pointer field inside a macro is not handled yet")
                     edits.append((fs[1], fs[1], "device "))
         if k in ("TypedefDecl", "TypeAliasDecl"):

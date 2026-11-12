@@ -33,6 +33,13 @@ cost: { hours: 1.5, ai_usage: 0 }
 - [x] M1 Pro: 백엔드 53/53(saxpy 100만 값 1.4ms), 변환 23/23
 - [x] 두 Mac 모두 전체 시험 42/42, check.sh ALL PASS(빌드 경고 0, Release)
 
+- [x] Rodinia translation count (host side, `cu2msl.py --keep-going` over the pinned Rodinia tree, template instances counted once): 35/79 before, 49/79 after; `msl_check` passes on every image. Not yet run on a GPU.
+  - legacy texture declarations (`texture<>`, channel descriptors, bind calls) parse; a kernel that uses a texture reference is skipped with "texture reference '<name>' is not supported yet", the other kernels of the file translate (hybridsort 4, kmeans 1)
+  - own minimal helper headers in `compiler/metal/compat/` (`helper_cuda.h`, `helper_timer.h`, empty GL/OpenMP stubs, `vector_types.h`), searched after the program's own `-I` directories (cfd 7)
+  - `__constant__ float3` globals are `packed_float3` in the module buffer (12-byte host layout) (cfd 2)
+  - struct-typed `__constant__` globals without an initializer, and pointer fields spelled through a macro (heartwall)
+- [ ] Still failing: double (policy open), texture use (hybridsort 3, kmeans 1, leukocyte 2, mummergpu 2), mummergpu (driver-API names, old literal syntax), pointer-to-pointer arguments, namespaces/class templates (dwt2d 4)
+
 ## 메모
 
 이 세션은 Mac이 없어 Metal 코드를 컴파일하지 못한다. 결과는 M3 시험기 보고로 확인한다. 시험과 구현을 같은 세션이 썼다.
