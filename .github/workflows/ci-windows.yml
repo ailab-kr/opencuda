@@ -1,0 +1,59 @@
+# Windows CI: cross-build the CPU path with MinGW-w64 (POSIX threads, static
+# link, cmake/toolchains/x86_64-w64-mingw32.cmake) on a Linux runner, run the
+# tests under Wine, and pack a test bundle that runs on a plain Windows
+# machine (tools/make_test_bundle.py). A native MSVC build is not supported.
+#
+# Under Wine, some tests have failed in earlier local runs (the stack-size
+# regression test, the Python-driven conformance tests and the device-math
+# test), so the test step does not fail the job yet: it records the result in
+# the log and the scoreboard. Remove `continue-on-error` once a clean Wine run
+# is confirmed.
+#
+# MANUAL ONLY (workflow_dispatch). No push or pull_request trigger on purpose:
+# the repository is private and runner minutes count against the
+# organisation's quota. Enabling automatic triggers is the maintainers'
+# decision.
+name: ci-windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mingw-wine:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build python3 mingw-w64 wine64
+      - name: Configure
+        run: |
+          cmake -S . -B build-win -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/x86_64-w64-mingw32.cmake
+      - name: Build
+        run: cmake --build build-win -j4
+      - name: Test under Wine
+        continue-on-error: true
+        env:
+          WINEDEBUG: -all
+          WINEPREFIX: ${{ runner.temp }}/wine
+        run: ctest --test-dir build-win --output-on-failure | tee ctest.txt
+      - name: Test bundle for a Windows machine
+        run: python3 tools/make_test_bundle.py build-win ocu-windows-tests.zip
+      - name: Scoreboard
+        if: always()
+        run: |
+          python3 tools/scoreboard.py --ctest cpu=ctest.txt --out-dir scoreboard
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows
+          path: |
+            ocu-windows-tests.zip
+            scoreboard/

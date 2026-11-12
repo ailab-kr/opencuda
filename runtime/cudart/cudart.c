@@ -24,6 +24,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -318,9 +319,34 @@ cudaError_t cudaGetDeviceProperties(struct cudaDeviceProp *prop, int device)
     prop->memoryClockRate = 1000000;
     prop->memoryBusWidth = 64;
     prop->totalConstMem = 65536;
-    /* The capability this layer compiles device code for (sm_80). */
-    prop->major = 8;
+    /*
+     * Reported device policy (what programs such as llama.cpp's CUDA
+     * backend pick kernels from):
+     *   compute capability 5.0 -- the generic tier: no tensor-core, async
+     *     copy or half-arithmetic paths, which the CPU path cannot run and
+     *     which are not needed for correctness. OCU_COMPUTE_CAPABILITY=
+     *     "M.m" (for example "8.0") overrides it;
+     *   warpSize = the backend's value (32 on CPU and NVIDIA);
+     *   sharedMemPerBlockOptin >= 48 KiB on CPU and NVIDIA (Metal reports
+     *     its smaller real value);
+     *   cudaFuncGetAttributes().ptxVersion = 10*major+minor, below 90, so
+     *     programs do not take their Hopper-only launch paths;
+     *   cooperative launch: not supported (attribute 0);
+     *   PCI ids: synthetic, see cudaDeviceGetPCIBusId.
+     */
+    prop->major = 5;
     prop->minor = 0;
+    {
+        const char *cc = getenv("OCU_COMPUTE_CAPABILITY");
+        int M, m;
+        if (cc != NULL && sscanf(cc, "%d.%d", &M, &m) == 2 && M >= 1 && M < 20 && m >= 0 && m < 10) {
+            prop->major = M;
+            prop->minor = m;
+        }
+    }
+    prop->pciDomainID = 0;
+    prop->pciBusID = 1 + device;
+    prop->pciDeviceID = 0;
     prop->textureAlignment = 512;
     prop->deviceOverlap = 1;
     prop->asyncEngineCount = 1;
@@ -359,6 +385,61 @@ cudaError_t cudaDeviceCanAccessPeer(int *can, int device, int peer)
     if (device < 0 || device >= n || peer < 0 || peer >= n) return set_error(cudaErrorInvalidDevice);
     *can = 0; /* no peer access between devices yet; a device is not its own peer */
     return cudaSuccess;
+}
+
+/*
+ * Peer access. Devices here never reach each other's memory
+ * (cudaDeviceCanAccessPeer reports 0), so enabling it is the documented
+ * failure for an incapable pair: cudaErrorPeerAccessUnsupported. Checks
+ * first, in the documented order: flags must be 0; the peer must be a valid
+ * device other than the current one (cudaErrorInvalidDevice).
+ */
+cudaError_t cudaDeviceEnablePeerAccess(int peer, unsigned int flags)
+{
+    if (flags != 0) return set_error(cudaErrorInvalidValue);
+    int can = 0;
+    cudaError_t e = cudaDeviceCanAccessPeer(&can, tl_device, peer);
+    if (e != cudaSuccess) return e;
+    if (peer == tl_device) return set_error(cudaErrorInvalidDevice);
+    (void)can; /* can is always 0 until a backend reports peers */
+    return set_error(cudaErrorPeerAccessUnsupported);
+}
+
+cudaError_t cudaDeviceDisablePeerAccess(int peer)
+{
+    int n = 0;
+    cudaError_t e = cudaGetDeviceCount(&n);
+    if (e != cudaSuccess) return e;
+    if (peer < 0 || peer >= n || peer == tl_device) return set_error(cudaErrorInvalidDevice);
+    return set_error(cudaErrorPeerAccessNotEnabled); /* never enabled */
+}
+
+/*
+ * Synthetic PCI identifier "0000:BB:00.0" (domain, bus, device, function in
+ * hex, as the documented format): bus = 1 + device index, so it is stable
+ * across runs, unique per device and never the host bridge's bus 0. The
+ * backends do not report real PCI locations. The string needs 13 bytes with
+ * the terminator; a shorter len is cudaErrorInvalidValue.
+ */
+cudaError_t cudaDeviceGetPCIBusId(char *id, int len, int device)
+{
+    if (id == NULL || len < 13) return set_error(cudaErrorInvalidValue);
+    struct cudaDeviceProp p;
+    cudaError_t e = cudaGetDeviceProperties(&p, device);
+    if (e != cudaSuccess) return e;
+    snprintf(id, (size_t)len, "%04x:%02x:%02x.%x", (unsigned)p.pciDomainID,
+             (unsigned)p.pciBusID & 0xffu, (unsigned)p.pciDeviceID & 0x1fu, 0u);
+    return cudaSuccess;
+}
+
+/* No backend can promise that every block of a grid is resident at once,
+   which cooperative launch requires: report "not supported", as for a
+   device whose cooperative-launch attribute is 0. */
+cudaError_t cudaLaunchCooperativeKernel(const void *func, dim3 grid, dim3 block, void **args,
+                                        size_t shared_mem, cudaStream_t stream)
+{
+    (void)func; (void)grid; (void)block; (void)args; (void)shared_mem; (void)stream;
+    return set_error(cudaErrorNotSupported);
 }
 
 /* Shared memory a kernel may ask for at launch, raised per function up to
@@ -459,6 +540,11 @@ cudaError_t cudaDeviceGetAttribute(int *value, enum cudaDeviceAttr attr, int dev
     case cudaDevAttrManagedMemory:               *value = p.managedMemory; break;
     case cudaDevAttrConcurrentManagedAccess:     *value = p.concurrentManagedAccess; break;
     case cudaDevAttrMaxSharedMemoryPerBlockOptin: *value = (int)p.sharedMemPerBlockOptin; break;
+    case cudaDevAttrPciBusId:                    *value = p.pciBusID; break;
+    case cudaDevAttrPciDeviceId:                 *value = p.pciDeviceID; break;
+    case cudaDevAttrPciDomainId:                 *value = p.pciDomainID; break;
+    case cudaDevAttrCooperativeLaunch:           *value = 0; break;
+    case cudaDevAttrCooperativeMultiDeviceLaunch: *value = 0; break;
     default:
         return set_error(cudaErrorInvalidValue);
     }

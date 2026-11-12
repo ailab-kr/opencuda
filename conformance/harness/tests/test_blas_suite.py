@@ -62,5 +62,19 @@ class SelfCheck(unittest.TestCase):
         self.assertEqual(blas_check.check(case, dict(case["expect"]), tol)["status"], "pass")
 
 
+class Subset(unittest.TestCase):
+    def test_only_selects_functions_and_kinds(self):
+        from harness.ocu_conf.blas_run import select
+        sub = select(cases(), "gemm,dot:f32")
+        self.assertTrue(sub)
+        self.assertEqual({(c["fn"], c["kind"]) for c in sub},
+                         {("gemm", "f32"), ("gemm", "f64"), ("dot", "f32")})
+        self.assertIs(select(cases(), None), cases())
+        with self.assertRaises(ValueError):
+            select(cases(), "nosuchfn")
+        with self.assertRaises(ValueError):
+            select(cases(), "gemm,,dot")
+
+
 if __name__ == "__main__":
     unittest.main()

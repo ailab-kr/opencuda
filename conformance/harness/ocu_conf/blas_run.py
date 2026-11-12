@@ -1,12 +1,16 @@
 """Run the BLAS cases through an implementation's driver and grade them.
 
     python3 -m ocu_conf.blas_run <driver> [--out result.json] [--backend cpu]
-                                 [--samples N]
+                                 [--samples N] [--only fn[:kind],...]
 
 Writes the cases to the driver's stdin (protocol in
 tests/conformance/blas_driver.c), reads its outputs, grades every case with
 blas_check, writes a result record (conformance/README.md) and prints a
 summary with sample outputs. Exit status 0 only when every case passes.
+
+--only runs a subset, for an implementation that offers only some of the
+functions: "gemm,dot:f32" keeps every gemm case and the f32 dot cases. The
+record then holds only those cases; it says so in run.subset.
 """
 
 from __future__ import annotations
@@ -95,6 +99,23 @@ def parse(text: str) -> dict[str, dict]:
     return results
 
 
+def select(cases: list[dict], only: str | None) -> list[dict]:
+    """Cases whose fn (and kind, if given) is listed in `only`."""
+    if not only:
+        return cases
+    wanted = []
+    for item in only.split(","):
+        fn, _, kind = item.strip().partition(":")
+        if not fn:
+            raise ValueError(f"--only: empty item in {only!r}")
+        wanted.append((fn, kind or None))
+    out = [c for c in cases
+           if any(c["fn"] == fn and (kind is None or c["kind"] == kind) for fn, kind in wanted)]
+    if not out:
+        raise ValueError(f"--only {only!r} selects no case")
+    return out
+
+
 def _git_version() -> str:
     try:
         return subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
@@ -109,9 +130,10 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--out")
     ap.add_argument("--backend", default="cpu")
     ap.add_argument("--samples", type=int, default=3)
+    ap.add_argument("--only", help="fn[:kind],... subset of the cases")
     args = ap.parse_args(argv)
 
-    cases = C.all_cases()
+    cases = select(C.all_cases(), args.only)
     # OCU_DRIVER_LAUNCHER runs the driver through another program, e.g. an
     # emulator for a cross-compiled driver.
     import shlex
@@ -146,7 +168,7 @@ def main(argv: list[str]) -> int:
     record = {
         "schema": SCHEMA_VERSION,
         "run": {"date": datetime.date.today().isoformat(), "suite_version": "0.1.0",
-                "set": "public"},
+                "set": "public", **({"subset": args.only} if args.only else {})},
         "device": {"vendor": args.backend, "model": platform.processor() or platform.machine(),
                    "driver": "none", "os": f"{platform.system()} {platform.release()}"},
         "impl": {"name": "ocu", "version": _git_version(), "backend": args.backend},
