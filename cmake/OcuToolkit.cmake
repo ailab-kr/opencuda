@@ -7,7 +7,8 @@
 #   bin/ocu-nvcc-cpu, bin/ocu-nvcc-nvidia
 #                           links to ocu-nvcc; the name picks the target
 #   include/                our headers (cuda_runtime.h ...)
-#   lib/                    libocu_cudart.a, libocu_core.a, backends, ocu_blas
+#   lib/                    libocu_cudart.a, libocu_core.a, backends, ocu_blas,
+#                           libocu_cublas_<target>.a (cublas_v2.h, per target)
 #   nvvm/libdevice/         empty: CMake checks that it exists; never read
 #   cmake/OcuCUDA.cmake     toolchain file / module (see there)
 #   cmake/OcuCUDARules.cmake, cmake/modules/FindCUDAToolkit.cmake
@@ -36,7 +37,8 @@ file(GLOB _ocu_tk_headers
   ${PROJECT_SOURCE_DIR}/backends/cpu/ocu_backend_cpu.h
   ${PROJECT_SOURCE_DIR}/backends/cpu/ocu_cpu_kernel.h
   ${PROJECT_SOURCE_DIR}/backends/nvidia/ocu_backend_nvidia.h
-  ${PROJECT_SOURCE_DIR}/libs/blas/ocu_blas.h)
+  ${PROJECT_SOURCE_DIR}/libs/blas/ocu_blas.h
+  ${PROJECT_SOURCE_DIR}/libs/cublas/include/*.h)
 foreach(h IN LISTS _ocu_tk_headers)
   get_filename_component(n ${h} NAME)
   file(CREATE_LINK ${h} ${_tk}/include/${n} SYMBOLIC)
@@ -49,7 +51,7 @@ configure_file(${PROJECT_SOURCE_DIR}/cmake/cuda-modules/FindCUDAToolkit.cmake
 
 # Libraries: links to the built archives, refreshed after every build.
 set(_ocu_tk_libs ocu_cudart ocu_core ocu_blas)
-foreach(t ocu_backend_cpu ocu_backend_nvidia ocu_backend_metal)
+foreach(t ocu_backend_cpu ocu_backend_nvidia ocu_backend_metal ocu_cublas_cpu ocu_cublas_nvidia)
   if(TARGET ${t})
     list(APPEND _ocu_tk_libs ${t})
   endif()
