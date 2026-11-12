@@ -157,6 +157,14 @@ def header_dirs() -> list[Path]:
             REPO / "backends" / "cpu"]
 
 
+# Clang's CUDA default (-ffp-contract=fast) fuses a*b+c into fma everywhere,
+# like nvcc, but ignores "#pragma clang fp contract(off)". The device math
+# library needs that pragma (its float functions round each operation as
+# written, so device and host give the same bits); fast-honor-pragmas keeps
+# fusion for all other code.
+FP_CONTRACT = ["-ffp-contract=fast-honor-pragmas"]
+
+
 def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
     codegen = []  # options that matter after preprocessing
     if args.O:
@@ -207,7 +215,7 @@ def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
         cuda = [clang, "-x", "cuda", "-std=c++17", "-nocudainc", "-nocudalib",
                 f"--cuda-path={path}", f"--cuda-gpu-arch={arch}", *ours,
                 "-include", str(dirs[0] / "cuda_runtime.h"),
-                "-Wno-unknown-cuda-version"]
+                "-Wno-unknown-cuda-version", *FP_CONTRACT]
         ptx = work / (src.stem + ".ptx")
         fat = work / (src.stem + ".ocufat")
         # Spaced chevrons ("<< <"), which Clang rejects: compile copies of
@@ -225,7 +233,7 @@ def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
         arch = args.arch or "sm_80"
         path = pinned_cuda_path(work.parent if args.cache is None else Path(args.cache))
         return [[clang, "-x", "cuda", "-nocudainc", "-nocudalib", f"--cuda-path={path}",
-                 f"--cuda-gpu-arch={arch}", "--cuda-device-only", "-S", *common,
+                 f"--cuda-gpu-arch={arch}", "--cuda-device-only", "-S", *FP_CONTRACT, *common,
                  str(src), "-o", str(out)]]
     arch = args.arch or "gfx1201"
     return [[clang, "-x", "hip", "-nogpuinc", "-nogpulib", f"--offload-arch={arch}",
