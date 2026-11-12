@@ -1608,6 +1608,83 @@ cudaError_t cudaLaunchKernel(const void *func, dim3 grid, dim3 block, void **arg
     return ocu_rt_launch(k, &p, stream);
 }
 
+/*
+ * Extensible launch configuration (see cuda_runtime_api.h for what each
+ * attribute does here). Programmatic dependent launch only relaxes stream
+ * order; this layer keeps full stream order, which the attribute allows.
+ */
+cudaError_t ocu_rt_launch_config_check(const cudaLaunchConfig_t *config)
+{
+    if (config == NULL) return set_error(cudaErrorInvalidValue);
+    if (config->numAttrs > 0 && config->attrs == NULL) return set_error(cudaErrorInvalidValue);
+    for (unsigned int i = 0; i < config->numAttrs; ++i) {
+        const cudaLaunchAttribute *a = &config->attrs[i];
+        switch (a->id) {
+        case cudaLaunchAttributeIgnore:
+        case cudaLaunchAttributeAccessPolicyWindow:
+        case cudaLaunchAttributeSynchronizationPolicy:
+        case cudaLaunchAttributeClusterSchedulingPolicyPreference:
+        case cudaLaunchAttributeProgrammaticStreamSerialization:
+        case cudaLaunchAttributePriority:
+        case cudaLaunchAttributeMemSyncDomainMap:
+        case cudaLaunchAttributeMemSyncDomain:
+        case cudaLaunchAttributePreferredClusterDimension:
+        case cudaLaunchAttributePreferredSharedMemoryCarveout:
+            break;
+        case cudaLaunchAttributeProgrammaticEvent:
+            if (a->val.programmaticEvent.event == NULL) {
+                return set_error(cudaErrorInvalidResourceHandle);
+            }
+            break;
+        case cudaLaunchAttributeLaunchCompletionEvent:
+            if (a->val.launchCompletionEvent.event == NULL) {
+                return set_error(cudaErrorInvalidResourceHandle);
+            }
+            break;
+        case cudaLaunchAttributeCooperative:
+            if (a->val.cooperative != 0) return set_error(cudaErrorNotSupported);
+            break;
+        case cudaLaunchAttributeClusterDimension: {
+            unsigned long long n = (unsigned long long)a->val.clusterDim.x *
+                                   a->val.clusterDim.y * a->val.clusterDim.z;
+            if (n > 1) return set_error(cudaErrorNotSupported);
+            break;
+        }
+        default:
+            return set_error(cudaErrorInvalidValue);
+        }
+    }
+    return cudaSuccess;
+}
+
+cudaError_t ocu_rt_launch_config_done(const cudaLaunchConfig_t *config)
+{
+    for (unsigned int i = 0; i < config->numAttrs; ++i) {
+        const cudaLaunchAttribute *a = &config->attrs[i];
+        cudaEvent_t ev = NULL;
+        if (a->id == cudaLaunchAttributeProgrammaticEvent) {
+            ev = a->val.programmaticEvent.event;
+        } else if (a->id == cudaLaunchAttributeLaunchCompletionEvent) {
+            ev = a->val.launchCompletionEvent.event;
+        }
+        if (ev != NULL) {
+            cudaError_t e = cudaEventRecord(ev, config->stream);
+            if (e != cudaSuccess) return e;
+        }
+    }
+    return cudaSuccess;
+}
+
+cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t *config, const void *func, void **args)
+{
+    cudaError_t e = ocu_rt_launch_config_check(config);
+    if (e != cudaSuccess) return e;
+    e = cudaLaunchKernel(func, config->gridDim, config->blockDim, args,
+                         config->dynamicSmemBytes, config->stream);
+    if (e != cudaSuccess) return e;
+    return ocu_rt_launch_config_done(config);
+}
+
 cudaError_t ocu_rt_launch(ocu_kernel *kernel, const ocu_launch_params *params,
                           cudaStream_t stream)
 {

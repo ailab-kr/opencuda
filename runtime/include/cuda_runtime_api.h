@@ -268,6 +268,98 @@ struct cudaFuncAttributes {
     int    preferredShmemCarveout;
 };
 
+/*
+ * Extensible launch configuration (cudaLaunchKernelEx). Names and values
+ * as in the public API reference (cudaLaunchAttributeID,
+ * cudaLaunchAttributeValue, cudaLaunchConfig_t). What this layer does with
+ * each attribute is described at cudaLaunchKernelExC below.
+ */
+typedef enum cudaLaunchAttributeID {
+    cudaLaunchAttributeIgnore = 0,
+    cudaLaunchAttributeAccessPolicyWindow = 1,
+    cudaLaunchAttributeCooperative = 2,
+    cudaLaunchAttributeSynchronizationPolicy = 3,
+    cudaLaunchAttributeClusterDimension = 4,
+    cudaLaunchAttributeClusterSchedulingPolicyPreference = 5,
+    cudaLaunchAttributeProgrammaticStreamSerialization = 6,
+    cudaLaunchAttributeProgrammaticEvent = 7,
+    cudaLaunchAttributePriority = 8,
+    cudaLaunchAttributeMemSyncDomainMap = 9,
+    cudaLaunchAttributeMemSyncDomain = 10,
+    cudaLaunchAttributePreferredClusterDimension = 11,
+    cudaLaunchAttributeLaunchCompletionEvent = 12,
+    cudaLaunchAttributeDeviceUpdatableKernelNode = 13,
+    cudaLaunchAttributePreferredSharedMemoryCarveout = 14
+} cudaLaunchAttributeID;
+
+enum cudaAccessProperty {
+    cudaAccessPropertyNormal = 0,
+    cudaAccessPropertyStreaming = 1,
+    cudaAccessPropertyPersisting = 2
+};
+
+struct cudaAccessPolicyWindow {
+    void                   *base_ptr;
+    size_t                  num_bytes;
+    float                   hitRatio;
+    enum cudaAccessProperty hitProp;
+    enum cudaAccessProperty missProp;
+};
+
+enum cudaSynchronizationPolicy {
+    cudaSyncPolicyAuto = 1,
+    cudaSyncPolicySpin = 2,
+    cudaSyncPolicyYield = 3,
+    cudaSyncPolicyBlockingSync = 4
+};
+
+enum cudaClusterSchedulingPolicy {
+    cudaClusterSchedulingPolicyDefault = 0,
+    cudaClusterSchedulingPolicySpread = 1,
+    cudaClusterSchedulingPolicyLoadBalancing = 2
+};
+
+typedef enum cudaLaunchMemSyncDomain {
+    cudaLaunchMemSyncDomainDefault = 0,
+    cudaLaunchMemSyncDomainRemote = 1
+} cudaLaunchMemSyncDomain;
+
+typedef struct cudaLaunchMemSyncDomainMap_st {
+    unsigned char default_;
+    unsigned char remote;
+} cudaLaunchMemSyncDomainMap;
+
+typedef union cudaLaunchAttributeValue {
+    char pad[64];
+    struct cudaAccessPolicyWindow accessPolicyWindow;
+    int cooperative;
+    enum cudaSynchronizationPolicy syncPolicy;
+    struct { unsigned int x, y, z; } clusterDim;
+    enum cudaClusterSchedulingPolicy clusterSchedulingPolicyPreference;
+    int programmaticStreamSerializationAllowed;
+    struct { cudaEvent_t event; int flags; int triggerAtBlockStart; } programmaticEvent;
+    int priority;
+    cudaLaunchMemSyncDomainMap memSyncDomainMap;
+    cudaLaunchMemSyncDomain memSyncDomain;
+    struct { unsigned int x, y, z; } preferredClusterDim;
+    struct { cudaEvent_t event; int flags; } launchCompletionEvent;
+    unsigned int sharedMemCarveout;
+} cudaLaunchAttributeValue;
+
+typedef struct cudaLaunchAttribute_st {
+    cudaLaunchAttributeID id;
+    cudaLaunchAttributeValue val;
+} cudaLaunchAttribute;
+
+typedef struct cudaLaunchConfig_st {
+    dim3 gridDim;
+    dim3 blockDim;
+    size_t dynamicSmemBytes;
+    cudaStream_t stream;
+    cudaLaunchAttribute *attrs;
+    unsigned int numAttrs;
+} cudaLaunchConfig_t;
+
 /* The legacy default stream. */
 #define cudaStreamLegacy ((cudaStream_t)0x1)
 #define cudaStreamPerThread ((cudaStream_t)0x2)
@@ -416,6 +508,37 @@ cudaError_t cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void *user_
    points at the i-th argument value. */
 cudaError_t cudaLaunchKernel(const void *func, dim3 grid, dim3 block, void **args,
                              size_t shared, cudaStream_t stream);
+
+/*
+ * cudaLaunchKernel with an extensible configuration: grid, block, dynamic
+ * shared memory and stream from `config`, then its attributes:
+ *   Ignore, AccessPolicyWindow, SynchronizationPolicy, Priority,
+ *   MemSyncDomain(Map), ClusterSchedulingPolicyPreference,
+ *   PreferredClusterDimension, PreferredSharedMemoryCarveout:
+ *     performance hints, accepted and without effect;
+ *   ProgrammaticStreamSerialization: accepted. The kernel still starts
+ *     only after the previous work in the stream has completed. The
+ *     attribute only permits overlap with that work, so full stream order
+ *     is one of the allowed executions; cudaGridDependencySynchronize()
+ *     then has nothing left to wait for;
+ *   ProgrammaticEvent, LaunchCompletionEvent: the event is recorded in
+ *     the stream after the kernel, a later point than the one the
+ *     attribute names, which waiters cannot tell apart from a trigger that
+ *     happened to come late;
+ *   Cooperative (non-zero): cudaErrorNotSupported, as
+ *     cudaLaunchCooperativeKernel;
+ *   ClusterDimension (more than one block per cluster): cudaErrorNotSupported;
+ *   DeviceUpdatableKernelNode (graphs only) and unknown ids:
+ *     cudaErrorInvalidValue.
+ * A NULL config, or numAttrs > 0 with attrs NULL: cudaErrorInvalidValue.
+ */
+cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t *config, const void *func, void **args);
+
+/* The attribute checks of cudaLaunchKernelExC, and what it does after the
+   launch (events), for launch paths that do not go through it (the CPU
+   path's typed launch). Internal names, not part of the CUDA API. */
+cudaError_t ocu_rt_launch_config_check(const cudaLaunchConfig_t *config);
+cudaError_t ocu_rt_launch_config_done(const cudaLaunchConfig_t *config);
 
 /* ---- events ------------------------------------------------------------ */
 
