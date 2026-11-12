@@ -28,7 +28,10 @@ mkdir -p "$TOOLS"
 gcc -O2 -shared -fPIC "$HERE/fixtime.c" -o "$TOOLS/fixtime.so" || exit 2
 gcc -O2 "$HERE/hotspot_ref.c" -o "$TOOLS/hotspot_ref" || exit 2
 
+# OCU_TARGET=nvidia builds the same programs for the NVIDIA GPU.
+TARGET=${OCU_TARGET:-cpu}
 LIBS="$BUILD/runtime/libocu_cudart.a $BUILD/runtime/libocu_core.a $BUILD/backends/cpu/libocu_backend_cpu.a"
+[ -f "$BUILD/backends/nvidia/libocu_backend_nvidia.a" ] && LIBS="$LIBS $BUILD/backends/nvidia/libocu_backend_nvidia.a -ldl"
 # build <exe> <sources...> [-- flags]: every source through ocu_cc, as nvcc
 # would take it.
 build() {
@@ -38,11 +41,11 @@ build() {
         if [ "$1" = "--" ]; then shift; flags=("$@"); break; fi
         srcs+=("$1"); shift
     done
-    mkdir -p .ocu
+    rm -rf .ocu; mkdir -p .ocu
     local objs=() s o
     for s in "${srcs[@]}"; do
         o=.ocu/$(echo "$s" | tr / _).o
-        python3 "$REPO/compiler/probe/ocu_cc.py" --target cpu -O2 "${flags[@]}" -c "$s" -o "$o" \
+        python3 "$REPO/compiler/probe/ocu_cc.py" --target "$TARGET" -O2 "${flags[@]}" -c "$s" -o "$o" \
             2> .ocu/build.log || return 1
         objs+=("$o")
     done
