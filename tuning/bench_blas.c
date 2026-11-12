@@ -73,12 +73,15 @@ int main(void)
             fprintf(stderr, "bench_blas: %s failed\n", j.op);
             failed = 1;
         } else {
+            /* Timing relies on the backend contract: queue == NULL runs the
+               call to completion before returning. */
             double flop = strcmp(j.op, "sgemm") == 0 ? 2.0 * j.m * j.n * j.k : 2.0 * j.n;
+            double gflops = r.median_ms > 0 ? flop / (r.median_ms * 1e6) : 0.0;
             printf("{\"backend\": \"%s\", \"op\": \"%s\", \"m\": %d, \"n\": %d, \"k\": %d, "
                    "\"median_ms\": %.4f, \"p10_ms\": %.4f, \"p90_ms\": %.4f, "
                    "\"spread\": %.4f, \"valid\": %s, \"runs\": %d, \"gflops\": %.3f}\n",
                    B->name, j.op, j.m, j.n, j.k, r.median_ms, r.p10_ms, r.p90_ms, r.spread,
-                   r.valid ? "true" : "false", r.runs, flop / (r.median_ms * 1e6));
+                   r.valid ? "true" : "false", r.runs, gflops);
         }
         B->mem_free(D, j.a);
         B->mem_free(D, j.b);

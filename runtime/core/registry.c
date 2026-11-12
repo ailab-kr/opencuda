@@ -135,20 +135,28 @@ ocu_status ocu_core_device(const ocu_backend **backend, ocu_device **device)
     static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
     static ocu_device *dev;
     static const ocu_backend *dev_backend;
-    const ocu_backend *b = ocu_active_backend();
-    if (b == NULL) {
-        return OCU_ERR_INVALID_DEVICE;
-    }
     ocu_status st = OCU_OK;
     pthread_mutex_lock(&lock);
+    /* Read the active backend inside the lock so that the device and the
+       backend handed out always belong together. */
+    const ocu_backend *b = ocu_active_backend();
+    if (b == NULL) {
+        pthread_mutex_unlock(&lock);
+        return OCU_ERR_INVALID_DEVICE;
+    }
     if (dev == NULL || dev_backend != b) {
+        if (dev != NULL && dev_backend != NULL) {
+            (void)dev_backend->dev_close(dev); /* the backend changed */
+        }
+        dev = NULL;
         st = b->dev_open(0, &dev);
         dev_backend = st == OCU_OK ? b : NULL;
     }
+    ocu_device *d = dev;
     pthread_mutex_unlock(&lock);
     if (st == OCU_OK) {
         if (backend != NULL) *backend = b;
-        if (device != NULL) *device = dev;
+        if (device != NULL) *device = d;
     }
     return st;
 }

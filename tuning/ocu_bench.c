@@ -55,7 +55,8 @@ int ocu_bench_run(const ocu_bench_config *cfg_in, ocu_bench_fn fn, void *ctx,
         ocu_bench_default_config(&cfg);
     }
     if (fn == NULL || r == NULL || cfg.reps < 1 || cfg.reps > OCU_BENCH_MAX_REPS ||
-        cfg.repeats < 1 || cfg.repeats > OCU_BENCH_MAX_REPEATS || cfg.warmup < 0) {
+        cfg.repeats < 1 || cfg.repeats > OCU_BENCH_MAX_REPEATS || cfg.warmup < 0 ||
+        !(cfg.max_spread >= 0)) { /* also refuses NaN */
         return -1;
     }
     if (clock == NULL) {
@@ -99,7 +100,11 @@ int ocu_bench_run(const ocu_bench_config *cfg_in, ocu_bench_fn fn, void *ctx,
     memcpy(samples, r->sample_ms, sizeof(double) * (size_t)cfg.repeats);
     r->median_ms = ocu_bench_percentile(samples, cfg.repeats, 0.5);
     double lo = samples[0], hi = samples[cfg.repeats - 1]; /* sorted above */
-    r->spread = r->median_ms > 0 ? (hi - lo) / r->median_ms : 0.0;
+    if (r->median_ms > 0) {
+        r->spread = (hi - lo) / r->median_ms;
+    } else {
+        r->spread = hi > lo ? 1e300 : 0.0; /* a zero median cannot vouch for anything */
+    }
     r->valid = r->spread <= cfg.max_spread;
     r->p10_ms = ocu_bench_percentile(all, count, 0.1);
     r->p90_ms = ocu_bench_percentile(all, count, 0.9);
