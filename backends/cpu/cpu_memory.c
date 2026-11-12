@@ -33,6 +33,19 @@ static pthread_mutex_t g_mem_lock = PTHREAD_MUTEX_INITIALIZER;
 static alloc_table     g_device;
 static alloc_table     g_pinned;
 
+/*
+ * fork(): another thread may hold g_mem_lock at the moment of fork, which
+ * would leave it locked forever in the child. Take it around fork; the
+ * child keeps the parent's allocations (its memory is a copy).
+ */
+static pthread_once_t g_mem_atfork_once = PTHREAD_ONCE_INIT;
+static void mem_prepare(void) { pthread_mutex_lock(&g_mem_lock); }
+static void mem_release(void) { pthread_mutex_unlock(&g_mem_lock); }
+static void mem_install_atfork(void)
+{
+    (void)pthread_atfork(mem_prepare, mem_release, mem_release);
+}
+
 uint64_t cpu_total_memory(void)
 {
     long pages = sysconf(_SC_PHYS_PAGES);
@@ -95,6 +108,7 @@ static bool table_remove(alloc_table *t, uintptr_t base)
 
 static ocu_status tracked_alloc(alloc_table *t, size_t bytes, void **ptr)
 {
+    pthread_once(&g_mem_atfork_once, mem_install_atfork);
     if (ptr == NULL) {
         return OCU_ERR_INVALID_VALUE;
     }

@@ -29,9 +29,18 @@ double cpu_now_ms(void)
  * queue is safe.
  */
 typedef struct marker_box {
-    ocu_marker marker; /* first member: the handle points here */
-    unsigned   refs;   /* guarded by marker.lock */
+    ocu_marker marker;     /* first member: the handle points here */
+    unsigned   refs;       /* guarded by marker.lock */
+    unsigned   generation; /* fork generation that created it */
 } marker_box;
+
+static unsigned current_generation(void);
+
+/* A marker from an ancestor process: its queue does not run here. */
+static bool marker_inherited(const ocu_marker *m)
+{
+    return ((const marker_box *)m)->generation != current_generation();
+}
 
 static void marker_unref(ocu_marker *m)
 {
@@ -76,6 +85,7 @@ ocu_status cpu_marker_create(ocu_device *dev, ocu_marker **marker)
     pthread_cond_init(&box->marker.done_cv, NULL);
     box->marker.state = MARKER_NEVER;
     box->refs = 1;
+    box->generation = current_generation();
     *marker = &box->marker;
     return OCU_OK;
 }
@@ -94,7 +104,7 @@ ocu_status cpu_marker_wait(ocu_marker *m)
     if (m == NULL) {
         return OCU_ERR_INVALID_HANDLE;
     }
-    if (cpu_in_kernel()) {
+    if (cpu_in_kernel() || marker_inherited(m)) {
         return OCU_ERR_NOT_SUPPORTED;
     }
     pthread_mutex_lock(&m->lock);
@@ -112,6 +122,9 @@ ocu_status cpu_marker_query(ocu_marker *m)
     if (m == NULL) {
         return OCU_ERR_INVALID_HANDLE;
     }
+    if (marker_inherited(m)) {
+        return OCU_ERR_NOT_SUPPORTED;
+    }
     pthread_mutex_lock(&m->lock);
     ocu_status st = m->state == MARKER_PENDING ? OCU_ERR_NOT_READY : OCU_OK;
     pthread_mutex_unlock(&m->lock);
@@ -123,6 +136,9 @@ ocu_status cpu_marker_elapsed_ms(ocu_marker *start, ocu_marker *end,
 {
     if (start == NULL || end == NULL) {
         return OCU_ERR_INVALID_HANDLE;
+    }
+    if (marker_inherited(start) || marker_inherited(end)) {
+        return OCU_ERR_NOT_SUPPORTED;
     }
     if (milliseconds == NULL) {
         return OCU_ERR_INVALID_VALUE;
@@ -246,6 +262,12 @@ static void queue_install_atfork(void)
 static bool inherited(const ocu_queue *q)
 {
     return q->generation != atomic_load(&g_fork_generation);
+}
+
+static unsigned current_generation(void)
+{
+    pthread_once(&g_queue_atfork_once, queue_install_atfork);
+    return atomic_load(&g_fork_generation);
 }
 
 static void wait_idle_locked(ocu_queue *q)
@@ -559,6 +581,9 @@ ocu_status cpu_marker_record(ocu_marker *m, ocu_queue *queue)
 {
     if (m == NULL) {
         return OCU_ERR_INVALID_HANDLE;
+    }
+    if (marker_inherited(m)) {
+        return OCU_ERR_NOT_SUPPORTED;
     }
     pthread_mutex_lock(&m->lock);
     uint64_t gen = ++m->generation;
