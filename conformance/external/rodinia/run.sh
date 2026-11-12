@@ -208,8 +208,9 @@ else report b+tree BUILD-FAIL "$(head -c 200 $C/b+tree/.ocu/build.log)"; fi
 
 # huffman: the program's own check (its GPU bitstream against cpuencode.cpp,
 # the program's CPU encoder). Reported as the program reports it. On the CPU
-# path it currently FAILS: the bitstream differs from element 189,425 on for the
-# 1 MiB input, and at 4 blocks the Pack2 kernel rejects its launch configuration.
+# path it FAILS because the program shifts 32-bit values by 32 (undefined in
+# C++; see README.md, "huffman"), and below 16 blocks the program launches
+# Pack2 with a grid of 0 blocks.
 if (cd $C/huffman && build huff main_test_cu.cu vlc_kernel_sm64huff.cu scan.cu pack_kernels.cu cpuencode.cpp -- -I.); then
     python3 "$HERE/huffman_gen.py" 1048576 $C/huffman/data.bin
     (cd $C/huffman && ./huff data.bin > ocu.txt 2>&1)
