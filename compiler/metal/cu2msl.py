@@ -61,7 +61,12 @@ def clang_ast(clang: str, src: Path, flags: list[str], name: str) -> list[dict]:
            f"-I{rt}", "-include", str(rt / "cuda_runtime.h"), "-DOCU_METAL_PATH",
            "-Wno-unknown-cuda-version", *flags, "-fsyntax-only",
            "-Xclang", "-ast-dump=json", "-Xclang", f"-ast-dump-filter={name}", str(src)]
-    out = subprocess.run(cmd, capture_output=True, text=True)
+    env = dict(os.environ)
+    if sys.platform == "darwin" and not env.get("SDKROOT"):
+        sdk = subprocess.run(["xcrun", "--show-sdk-path"], capture_output=True, text=True)
+        if sdk.returncode == 0 and sdk.stdout.strip():
+            env["SDKROOT"] = sdk.stdout.strip()  # compilers called by full path need it
+    out = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if out.returncode != 0:
         raise TranslateError(f"clang failed:\n{out.stderr[-2000:]}")
     dec = json.JSONDecoder()

@@ -70,17 +70,21 @@ def _llvm_tool(name: str) -> str:
     return name
 
 
-def sdk_flags() -> list[str]:
+def macos_sdk_env(env: dict) -> dict:
     """On macOS, a compiler called by full path (not through xcrun) does not
-    find the SDK by itself; pass it explicitly unless SDKROOT is set."""
-    if sys.platform != "darwin" or os.environ.get("SDKROOT"):
-        return []
+    find the SDK by itself. Set SDKROOT for it (unless already set): unlike
+    -isysroot this is also right when the compiler is an xcrun shim."""
+    if sys.platform != "darwin" or env.get("SDKROOT"):
+        return env
     try:
         path = subprocess.run(["xcrun", "--show-sdk-path"], capture_output=True, text=True,
                               check=True).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
-        return []
-    return ["-isysroot", path] if path else []
+        return env
+    if path:
+        env = dict(env)
+        env["SDKROOT"] = path
+    return env
 
 
 def write_container(path: Path, images: list[tuple[str, bytes]]) -> None:
@@ -165,7 +169,6 @@ def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
     for d in args.D:
         common += ["-D", d]
     common.append(f"-I{HERE}")
-    common += sdk_flags()
 
     if args.target == "cpu":
         cxx = os.environ.get("CXX", "c++")
@@ -254,6 +257,7 @@ def main(argv: list[str]) -> int:
     env = {k: v for k, v in os.environ.items()
            if k not in ("CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH",
                         "OBJC_INCLUDE_PATH", "CUDA_PATH", "CUDA_HOME", "HIP_PATH")}
+    env = macos_sdk_env(env)
 
     src = Path(args.source).resolve()
     out = Path(args.output).resolve()
