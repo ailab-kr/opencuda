@@ -89,6 +89,15 @@ void ocu_cpu_warp_sync(void);
 #define OCU_CPU_MAX_WARP 64
 uint32_t ocu_cpu_warp_gather(uint64_t value, uint64_t *all);
 
+/*
+ * The same, with a tag naming the call (for example the operation, mask
+ * and width). Every live lane meeting at this gather must pass the same
+ * tag; otherwise the lanes came from different calls (as with partial-mask
+ * code) and the launch fails with OCU_ERR_LAUNCH_FAILED instead of pairing
+ * them silently. ocu_cpu_warp_gather uses tag 0.
+ */
+uint32_t ocu_cpu_warp_gather_tagged(uint64_t value, uint64_t tag, uint64_t *all);
+
 #ifdef __cplusplus
 }
 #endif

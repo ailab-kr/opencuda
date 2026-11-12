@@ -15,7 +15,6 @@
 #include <string.h>
 
 #define RED_THREADS 256u /* threads of the single block used by reductions */
-#define TILE 16u
 
 static inline int64_t vidx(int64_t i, int n, int inc)
 {
@@ -24,7 +23,8 @@ static inline int64_t vidx(int64_t i, int n, int inc)
 
 static uint32_t blocks_for(int64_t count, uint32_t per)
 {
-    return (uint32_t)((count + per - 1) / per);
+    int64_t b = (count + per - 1) / per;
+    return b < 1 ? 1u : (uint32_t)b; /* callers keep count <= 2^31 * per */
 }
 
 static ocu_status launch(ocu_queue *q, ocu_cpu_kernel_fn fn, uint32_t gx,
@@ -45,15 +45,13 @@ static ocu_status launch(ocu_queue *q, ocu_cpu_kernel_fn fn, uint32_t gx,
     return cpu_kernel_launch(q, &k, &p);
 }
 
-static inline uint32_t gtid_x(void)
+/* 64-bit global thread id: grid.x * block.x can exceed 2^32. */
+static inline int64_t gtid(void)
 {
-    return ocu_cpu_block_idx().x * ocu_cpu_block_dim().x + ocu_cpu_thread_idx().x;
+    return (int64_t)ocu_cpu_block_idx().x * ocu_cpu_block_dim().x + ocu_cpu_thread_idx().x;
 }
 
-static inline uint32_t gtid_y(void)
-{
-    return ocu_cpu_block_idx().y * ocu_cpu_block_dim().y + ocu_cpu_thread_idx().y;
-}
+#define ELEM_THREADS 256u /* threads per block for one-thread-per-element kernels */
 
 /* ---- argument blocks ---------------------------------------------------- */
 
@@ -82,8 +80,8 @@ typedef struct mat_args {
 static void k_axpy_##S(void **a)                                               \
 {                                                                              \
     const vec_args *v = a[0];                                                  \
-    uint32_t i = gtid_x();                                                     \
-    if ((int)i >= v->n) return;                                                \
+    int64_t i = gtid();                                                        \
+    if (i >= v->n) return;                                                     \
     const T *x = v->x;                                                         \
     T *y = v->y;                                                               \
     T al = (T)v->alpha;                                                        \
@@ -94,17 +92,17 @@ static void k_axpy_##S(void **a)                                               \
 static void k_scal_##S(void **a)                                               \
 {                                                                              \
     const vec_args *v = a[0];                                                  \
-    uint32_t i = gtid_x();                                                     \
-    if ((int)i >= v->n) return;                                                \
+    int64_t i = gtid();                                                        \
+    if (i >= v->n) return;                                                     \
     T *x = v->y;                                                               \
-    x[(int64_t)i * v->incx] = (T)v->alpha * x[(int64_t)i * v->incx];           \
+    x[i * v->incx] = (T)v->alpha * x[i * v->incx];                             \
 }                                                                              \
                                                                                \
 static void k_copy_##S(void **a)                                               \
 {                                                                              \
     const vec_args *v = a[0];                                                  \
-    uint32_t i = gtid_x();                                                     \
-    if ((int)i >= v->n) return;                                                \
+    int64_t i = gtid();                                                        \
+    if (i >= v->n) return;                                                     \
     const T *x = v->x;                                                         \
     T *y = v->y;                                                               \
     y[vidx(i, v->n, v->incy)] = x[vidx(i, v->n, v->incx)];                     \
@@ -113,8 +111,8 @@ static void k_copy_##S(void **a)                                               \
 static void k_swap_##S(void **a)                                               \
 {                                                                              \
     const vec_args *v = a[0];                                                  \
-    uint32_t i = gtid_x();                                                     \
-    if ((int)i >= v->n) return;                                                \
+    int64_t i = gtid();                                                        \
+    if (i >= v->n) return;                                                     \
     T *x = (T *)(uintptr_t)v->x;                                               \
     T *y = v->y;                                                               \
     int64_t xi = vidx(i, v->n, v->incx), yi = vidx(i, v->n, v->incy);          \
@@ -246,15 +244,18 @@ static void k_gemv_##S(void **a)                                               \
     const mat_args *g = a[0];                                                  \
     int rows = g->opa == OCU_BLAS_OP_N ? g->m : g->n;                          \
     int cols = g->opa == OCU_BLAS_OP_N ? g->n : g->m;                          \
-    uint32_t i = gtid_x();                                                     \
-    if ((int)i >= rows) return;                                                \
+    int64_t i = gtid();                                                        \
+    if (i >= rows) return;                                                     \
     const T *A = g->a, *x = g->x;                                              \
     T *y = g->y;                                                               \
-    T s = 0;                                                                   \
-    for (int j = 0; j < cols; ++j)                                             \
-        s += op_get_##S(A, g->lda, g->opa, (int)i, j) * x[vidx(j, cols, g->incx)]; \
     int64_t yi = vidx(i, rows, g->incy);                                       \
-    T r = (T)g->alpha * s;                                                     \
+    T r = 0;                                                                   \
+    if (g->alpha != 0) { /* alpha == 0: A and x are not read */                \
+        T s = 0;                                                               \
+        for (int j = 0; j < cols; ++j)                                         \
+            s += op_get_##S(A, g->lda, g->opa, (int)i, j) * x[vidx(j, cols, g->incx)]; \
+        r = (T)g->alpha * s;                                                   \
+    }                                                                          \
     if (g->beta != 0) r += (T)g->beta * y[yi];                                 \
     y[yi] = r;                                                                 \
 }                                                                              \
@@ -262,8 +263,9 @@ static void k_gemv_##S(void **a)                                               \
 static void k_ger_##S(void **a)                                                \
 {                                                                              \
     const mat_args *g = a[0];                                                  \
-    uint32_t i = gtid_x(), j = gtid_y();                                       \
-    if ((int)i >= g->m || (int)j >= g->n) return;                              \
+    int64_t e = gtid();                                                        \
+    if (e >= (int64_t)g->m * g->n) return;                                     \
+    int64_t i = e % g->m, j = e / g->m;                                        \
     const T *x = g->x, *y = g->b;                                              \
     T *A = g->c;                                                               \
     int64_t q = i + (int64_t)j * g->lda;                                       \
@@ -273,16 +275,20 @@ static void k_ger_##S(void **a)                                                \
 static void k_gemm_##S(void **a)                                               \
 {                                                                              \
     const mat_args *g = a[0];                                                  \
-    uint32_t i = gtid_x(), j = gtid_y();                                       \
-    if ((int)i >= g->m || (int)j >= g->n) return;                              \
+    int64_t e = gtid();                                                        \
+    if (e >= (int64_t)g->m * g->n) return;                                     \
+    int i = (int)(e % g->m), j = (int)(e / g->m);                              \
     const T *A = g->a, *B = g->b;                                              \
     T *C = g->c;                                                               \
-    T s = 0;                                                                   \
-    for (int p = 0; p < g->k; ++p)                                             \
-        s += op_get_##S(A, g->lda, g->opa, (int)i, p) *                        \
-             op_get_##S(B, g->ldb, g->opb, p, (int)j);                         \
     int64_t q = i + (int64_t)j * g->ldc;                                       \
-    T r = (T)g->alpha * s;                                                     \
+    T r = 0;                                                                   \
+    if (g->alpha != 0) { /* alpha == 0: A and B are not read */                \
+        T s = 0;                                                               \
+        for (int p = 0; p < g->k; ++p)                                         \
+            s += op_get_##S(A, g->lda, g->opa, i, p) *                         \
+                 op_get_##S(B, g->ldb, g->opb, p, j);                          \
+        r = (T)g->alpha * s;                                                   \
+    }                                                                          \
     if (g->beta != 0) r += (T)g->beta * C[q]; /* beta == 0: C not read */      \
     C[q] = r;                                                                  \
 }                                                                              \
@@ -290,17 +296,21 @@ static void k_gemm_##S(void **a)                                               \
 static void k_syrk_##S(void **a)                                               \
 {                                                                              \
     const mat_args *g = a[0];                                                  \
-    uint32_t i = gtid_x(), j = gtid_y();                                       \
-    if ((int)i >= g->n || (int)j >= g->n) return;                              \
+    int64_t e = gtid();                                                        \
+    if (e >= (int64_t)g->n * g->n) return;                                     \
+    int i = (int)(e % g->n), j = (int)(e / g->n);                              \
     if (g->uplo == OCU_BLAS_UPPER ? i > j : i < j) return;                     \
     const T *A = g->a;                                                         \
     T *C = g->c;                                                               \
-    T s = 0;                                                                   \
-    for (int p = 0; p < g->k; ++p)                                             \
-        s += op_get_##S(A, g->lda, g->opa, (int)i, p) *                        \
-             op_get_##S(A, g->lda, g->opa, (int)j, p);                         \
     int64_t q = i + (int64_t)j * g->ldc;                                       \
-    T r = (T)g->alpha * s;                                                     \
+    T r = 0;                                                                   \
+    if (g->alpha != 0) { /* alpha == 0: A is not read */                       \
+        T s = 0;                                                               \
+        for (int p = 0; p < g->k; ++p)                                         \
+            s += op_get_##S(A, g->lda, g->opa, i, p) *                         \
+                 op_get_##S(A, g->lda, g->opa, j, p);                          \
+        r = (T)g->alpha * s;                                                   \
+    }                                                                          \
     if (g->beta != 0) r += (T)g->beta * C[q];                                  \
     C[q] = r;                                                                  \
 }                                                                              \
@@ -337,18 +347,26 @@ static void k_trsv_##S(void **a)                                               \
 static void k_trsm_##S(void **a)                                               \
 {                                                                              \
     const mat_args *g = a[0];                                                  \
-    uint32_t r = gtid_x();                                                     \
+    int64_t r = gtid();                                                        \
     T *B = g->c;                                                               \
     T al = (T)g->alpha;                                                        \
+    if (g->alpha == 0) { /* B := 0, neither A nor B is read */                 \
+        if (g->side == OCU_BLAS_LEFT ? r >= g->n : r >= g->m) return;          \
+        if (g->side == OCU_BLAS_LEFT)                                          \
+            for (int i = 0; i < g->m; ++i) B[r * g->ldb + i] = 0;              \
+        else                                                                   \
+            for (int j = 0; j < g->n; ++j) B[r + (int64_t)j * g->ldb] = 0;     \
+        return;                                                                \
+    }                                                                          \
     if (g->side == OCU_BLAS_LEFT) {                                            \
-        if ((int)r >= g->n) return;                                            \
+        if (r >= g->n) return;                                                 \
         int64_t col = (int64_t)r * g->ldb;                                     \
         for (int i = 0; i < g->m; ++i) B[col + i] *= al;                       \
         tri_solve_##S(g->a, g->lda, g->m, g->uplo, g->opa,                     \
                       g->diag == OCU_BLAS_UNIT, B, 1, col, 0, 0);              \
     } else {                                                                   \
         /* X op(A) = alpha B  <=>  op(A)^T X^T = alpha B^T */                  \
-        if ((int)r >= g->m) return;                                            \
+        if (r >= g->m) return;                                                 \
         for (int j = 0; j < g->n; ++j) B[r + (int64_t)j * g->ldb] *= al;       \
         int op_t = g->opa == OCU_BLAS_OP_N ? OCU_BLAS_OP_T : OCU_BLAS_OP_N;    \
         tri_solve_##S(g->a, g->lda, g->n, g->uplo, op_t,                       \
@@ -375,7 +393,8 @@ static ocu_status p_axpy(ocu_device *d, ocu_queue *q, ocu_blas_type t, int n,
 {
     (void)d;
     vec_args v = {n, incx, incy, scalar(t, alpha), x, y, NULL};
-    return launch(q, PICK(t, axpy), blocks_for(n, 256), 1, 256, 1, 0, &v, sizeof(v));
+    return launch(q, PICK(t, axpy), blocks_for(n, ELEM_THREADS), 1, ELEM_THREADS, 1, 0,
+                  &v, sizeof(v));
 }
 
 static ocu_status reduce(ocu_queue *q, ocu_cpu_kernel_fn fn, ocu_blas_type t,
@@ -399,7 +418,8 @@ static ocu_status p_scal(ocu_device *d, ocu_queue *q, ocu_blas_type t, int n,
 {
     (void)d;
     vec_args v = {n, incx, 0, scalar(t, alpha), NULL, x, NULL};
-    return launch(q, PICK(t, scal), blocks_for(n, 256), 1, 256, 1, 0, &v, sizeof(v));
+    return launch(q, PICK(t, scal), blocks_for(n, ELEM_THREADS), 1, ELEM_THREADS, 1, 0,
+                  &v, sizeof(v));
 }
 
 static ocu_status p_nrm2(ocu_device *d, ocu_queue *q, ocu_blas_type t, int n,
@@ -428,7 +448,8 @@ static ocu_status p_copy(ocu_device *d, ocu_queue *q, ocu_blas_type t, int n,
 {
     (void)d;
     vec_args v = {n, incx, incy, 0, x, y, NULL};
-    return launch(q, PICK(t, copy), blocks_for(n, 256), 1, 256, 1, 0, &v, sizeof(v));
+    return launch(q, PICK(t, copy), blocks_for(n, ELEM_THREADS), 1, ELEM_THREADS, 1, 0,
+                  &v, sizeof(v));
 }
 
 static ocu_status p_swap(ocu_device *d, ocu_queue *q, ocu_blas_type t, int n,
@@ -436,7 +457,8 @@ static ocu_status p_swap(ocu_device *d, ocu_queue *q, ocu_blas_type t, int n,
 {
     (void)d;
     vec_args v = {n, incx, incy, 0, x, y, NULL};
-    return launch(q, PICK(t, swap), blocks_for(n, 256), 1, 256, 1, 0, &v, sizeof(v));
+    return launch(q, PICK(t, swap), blocks_for(n, ELEM_THREADS), 1, ELEM_THREADS, 1, 0,
+                  &v, sizeof(v));
 }
 
 static ocu_status p_gemv(ocu_device *d, ocu_queue *q, ocu_blas_type t, ocu_blas_op op,
@@ -462,8 +484,8 @@ static ocu_status p_ger(ocu_device *d, ocu_queue *q, ocu_blas_type t, int m, int
     memset(&g, 0, sizeof(g));
     g.m = m; g.n = n; g.lda = lda; g.incx = incx; g.incy = incy;
     g.alpha = scalar(t, alpha); g.x = x; g.b = y; g.c = a;
-    return launch(q, PICK(t, ger), blocks_for(m, TILE), blocks_for(n, TILE), TILE,
-                  TILE, 0, &g, sizeof(g));
+    return launch(q, PICK(t, ger), blocks_for((int64_t)m * n, ELEM_THREADS), 1,
+                  ELEM_THREADS, 1, 0, &g, sizeof(g));
 }
 
 static ocu_status p_trsv(ocu_device *d, ocu_queue *q, ocu_blas_type t, ocu_blas_fill uplo,
@@ -489,8 +511,8 @@ static ocu_status p_gemm(ocu_device *d, ocu_queue *q, ocu_blas_type t, ocu_blas_
     g.m = m; g.n = n; g.k = k; g.lda = lda; g.ldb = ldb; g.ldc = ldc;
     g.opa = opa; g.opb = opb; g.alpha = scalar(t, alpha); g.beta = scalar(t, beta);
     g.a = a; g.b = b; g.c = c;
-    return launch(q, PICK(t, gemm), blocks_for(m, TILE), blocks_for(n, TILE), TILE,
-                  TILE, 0, &g, sizeof(g));
+    return launch(q, PICK(t, gemm), blocks_for((int64_t)m * n, ELEM_THREADS), 1,
+                  ELEM_THREADS, 1, 0, &g, sizeof(g));
 }
 
 static ocu_status p_syrk(ocu_device *d, ocu_queue *q, ocu_blas_type t, ocu_blas_fill uplo,
@@ -502,8 +524,8 @@ static ocu_status p_syrk(ocu_device *d, ocu_queue *q, ocu_blas_type t, ocu_blas_
     memset(&g, 0, sizeof(g));
     g.n = n; g.k = k; g.lda = lda; g.ldc = ldc; g.uplo = uplo; g.opa = op;
     g.alpha = scalar(t, alpha); g.beta = scalar(t, beta); g.a = a; g.c = c;
-    return launch(q, PICK(t, syrk), blocks_for(n, TILE), blocks_for(n, TILE), TILE,
-                  TILE, 0, &g, sizeof(g));
+    return launch(q, PICK(t, syrk), blocks_for((int64_t)n * n, ELEM_THREADS), 1,
+                  ELEM_THREADS, 1, 0, &g, sizeof(g));
 }
 
 static ocu_status p_trsm(ocu_device *d, ocu_queue *q, ocu_blas_type t, ocu_blas_side side,

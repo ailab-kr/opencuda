@@ -216,7 +216,9 @@ typedef struct block_exec {
     void             *dyn_shared;
     size_t            dyn_shared_bytes;
     uint64_t         *warp_slots;    /* one value per thread, for gathers */
+    uint64_t         *warp_tags;     /* the call each lane's gather came from */
     uint32_t          warp_size;
+    bool              warp_mismatch; /* lanes of a warp met at different calls */
     char             *stack_region;  /* one mmap for all fiber stacks */
     size_t            stack_region_bytes;
     size_t            stack_bytes;   /* usable bytes per fiber */
@@ -315,8 +317,10 @@ static ocu_status block_exec_init(block_exec *ex, uint32_t nthreads,
     ex->fibers = calloc(nthreads, sizeof(*ex->fibers));
     ex->order = calloc(nthreads, sizeof(*ex->order));
     ex->warp_slots = calloc(nthreads, sizeof(*ex->warp_slots));
+    ex->warp_tags = calloc(nthreads, sizeof(*ex->warp_tags));
     ex->warp_size = cfg->warp_size;
-    if (ex->fibers == NULL || ex->order == NULL || ex->warp_slots == NULL) {
+    if (ex->fibers == NULL || ex->order == NULL || ex->warp_slots == NULL ||
+        ex->warp_tags == NULL) {
         return OCU_ERR_OUT_OF_MEMORY;
     }
     for (uint32_t i = 0; i < nthreads; ++i) {
@@ -344,6 +348,7 @@ static void block_exec_release(block_exec *ex)
     free(ex->fibers);
     free(ex->order);
     free(ex->warp_slots);
+    free(ex->warp_tags);
     free(ex->dyn_shared);
     memset(ex, 0, sizeof(*ex));
 }
@@ -409,6 +414,16 @@ static bool release_warps(block_exec *ex)
     return released;
 }
 
+static void report_warp_mismatch(void)
+{
+    static atomic_flag said = ATOMIC_FLAG_INIT;
+    if (!atomic_flag_test_and_set(&said)) {
+        fprintf(stderr, "ocu cpu backend: lanes of one warp met at different "
+                        "warp operations (partial-mask code is not supported); "
+                        "the launch fails\n");
+    }
+}
+
 static void report_stack_overflow(void)
 {
     static atomic_flag said = ATOMIC_FLAG_INIT;
@@ -429,6 +444,7 @@ static ocu_status run_block(block_exec *ex, uint64_t linear_block)
         memset(ex->dyn_shared, 0xA5, ex->dyn_shared_bytes);
     }
     memset(ex->warp_slots, 0, ex->nthreads * sizeof(*ex->warp_slots));
+    ex->warp_mismatch = false;
     for (uint32_t i = 0; i < ex->nthreads; ++i) {
         fiber *f = &ex->fibers[i];
         f->state = FIBER_READY;
@@ -499,6 +515,10 @@ static ocu_status run_block(block_exec *ex, uint64_t linear_block)
             report_stack_overflow();
             return OCU_ERR_LAUNCH_FAILED;
         }
+    }
+    if (st == OCU_OK && ex->warp_mismatch) {
+        report_warp_mismatch();
+        return OCU_ERR_LAUNCH_FAILED;
     }
     return st;
 }
@@ -670,13 +690,24 @@ void ocu_cpu_warp_sync(void)
 
 uint32_t ocu_cpu_warp_gather(uint64_t value, uint64_t *all)
 {
+    return ocu_cpu_warp_gather_tagged(value, 0, all);
+}
+
+uint32_t ocu_cpu_warp_gather_tagged(uint64_t value, uint64_t tag, uint64_t *all)
+{
     block_exec *ex = tl_exec;
     uint32_t me = ex->current;
     uint32_t w = ex->warp_size;
     uint32_t base = me - me % w;
     uint32_t count = ex->nthreads - base < w ? ex->nthreads - base : w;
     ex->warp_slots[me] = value;
+    ex->warp_tags[me] = tag;
     ocu_cpu_warp_sync(); /* every lane has written */
+    for (uint32_t i = base; i < base + count; ++i) {
+        if (ex->fibers[i].state != FIBER_DONE && ex->warp_tags[i] != tag) {
+            ex->warp_mismatch = true;
+        }
+    }
     memcpy(all, &ex->warp_slots[base], count * sizeof(*all));
     ocu_cpu_warp_sync(); /* every lane has read: slots may be reused */
     return count;
