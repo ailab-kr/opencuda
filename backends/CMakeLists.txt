@@ -18,6 +18,11 @@ if(OCU_BACKEND_NVIDIA)
   add_subdirectory(nvidia)
 endif()
 
+if(OCU_BACKEND_OPENCL)
+  find_package(Threads REQUIRED)
+  add_subdirectory(opencl)
+endif()
+
 if(OCU_BACKEND_METAL)
   if(NOT APPLE)
     message(FATAL_ERROR "The Metal backend builds on Apple platforms only.")

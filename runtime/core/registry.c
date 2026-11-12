@@ -14,6 +14,9 @@
 #ifdef OCU_HAVE_BACKEND_NVIDIA
 #include "ocu_backend_nvidia.h"
 #endif
+#ifdef OCU_HAVE_BACKEND_OPENCL
+#include "ocu_backend_opencl.h"
+#endif
 #ifdef OCU_HAVE_BACKEND_METAL
 #include "ocu_backend_metal.h"
 #endif
@@ -90,6 +93,9 @@ static void register_builtin_once(void)
 #endif
 #ifdef OCU_HAVE_BACKEND_METAL
     (void)register_locked(ocu_backend_metal());
+#endif
+#ifdef OCU_HAVE_BACKEND_OPENCL
+    (void)register_locked(ocu_backend_opencl());
 #endif
     pthread_mutex_unlock(&g_lock);
 }
