@@ -209,10 +209,11 @@ inline std::uint64_t warp_tag(unsigned op, unsigned mask, int width)
  * Guide describes; up/down/idx never leave their group).
  */
 template <typename T>
-inline T shuffle_from(T v, int src, int width, std::uint64_t tag, bool earlier_ok = false)
+inline T shuffle_from(T v, int src, int width, std::uint64_t tag, unsigned mask,
+                      bool earlier_ok = false)
 {
     std::uint64_t all[OCU_CPU_MAX_WARP];
-    unsigned count = ocu_cpu_warp_gather_tagged(to_bits(v), tag, all);
+    unsigned count = ocu_cpu_warp_gather_masked(to_bits(v), tag, mask, all);
     int lane = static_cast<int>(ocu_cpu_lane_id());
     int w = width > 0 ? width : static_cast<int>(ocu_cpu_warp_size());
     int base = lane - lane % w;
@@ -232,7 +233,7 @@ inline T __shfl_sync(unsigned m, T v, int src, int width = warpSize)
     int lane = static_cast<int>(ocu_cpu_lane_id());
     int base = lane - lane % width;
     return ::ocu_cpu::shuffle_from(v, base + ((src % width) + width) % width, width,
-                                   ::ocu_cpu::warp_tag(1, m, width));
+                                   ::ocu_cpu::warp_tag(1, m, width), m);
 }
 
 template <typename T>
@@ -240,7 +241,7 @@ inline T __shfl_up_sync(unsigned m, T v, unsigned delta, int width = warpSize)
 {
     int lane = static_cast<int>(ocu_cpu_lane_id());
     return ::ocu_cpu::shuffle_from(v, lane - static_cast<int>(delta), width,
-                                   ::ocu_cpu::warp_tag(2, m, width));
+                                   ::ocu_cpu::warp_tag(2, m, width), m);
 }
 
 template <typename T>
@@ -248,7 +249,7 @@ inline T __shfl_down_sync(unsigned m, T v, unsigned delta, int width = warpSize)
 {
     int lane = static_cast<int>(ocu_cpu_lane_id());
     return ::ocu_cpu::shuffle_from(v, lane + static_cast<int>(delta), width,
-                                   ::ocu_cpu::warp_tag(3, m, width));
+                                   ::ocu_cpu::warp_tag(3, m, width), m);
 }
 
 template <typename T>
@@ -256,7 +257,7 @@ inline T __shfl_xor_sync(unsigned m, T v, int lane_mask, int width = warpSize)
 {
     int lane = static_cast<int>(ocu_cpu_lane_id());
     return ::ocu_cpu::shuffle_from(v, lane ^ lane_mask, width,
-                                   ::ocu_cpu::warp_tag(4, m, width), true);
+                                   ::ocu_cpu::warp_tag(4, m, width), m, true);
 }
 
 /*
@@ -267,7 +268,7 @@ inline T __shfl_xor_sync(unsigned m, T v, int lane_mask, int width = warpSize)
 inline unsigned __ballot_sync(unsigned m, int pred)
 {
     std::uint64_t all[OCU_CPU_MAX_WARP];
-    unsigned count = ocu_cpu_warp_gather_tagged(pred != 0, ::ocu_cpu::warp_tag(5, m, 0), all);
+    unsigned count = ocu_cpu_warp_gather_masked(pred != 0, ::ocu_cpu::warp_tag(5, m, 0), m, all);
     unsigned half = ocu_cpu_lane_id() & ~31u;
     unsigned bits = 0;
     for (unsigned i = 0; i < 32 && half + i < count; ++i) {
@@ -279,7 +280,7 @@ inline unsigned __ballot_sync(unsigned m, int pred)
 inline int __any_sync(unsigned m, int pred)
 {
     std::uint64_t all[OCU_CPU_MAX_WARP];
-    unsigned count = ocu_cpu_warp_gather_tagged(pred != 0, ::ocu_cpu::warp_tag(6, m, 0), all);
+    unsigned count = ocu_cpu_warp_gather_masked(pred != 0, ::ocu_cpu::warp_tag(6, m, 0), m, all);
     for (unsigned i = 0; i < count; ++i) {
         if (all[i]) return 1;
     }
@@ -289,11 +290,11 @@ inline int __any_sync(unsigned m, int pred)
 inline int __all_sync(unsigned m, int pred)
 {
     std::uint64_t all[OCU_CPU_MAX_WARP];
-    unsigned count = ocu_cpu_warp_gather_tagged(pred != 0, ::ocu_cpu::warp_tag(7, m, 0), all);
+    unsigned count = ocu_cpu_warp_gather_masked(pred != 0, ::ocu_cpu::warp_tag(7, m, 0), m, all);
     for (unsigned i = 0; i < count; ++i) {
         if (!all[i]) return 0;
     }
     return 1;
 }
 
-inline void __syncwarp(unsigned = 0xffffffffu) { ocu_cpu_warp_sync(); }
+inline void __syncwarp(unsigned m = 0xffffffffu) { ocu_cpu_warp_sync_masked(m); }
