@@ -16,9 +16,12 @@ What it guarantees on every path:
     only content is a one-line version marker;
   - include paths that point into a vendor SDK are refused.
 
-cpu:    rewrite (cpu_rewrite.py) then compile as C++17 with our
-        cuda_runtime.h force-included (as nvcc does). Link with ocu_cudart
-        (see cmake/OcuCpuPath.cmake).
+cpu:    .cu: preprocess as C++17 with our cuda_runtime.h force-included
+        (as nvcc does) and __CUDACC__ defined, rewrite the whole translation
+        unit (cpu_rewrite.py: launches in included files and macros too),
+        compile the result. .c/.cpp: compile with our headers on the
+        include path, as nvcc hands them to the host compiler. Link with
+        ocu_cudart (see cmake/OcuCpuPath.cmake).
 nvidia: device code only, as PTX (-S).
 amd:    device code only, as a code object.
 """
@@ -68,28 +71,38 @@ def _llvm_tool(name: str) -> str:
 
 
 def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
-    common = []
+    codegen = []  # options that matter after preprocessing
+    if args.O:
+        codegen.append(f"-O{args.O}")
+    if args.g:
+        codegen.append("-g")
+    common = list(codegen)
     for inc in args.I:
         common += ["-I", inc]
     for d in args.D:
         common += ["-D", d]
-    if args.O:
-        common.append(f"-O{args.O}")
-    if args.g:
-        common.append("-g")
     common.append(f"-I{HERE}")
 
     if args.target == "cpu":
-        rewritten = work / (src.stem + ".ocu.cpp")
         cxx = os.environ.get("CXX", "c++")
         rt = REPO / "runtime" / "include"
-        return [["<rewrite>", str(src), str(rewritten)],
-                [cxx, "-std=c++17", "-DOCU_CPU_PATH",
-                 f"-I{rt}", f"-I{REPO / 'backends' / 'interface'}",
-                 f"-I{REPO / 'backends' / 'cpu'}",
+        ours = [f"-I{rt}", f"-I{REPO / 'backends' / 'interface'}",
+                f"-I{REPO / 'backends' / 'cpu'}"]
+        if src.suffix in (".c",):
+            cc = os.environ.get("CC", "cc")
+            return [[cc, *ours, *common, "-c", str(src), "-o", str(out)]]
+        if src.suffix in (".cpp", ".cc", ".cxx", ".C"):
+            return [[cxx, *ours, *common, "-c", str(src), "-o", str(out)]]
+        pre = work / (src.stem + ".ii")
+        rewritten = work / (src.stem + ".ocu.ii")
+        return [[cxx, "-std=c++17", "-x", "c++", "-E", "-DOCU_CPU_PATH",
+                 "-DOCU_CPU_PREPROCESS", "-D__CUDACC__", *ours,
                  # nvcc includes cuda_runtime.h in every .cu file
                  "-include", str(rt / "cuda_runtime.h"),
-                 *common, "-c", str(rewritten), "-o", str(out)]]
+                 *common, str(src), "-o", str(pre)],
+                ["<rewrite>", str(pre), str(rewritten)],
+                [cxx, "-std=c++17", "-x", "c++-cpp-output", *codegen,
+                 "-c", str(rewritten), "-o", str(out)]]
     clang = _llvm_tool("clang++")
     if args.target == "nvidia":
         arch = args.arch or "sm_80"
@@ -140,11 +153,13 @@ def main(argv: list[str]) -> int:
                 continue
             if cmd[0] == "<rewrite>":
                 try:
-                    text, _stats = rewrite(Path(cmd[1]).read_text(encoding="utf-8"))
+                    # Bytes that are not UTF-8 (old sources) pass through unchanged.
+                    text = Path(cmd[1]).read_text(encoding="utf-8", errors="surrogateescape")
+                    text, _stats = rewrite(text, preprocessed=True)
                 except RewriteError as error:
-                    print(f"{cmd[1]}: {error}", file=sys.stderr)
+                    print(f"{args.source}: {error}", file=sys.stderr)
                     return 1
-                Path(cmd[2]).write_text(f'#line 1 "{cmd[1]}"\n' + text, encoding="utf-8")
+                Path(cmd[2]).write_text(text, encoding="utf-8", errors="surrogateescape")
                 continue
             done = subprocess.run(cmd, env=env)
             if done.returncode != 0:

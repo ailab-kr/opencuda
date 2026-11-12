@@ -1,10 +1,11 @@
 # ocu_add_cpu_cu_executable(<target> <source.cu|.cpp>...)
 #
 # Builds a CUDA program for the CPU path: every .cu source goes through
-# compiler/probe/ocu_cc.py --target cpu (rewrite + C++17 compile with
-# cuda_runtime.h force-included, as nvcc does), other sources are compiled
-# normally; the result links with the runtime and the CPU backend.
+# compiler/probe/ocu_cc.py --target cpu (preprocess with cuda_runtime.h
+# force-included as nvcc does, rewrite, compile as C++17), other sources are
+# compiled normally; the result links with the runtime and the CPU backend.
 function(ocu_add_cpu_cu_executable target)
+  file(GLOB ocu_rt_headers ${PROJECT_SOURCE_DIR}/runtime/include/*.h)
   set(objs)
   set(others)
   foreach(src IN LISTS ARGN)
@@ -21,8 +22,8 @@ function(ocu_add_cpu_cu_executable target)
                 --target cpu -O2 -c ${abs} -o ${obj}
         DEPENDS ${abs} ${PROJECT_SOURCE_DIR}/compiler/probe/ocu_cc.py
                 ${PROJECT_SOURCE_DIR}/compiler/probe/cpu_rewrite.py
-                ${PROJECT_SOURCE_DIR}/runtime/include/cuda_runtime_api.h
-                ${PROJECT_SOURCE_DIR}/runtime/include/ocu_cuda_lang_cpu.h
+                ${ocu_rt_headers}
+                ${PROJECT_SOURCE_DIR}/backends/cpu/ocu_cpu_kernel.h
         IMPLICIT_DEPENDS CXX ${abs}
         COMMENT "ocu_cc --target cpu ${src}")
       list(APPEND objs ${obj})

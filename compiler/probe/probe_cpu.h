@@ -38,6 +38,14 @@ struct dim3 {
 
 namespace ocu_cpu {
 
+/* A literal 0 passed to a kernel: converts to any pointer or number, as
+   the literal would in a direct call. */
+struct literal_zero {
+    template <class T, class = std::enable_if_t<std::is_pointer_v<T> || std::is_arithmetic_v<T> ||
+                                                std::is_enum_v<T> || std::is_member_pointer_v<T>>>
+    constexpr operator T() const { return T(0); }
+};
+
 struct idx3 {
     unsigned x, y, z;
 };

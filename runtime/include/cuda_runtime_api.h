@@ -15,20 +15,7 @@
 
 #include <stddef.h>
 
-/* Grid and block sizes. */
-#ifndef OCU_DIM3_DEFINED
-#define OCU_DIM3_DEFINED
-struct dim3 {
-    unsigned int x, y, z;
-#ifdef __cplusplus
-    constexpr dim3(unsigned int vx = 1, unsigned int vy = 1, unsigned int vz = 1)
-        : x(vx), y(vy), z(vz) {}
-#endif
-};
-#ifndef __cplusplus
-typedef struct dim3 dim3;
-#endif
-#endif
+#include "ocu_vector_types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -39,22 +26,88 @@ extern "C" {
 
 /* ---- errors ------------------------------------------------------------ */
 
+/*
+ * Values as listed in the public API reference. The runtime returns only
+ * some of them (see cudart.c); the rest exist so that code switching over
+ * error values compiles.
+ */
+#define OCU_RT_ERRORS(X) \
+    X(cudaSuccess, 0, "no error") \
+    X(cudaErrorInvalidValue, 1, "invalid argument") \
+    X(cudaErrorMemoryAllocation, 2, "out of memory") \
+    X(cudaErrorInitializationError, 3, "initialization error") \
+    X(cudaErrorCudartUnloading, 4, "runtime is shutting down") \
+    X(cudaErrorProfilerDisabled, 5, "profiler disabled") \
+    X(cudaErrorProfilerNotInitialized, 6, "profiler not initialized") \
+    X(cudaErrorProfilerAlreadyStarted, 7, "profiler already started") \
+    X(cudaErrorProfilerAlreadyStopped, 8, "profiler already stopped") \
+    X(cudaErrorInvalidConfiguration, 9, "invalid launch configuration") \
+    X(cudaErrorInvalidPitchValue, 12, "invalid pitch") \
+    X(cudaErrorInvalidSymbol, 13, "invalid device symbol") \
+    X(cudaErrorInvalidHostPointer, 16, "invalid host pointer") \
+    X(cudaErrorInvalidDevicePointer, 17, "invalid device pointer") \
+    X(cudaErrorInvalidTexture, 18, "invalid texture") \
+    X(cudaErrorInvalidTextureBinding, 19, "invalid texture binding") \
+    X(cudaErrorInvalidChannelDescriptor, 20, "invalid channel descriptor") \
+    X(cudaErrorInvalidMemcpyDirection, 21, "invalid copy direction") \
+    X(cudaErrorAddressOfConstant, 22, "address of constant") \
+    X(cudaErrorTextureFetchFailed, 23, "texture fetch failed") \
+    X(cudaErrorTextureNotBound, 24, "texture not bound") \
+    X(cudaErrorSynchronizationError, 25, "synchronization error") \
+    X(cudaErrorInvalidFilterSetting, 26, "invalid filter setting") \
+    X(cudaErrorInvalidNormSetting, 27, "invalid normalization setting") \
+    X(cudaErrorMixedDeviceExecution, 28, "mixed device execution") \
+    X(cudaErrorNotYetImplemented, 31, "not yet implemented") \
+    X(cudaErrorMemoryValueTooLarge, 32, "memory value too large") \
+    X(cudaErrorInsufficientDriver, 35, "driver too old") \
+    X(cudaErrorInvalidSurface, 37, "invalid surface") \
+    X(cudaErrorDuplicateVariableName, 43, "duplicate variable name") \
+    X(cudaErrorDuplicateTextureName, 44, "duplicate texture name") \
+    X(cudaErrorDuplicateSurfaceName, 45, "duplicate surface name") \
+    X(cudaErrorDevicesUnavailable, 46, "devices unavailable") \
+    X(cudaErrorIncompatibleDriverContext, 49, "incompatible driver context") \
+    X(cudaErrorMissingConfiguration, 52, "missing launch configuration") \
+    X(cudaErrorPriorLaunchFailure, 53, "prior launch failure") \
+    X(cudaErrorInvalidDeviceFunction, 98, "invalid device function") \
+    X(cudaErrorNoDevice, 100, "no device available") \
+    X(cudaErrorInvalidDevice, 101, "invalid device ordinal") \
+    X(cudaErrorStartupFailure, 127, "startup failure") \
+    X(cudaErrorInvalidKernelImage, 200, "invalid kernel image") \
+    X(cudaErrorMapBufferObjectFailed, 205, "map buffer object failed") \
+    X(cudaErrorUnmapBufferObjectFailed, 206, "unmap buffer object failed") \
+    X(cudaErrorNoKernelImageForDevice, 209, "no kernel image for this device") \
+    X(cudaErrorECCUncorrectable, 214, "uncorrectable memory error") \
+    X(cudaErrorUnsupportedLimit, 215, "unsupported limit") \
+    X(cudaErrorPeerAccessUnsupported, 217, "peer access unsupported") \
+    X(cudaErrorInvalidSource, 300, "invalid source") \
+    X(cudaErrorFileNotFound, 301, "file not found") \
+    X(cudaErrorSharedObjectSymbolNotFound, 302, "shared object symbol not found") \
+    X(cudaErrorSharedObjectInitFailed, 303, "shared object initialization failed") \
+    X(cudaErrorOperatingSystem, 304, "operating system call failed") \
+    X(cudaErrorInvalidResourceHandle, 400, "invalid resource handle") \
+    X(cudaErrorIllegalState, 401, "illegal state") \
+    X(cudaErrorSymbolNotFound, 500, "symbol not found") \
+    X(cudaErrorNotReady, 600, "device not ready") \
+    X(cudaErrorIllegalAddress, 700, "illegal memory access") \
+    X(cudaErrorLaunchOutOfResources, 701, "too many resources requested for launch") \
+    X(cudaErrorLaunchTimeout, 702, "launch timed out") \
+    X(cudaErrorPeerAccessAlreadyEnabled, 704, "peer access already enabled") \
+    X(cudaErrorPeerAccessNotEnabled, 705, "peer access not enabled") \
+    X(cudaErrorSetOnActiveProcess, 708, "cannot set while device is active") \
+    X(cudaErrorAssert, 710, "device-side assert triggered") \
+    X(cudaErrorTooManyPeers, 711, "too many peers") \
+    X(cudaErrorHostMemoryAlreadyRegistered, 712, "host memory already registered") \
+    X(cudaErrorHostMemoryNotRegistered, 713, "host memory not registered") \
+    X(cudaErrorLaunchFailure, 719, "unspecified launch failure") \
+    X(cudaErrorNotPermitted, 800, "operation not permitted") \
+    X(cudaErrorNotSupported, 801, "operation not supported") \
+    X(cudaErrorUnknown, 999, "unknown error")
+
 typedef enum cudaError {
-    cudaSuccess = 0,
-    cudaErrorInvalidValue = 1,
-    cudaErrorMemoryAllocation = 2,
-    cudaErrorInitializationError = 3,
-    cudaErrorInvalidConfiguration = 9,
-    cudaErrorInvalidMemcpyDirection = 21,
-    cudaErrorInvalidDeviceFunction = 98,
-    cudaErrorNoDevice = 100,
-    cudaErrorInvalidDevice = 101,
-    cudaErrorInvalidSymbol = 13,
-    cudaErrorInvalidResourceHandle = 400,
-    cudaErrorNotReady = 600,
-    cudaErrorLaunchFailure = 719,
-    cudaErrorNotSupported = 801,
-    cudaErrorUnknown = 999
+#define OCU_RT_ERROR_ENUM(name, value, text) name = value,
+    OCU_RT_ERRORS(OCU_RT_ERROR_ENUM)
+#undef OCU_RT_ERROR_ENUM
+    ocu_rt_error_end_ = 10000 /* not an error value */
 } cudaError_t;
 
 /* ---- basic types ------------------------------------------------------- */
@@ -78,6 +131,27 @@ typedef enum cudaMemcpyKind {
 #define cudaEventBlockingSync   0x01u
 #define cudaEventDisableTiming  0x02u
 #define cudaEventInterprocess   0x04u
+
+/* Host allocation flags (cudaHostAlloc). */
+#define cudaHostAllocDefault       0x00u
+#define cudaHostAllocPortable      0x01u
+#define cudaHostAllocMapped        0x02u
+#define cudaHostAllocWriteCombined 0x04u
+
+/* Cache preference: a hint. Devices without the choice ignore it. */
+enum cudaFuncCache {
+    cudaFuncCachePreferNone = 0,
+    cudaFuncCachePreferShared = 1,
+    cudaFuncCachePreferL1 = 2,
+    cudaFuncCachePreferEqual = 3
+};
+
+enum cudaComputeMode {
+    cudaComputeModeDefault = 0,
+    cudaComputeModeExclusive = 1,
+    cudaComputeModeProhibited = 2,
+    cudaComputeModeExclusiveProcess = 3
+};
 
 /* The legacy default stream. */
 #define cudaStreamLegacy ((cudaStream_t)0x1)
@@ -148,6 +222,10 @@ cudaError_t cudaDriverGetVersion(int *version);
 /* Deprecated spellings kept by existing code. */
 cudaError_t cudaThreadSynchronize(void);
 cudaError_t cudaThreadExit(void);
+/* Cache preferences are hints: recorded, validated, otherwise no effect. */
+cudaError_t cudaDeviceSetCacheConfig(enum cudaFuncCache config);
+cudaError_t cudaDeviceGetCacheConfig(enum cudaFuncCache *config);
+cudaError_t cudaFuncSetCacheConfig(const void *func, enum cudaFuncCache config);
 
 /* ---- memory ------------------------------------------------------------ */
 
@@ -155,6 +233,8 @@ cudaError_t cudaMalloc(void **ptr, size_t size);
 cudaError_t cudaFree(void *ptr);
 cudaError_t cudaMallocHost(void **ptr, size_t size);
 cudaError_t cudaFreeHost(void *ptr);
+cudaError_t cudaHostAlloc(void **ptr, size_t size, unsigned int flags);
+cudaError_t cudaMallocPitch(void **ptr, size_t *pitch, size_t width, size_t height);
 cudaError_t cudaMemGetInfo(size_t *free, size_t *total);
 cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, enum cudaMemcpyKind kind);
 cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count,
@@ -166,10 +246,17 @@ cudaError_t cudaMemcpy2DAsync(void *dst, size_t dpitch, const void *src, size_t 
                               cudaStream_t stream);
 cudaError_t cudaMemset(void *ptr, int value, size_t count);
 cudaError_t cudaMemsetAsync(void *ptr, int value, size_t count, cudaStream_t stream);
+cudaError_t cudaMemset2D(void *ptr, size_t pitch, int value, size_t width, size_t height);
 cudaError_t cudaMemcpyToSymbol(const void *symbol, const void *src, size_t count,
                                size_t offset, enum cudaMemcpyKind kind);
 cudaError_t cudaMemcpyFromSymbol(void *dst, const void *symbol, size_t count,
                                  size_t offset, enum cudaMemcpyKind kind);
+cudaError_t cudaMemcpyToSymbolAsync(const void *symbol, const void *src, size_t count,
+                                    size_t offset, enum cudaMemcpyKind kind,
+                                    cudaStream_t stream);
+cudaError_t cudaMemcpyFromSymbolAsync(void *dst, const void *symbol, size_t count,
+                                      size_t offset, enum cudaMemcpyKind kind,
+                                      cudaStream_t stream);
 
 /* ---- streams ----------------------------------------------------------- */
 
@@ -220,6 +307,44 @@ template <class T>
 static inline cudaError_t cudaMallocHost(T **ptr, size_t size)
 {
     return cudaMallocHost(reinterpret_cast<void **>(ptr), size);
+}
+
+template <class T>
+static inline cudaError_t cudaHostAlloc(T **ptr, size_t size, unsigned int flags)
+{
+    return cudaHostAlloc(reinterpret_cast<void **>(ptr), size, flags);
+}
+
+template <class T>
+static inline cudaError_t cudaMallocPitch(T **ptr, size_t *pitch, size_t width, size_t height)
+{
+    return cudaMallocPitch(reinterpret_cast<void **>(ptr), pitch, width, height);
+}
+
+template <class T>
+static inline cudaError_t cudaFuncSetCacheConfig(T *func, cudaFuncCache config)
+{
+    return cudaFuncSetCacheConfig(reinterpret_cast<const void *>(func), config);
+}
+
+template <class T>
+static inline cudaError_t cudaMemcpyToSymbolAsync(const T &symbol, const void *src,
+                                                  size_t count, size_t offset = 0,
+                                                  cudaMemcpyKind kind = cudaMemcpyHostToDevice,
+                                                  cudaStream_t stream = nullptr)
+{
+    return cudaMemcpyToSymbolAsync(static_cast<const void *>(&symbol), src, count, offset,
+                                   kind, stream);
+}
+
+template <class T>
+static inline cudaError_t cudaMemcpyFromSymbolAsync(void *dst, const T &symbol,
+                                                    size_t count, size_t offset = 0,
+                                                    cudaMemcpyKind kind = cudaMemcpyDeviceToHost,
+                                                    cudaStream_t stream = nullptr)
+{
+    return cudaMemcpyFromSymbolAsync(dst, static_cast<const void *>(&symbol), count, offset,
+                                     kind, stream);
 }
 
 static inline cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count,

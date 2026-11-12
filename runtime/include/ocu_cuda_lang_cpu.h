@@ -23,6 +23,14 @@
 #include "ocu_backend.h"
 #include "ocu_cpu_kernel.h"
 
+/* C headers whose names CUDA programs use without including them: the
+   vendor toolchain's own headers bring them in. */
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -39,8 +47,17 @@
 #define __device__
 #define __host__
 #define __forceinline__ inline
-#define __noinline__ __attribute__((noinline))
+/* An optimisation hint only. Left empty: the standard library spells the
+   GCC attribute __attribute__((__noinline__)), which a non-empty macro
+   would break. */
+#define __noinline__
+/* ocu_cc preprocesses first and rewrites after: there __shared__ must stay
+   recognisable (extern __shared__ arrays are rewritten). */
+#ifdef OCU_CPU_PREPROCESS
+#define __shared__ __ocu_shared__
+#else
 #define __shared__ static thread_local
+#endif
 #define __constant__
 #define __managed__
 #define __align__(n) alignas(n)
@@ -49,10 +66,14 @@
 
 namespace ocu_cpu {
 
-struct idx3 {
-    unsigned x, y, z;
+/* A literal 0 passed to a kernel: converts to any pointer or number, as
+   the literal would in a direct call. */
+struct literal_zero {
+    template <class T, class = std::enable_if_t<std::is_pointer_v<T> || std::is_arithmetic_v<T> ||
+                                                std::is_enum_v<T> || std::is_member_pointer_v<T>>>
+    constexpr operator T() const { return T(0); }
 };
-inline idx3 to_idx3(ocu_cpu_dim3 d) { return idx3{d.x, d.y, d.z}; }
+
 
 inline void *dynamic_shared() { return ocu_cpu_dynamic_shared(); }
 
@@ -191,18 +212,25 @@ inline T atomic_update_fp(T *addr, Op op)
 
 /* ---- built-in variables --------------------------------------------------- */
 
-#define threadIdx (::ocu_cpu::to_idx3(ocu_cpu_thread_idx()))
-#define blockIdx  (::ocu_cpu::to_idx3(ocu_cpu_block_idx()))
-#define blockDim  (::ocu_cpu::to_idx3(ocu_cpu_block_dim()))
-#define gridDim   (::ocu_cpu::to_idx3(ocu_cpu_grid_dim()))
-/* warpSize is a variable, not a macro: host code reads the field
-   cudaDeviceProp::warpSize under the same name. */
-namespace ocu_cpu {
-struct warp_size_t {
-    operator int() const { return static_cast<int>(ocu_cpu_warp_size()); }
-};
-} // namespace ocu_cpu
-static constexpr ::ocu_cpu::warp_size_t warpSize{};
+/*
+ * Real variables, as in CUDA (so host code may declare a local named
+ * gridDim): per-thread variables of the CPU backend under their CUDA
+ * names. Each GPU thread sees its own values; they never change while it
+ * runs, so `const` is accurate. dim3 and ocu_cpu_dim3 have the same layout.
+ */
+#define OCU_STR2_(x) #x
+#define OCU_STR_(x) OCU_STR2_(x)
+#define OCU_CPU_TLS_(name) __asm__(OCU_STR_(__USER_LABEL_PREFIX__) #name)
+static_assert(sizeof(dim3) == sizeof(ocu_cpu_dim3) && sizeof(uint3) == sizeof(ocu_cpu_dim3),
+              "built-in variable layout");
+extern "C" {
+extern thread_local const uint3 threadIdx OCU_CPU_TLS_(ocu_cpu_tls_thread_idx);
+extern thread_local const uint3 blockIdx OCU_CPU_TLS_(ocu_cpu_tls_block_idx);
+extern thread_local const dim3 blockDim OCU_CPU_TLS_(ocu_cpu_tls_block_dim);
+extern thread_local const dim3 gridDim OCU_CPU_TLS_(ocu_cpu_tls_grid_dim);
+extern thread_local const int warpSize OCU_CPU_TLS_(ocu_cpu_tls_warp_size);
+}
+#undef OCU_CPU_TLS_
 
 /* ---- synchronisation and fences ------------------------------------------- */
 
@@ -213,8 +241,15 @@ inline void __threadfence_system() { std::atomic_thread_fence(std::memory_order_
 
 /* ---- atomics ---------------------------------------------------------------- */
 
+/* The operand types follow the address type only (CUDA declares one
+   function per type, so atomicAdd(unsigned *, 1) converts the 1). */
+namespace ocu_cpu {
+template <typename T> struct nd_ { using type = T; };
+template <typename T> using nd = typename nd_<T>::type;
+} // namespace ocu_cpu
+
 template <typename T>
-inline T atomicAdd(T *addr, T v)
+inline T atomicAdd(T *addr, ::ocu_cpu::nd<T> v)
 {
     if constexpr (std::is_floating_point_v<T>) {
         return ::ocu_cpu::atomic_update_fp(addr, [v](T c) { return c + v; });
@@ -223,9 +258,9 @@ inline T atomicAdd(T *addr, T v)
     }
 }
 template <typename T>
-inline T atomicSub(T *addr, T v) { return __atomic_fetch_sub(addr, v, __ATOMIC_RELAXED); }
+inline T atomicSub(T *addr, ::ocu_cpu::nd<T> v) { return __atomic_fetch_sub(addr, v, __ATOMIC_RELAXED); }
 template <typename T>
-inline T atomicExch(T *addr, T v)
+inline T atomicExch(T *addr, ::ocu_cpu::nd<T> v)
 {
     if constexpr (std::is_floating_point_v<T>) {
         return ::ocu_cpu::atomic_update_fp(addr, [v](T) { return v; });
@@ -234,23 +269,23 @@ inline T atomicExch(T *addr, T v)
     }
 }
 template <typename T>
-inline T atomicMin(T *addr, T v)
+inline T atomicMin(T *addr, ::ocu_cpu::nd<T> v)
 {
     return ::ocu_cpu::atomic_update(addr, [v](T c) { return v < c ? v : c; });
 }
 template <typename T>
-inline T atomicMax(T *addr, T v)
+inline T atomicMax(T *addr, ::ocu_cpu::nd<T> v)
 {
     return ::ocu_cpu::atomic_update(addr, [v](T c) { return v > c ? v : c; });
 }
 template <typename T>
-inline T atomicAnd(T *addr, T v) { return __atomic_fetch_and(addr, v, __ATOMIC_RELAXED); }
+inline T atomicAnd(T *addr, ::ocu_cpu::nd<T> v) { return __atomic_fetch_and(addr, v, __ATOMIC_RELAXED); }
 template <typename T>
-inline T atomicOr(T *addr, T v) { return __atomic_fetch_or(addr, v, __ATOMIC_RELAXED); }
+inline T atomicOr(T *addr, ::ocu_cpu::nd<T> v) { return __atomic_fetch_or(addr, v, __ATOMIC_RELAXED); }
 template <typename T>
-inline T atomicXor(T *addr, T v) { return __atomic_fetch_xor(addr, v, __ATOMIC_RELAXED); }
+inline T atomicXor(T *addr, ::ocu_cpu::nd<T> v) { return __atomic_fetch_xor(addr, v, __ATOMIC_RELAXED); }
 template <typename T>
-inline T atomicCAS(T *addr, T compare, T v)
+inline T atomicCAS(T *addr, ::ocu_cpu::nd<T> compare, ::ocu_cpu::nd<T> v)
 {
     T expected = compare;
     __atomic_compare_exchange_n(addr, &expected, v, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
@@ -278,6 +313,30 @@ inline float min(float a, float b) { return std::fmin(a, b); }
 inline float max(float a, float b) { return std::fmax(a, b); }
 inline double min(double a, double b) { return std::fmin(a, b); }
 inline double max(double a, double b) { return std::fmax(a, b); }
+inline unsigned long long min(unsigned long long a, unsigned long long b) { return a < b ? a : b; }
+inline unsigned long long max(unsigned long long a, unsigned long long b) { return a > b ? a : b; }
+inline long min(long a, long b) { return a < b ? a : b; }
+inline long max(long a, long b) { return a > b ? a : b; }
+inline unsigned long min(unsigned long a, unsigned long b) { return a < b ? a : b; }
+inline unsigned long max(unsigned long a, unsigned long b) { return a > b ? a : b; }
+/* Mixed signedness and precision: the wider or unsigned type wins, as in
+   the documented overload set. */
+inline unsigned min(int a, unsigned b) { return min(static_cast<unsigned>(a), b); }
+inline unsigned min(unsigned a, int b) { return min(a, static_cast<unsigned>(b)); }
+inline unsigned max(int a, unsigned b) { return max(static_cast<unsigned>(a), b); }
+inline unsigned max(unsigned a, int b) { return max(a, static_cast<unsigned>(b)); }
+inline unsigned long long min(long long a, unsigned long long b)
+{ return min(static_cast<unsigned long long>(a), b); }
+inline unsigned long long min(unsigned long long a, long long b)
+{ return min(a, static_cast<unsigned long long>(b)); }
+inline unsigned long long max(long long a, unsigned long long b)
+{ return max(static_cast<unsigned long long>(a), b); }
+inline unsigned long long max(unsigned long long a, long long b)
+{ return max(a, static_cast<unsigned long long>(b)); }
+inline double min(float a, double b) { return std::fmin(static_cast<double>(a), b); }
+inline double min(double a, float b) { return std::fmin(a, static_cast<double>(b)); }
+inline double max(float a, double b) { return std::fmax(static_cast<double>(a), b); }
+inline double max(double a, float b) { return std::fmax(a, static_cast<double>(b)); }
 
 inline float __expf(float x) { return std::exp(x); }
 inline float __logf(float x) { return std::log(x); }

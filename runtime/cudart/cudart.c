@@ -22,6 +22,7 @@
 #include "ocu_core.h"
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -104,21 +105,10 @@ cudaError_t cudaPeekAtLastError(void) { return tl_last_error; }
 const char *cudaGetErrorName(cudaError_t e)
 {
     switch (e) {
-    case cudaSuccess:                     return "cudaSuccess";
-    case cudaErrorInvalidValue:           return "cudaErrorInvalidValue";
-    case cudaErrorMemoryAllocation:       return "cudaErrorMemoryAllocation";
-    case cudaErrorInitializationError:    return "cudaErrorInitializationError";
-    case cudaErrorInvalidConfiguration:   return "cudaErrorInvalidConfiguration";
-    case cudaErrorInvalidSymbol:          return "cudaErrorInvalidSymbol";
-    case cudaErrorInvalidMemcpyDirection: return "cudaErrorInvalidMemcpyDirection";
-    case cudaErrorInvalidDeviceFunction:  return "cudaErrorInvalidDeviceFunction";
-    case cudaErrorNoDevice:               return "cudaErrorNoDevice";
-    case cudaErrorInvalidDevice:          return "cudaErrorInvalidDevice";
-    case cudaErrorInvalidResourceHandle:  return "cudaErrorInvalidResourceHandle";
-    case cudaErrorNotReady:               return "cudaErrorNotReady";
-    case cudaErrorLaunchFailure:          return "cudaErrorLaunchFailure";
-    case cudaErrorNotSupported:           return "cudaErrorNotSupported";
-    case cudaErrorUnknown:                return "cudaErrorUnknown";
+#define NAME_CASE(name, value, text) case name: return #name;
+        OCU_RT_ERRORS(NAME_CASE)
+#undef NAME_CASE
+    default: break;
     }
     return "cudaErrorUnknown";
 }
@@ -126,23 +116,12 @@ const char *cudaGetErrorName(cudaError_t e)
 const char *cudaGetErrorString(cudaError_t e)
 {
     switch (e) {
-    case cudaSuccess:                     return "no error";
-    case cudaErrorInvalidValue:           return "invalid argument";
-    case cudaErrorMemoryAllocation:       return "out of memory";
-    case cudaErrorInitializationError:    return "initialization error";
-    case cudaErrorInvalidConfiguration:   return "invalid launch configuration";
-    case cudaErrorInvalidSymbol:          return "invalid device symbol";
-    case cudaErrorInvalidMemcpyDirection: return "invalid copy direction";
-    case cudaErrorInvalidDeviceFunction:  return "invalid device function";
-    case cudaErrorNoDevice:               return "no device available";
-    case cudaErrorInvalidDevice:          return "invalid device ordinal";
-    case cudaErrorInvalidResourceHandle:  return "invalid resource handle";
-    case cudaErrorNotReady:               return "device not ready";
-    case cudaErrorLaunchFailure:          return "kernel launch failed";
-    case cudaErrorNotSupported:           return "operation not supported";
-    case cudaErrorUnknown:                return "unknown error";
+#define TEXT_CASE(name, value, text) case name: return text;
+        OCU_RT_ERRORS(TEXT_CASE)
+#undef TEXT_CASE
+    default: break;
     }
-    return "unknown error";
+    return "unrecognized error code";
 }
 
 /* ---- devices ------------------------------------------------------------- */
@@ -372,6 +351,42 @@ cudaError_t cudaDeviceReset(void)
 
 cudaError_t cudaThreadExit(void) { return cudaDeviceReset(); }
 
+static bool valid_cache(enum cudaFuncCache c)
+{
+    return c == cudaFuncCachePreferNone || c == cudaFuncCachePreferShared ||
+           c == cudaFuncCachePreferL1 || c == cudaFuncCachePreferEqual;
+}
+
+/* Per device, as the API describes; read back by cudaDeviceGetCacheConfig. */
+static _Atomic int g_cache[MAX_DEVICES];
+
+cudaError_t cudaDeviceSetCacheConfig(enum cudaFuncCache config)
+{
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    if (!valid_cache(config)) return set_error(cudaErrorInvalidValue);
+    atomic_store(&g_cache[tl_device], (int)config);
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceGetCacheConfig(enum cudaFuncCache *config)
+{
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    if (config == NULL) return set_error(cudaErrorInvalidValue);
+    *config = (enum cudaFuncCache)atomic_load(&g_cache[tl_device]);
+    return cudaSuccess;
+}
+
+cudaError_t cudaFuncSetCacheConfig(const void *func, enum cudaFuncCache config)
+{
+    if (func == NULL) return set_error(cudaErrorInvalidDeviceFunction);
+    if (!valid_cache(config)) return set_error(cudaErrorInvalidValue);
+    return cudaSuccess; /* a hint: no cache split to choose on this device */
+}
+
 /* ---- stream resolution and the default-stream rules ---------------------- */
 
 /*
@@ -448,6 +463,27 @@ cudaError_t cudaFreeHost(void *ptr)
     cudaError_t e = current(&d);
     if (e != cudaSuccess) return set_error(e);
     return from(g_backend->host_free_pinned(d->dev, ptr));
+}
+
+cudaError_t cudaHostAlloc(void **ptr, size_t size, unsigned int flags)
+{
+    const unsigned known = cudaHostAllocPortable | cudaHostAllocMapped | cudaHostAllocWriteCombined;
+    if ((flags & ~known) != 0) return set_error(cudaErrorInvalidValue);
+    return cudaMallocHost(ptr, size);
+}
+
+/* Rows start on this boundary, the alignment every allocation has. */
+#define PITCH_ALIGN 256u
+
+cudaError_t cudaMallocPitch(void **ptr, size_t *pitch, size_t width, size_t height)
+{
+    if (ptr == NULL || pitch == NULL) return set_error(cudaErrorInvalidValue);
+    if (width > SIZE_MAX - PITCH_ALIGN) return set_error(cudaErrorMemoryAllocation);
+    size_t p = (width + PITCH_ALIGN - 1) / PITCH_ALIGN * PITCH_ALIGN;
+    if (height != 0 && p > SIZE_MAX / height) return set_error(cudaErrorMemoryAllocation);
+    cudaError_t e = cudaMalloc(ptr, p * height);
+    if (e == cudaSuccess) *pitch = p;
+    return e;
 }
 
 cudaError_t cudaMemGetInfo(size_t *free_bytes, size_t *total_bytes)
@@ -571,13 +607,24 @@ cudaError_t cudaMemsetAsync(void *ptr, int value, size_t count, cudaStream_t str
     return fill(ptr, value, count, stream);
 }
 
+cudaError_t cudaMemset2D(void *ptr, size_t pitch, int value, size_t width, size_t height)
+{
+    if (width > pitch) return set_error(cudaErrorInvalidValue);
+    if (width == 0 || height == 0) return cudaSuccess;
+    for (size_t row = 0; row < height; ++row) {
+        cudaError_t e = fill((char *)ptr + row * pitch, value, width, NULL);
+        if (e != cudaSuccess) return e;
+    }
+    return cudaSuccess;
+}
+
 /*
  * Symbols: the address of a __device__ / __constant__ variable. On
  * backends with unified memory (the CPU backend) that host address is the
  * device address and the copy is a plain copy after the default stream.
  * Other backends need module-level symbol lookup: not supported yet.
  */
-static cudaError_t symbol_copy(void *dst, const void *src, size_t count)
+static cudaError_t symbol_copy(void *dst, const void *src, size_t count, cudaStream_t stream)
 {
     rt_device *d;
     cudaError_t e = current(&d);
@@ -587,33 +634,60 @@ static cudaError_t symbol_copy(void *dst, const void *src, size_t count)
     if (st != OCU_OK) return from(st);
     if (!info.supports_unified_memory) return set_error(cudaErrorNotSupported);
     ocu_queue *q;
-    e = queue_for_submit(d, NULL, &q);
+    e = queue_for_submit(d, stream, &q); /* ordered after the stream's work */
     if (e == cudaSuccess) e = ocu_rt_error(g_backend->queue_sync(q));
     if (e != cudaSuccess) return set_error(e);
     if (count > 0) memmove(dst, src, count);
     return cudaSuccess;
 }
 
-cudaError_t cudaMemcpyToSymbol(const void *symbol, const void *src, size_t count,
-                               size_t offset, enum cudaMemcpyKind kind)
+static cudaError_t to_symbol(const void *symbol, const void *src, size_t count,
+                             size_t offset, enum cudaMemcpyKind kind, cudaStream_t stream)
 {
     if (symbol == NULL || (src == NULL && count > 0)) return set_error(cudaErrorInvalidSymbol);
     if (kind != cudaMemcpyHostToDevice && kind != cudaMemcpyDeviceToDevice &&
         kind != cudaMemcpyDefault) {
         return set_error(cudaErrorInvalidMemcpyDirection);
     }
-    return symbol_copy((char *)(uintptr_t)symbol + offset, src, count);
+    return symbol_copy((char *)(uintptr_t)symbol + offset, src, count, stream);
 }
 
-cudaError_t cudaMemcpyFromSymbol(void *dst, const void *symbol, size_t count, size_t offset,
-                                 enum cudaMemcpyKind kind)
+static cudaError_t from_symbol(void *dst, const void *symbol, size_t count, size_t offset,
+                               enum cudaMemcpyKind kind, cudaStream_t stream)
 {
     if (symbol == NULL || (dst == NULL && count > 0)) return set_error(cudaErrorInvalidSymbol);
     if (kind != cudaMemcpyDeviceToHost && kind != cudaMemcpyDeviceToDevice &&
         kind != cudaMemcpyDefault) {
         return set_error(cudaErrorInvalidMemcpyDirection);
     }
-    return symbol_copy(dst, (const char *)symbol + offset, count);
+    return symbol_copy(dst, (const char *)symbol + offset, count, stream);
+}
+
+cudaError_t cudaMemcpyToSymbol(const void *symbol, const void *src, size_t count,
+                               size_t offset, enum cudaMemcpyKind kind)
+{
+    return to_symbol(symbol, src, count, offset, kind, NULL);
+}
+
+cudaError_t cudaMemcpyFromSymbol(void *dst, const void *symbol, size_t count, size_t offset,
+                                 enum cudaMemcpyKind kind)
+{
+    return from_symbol(dst, symbol, count, offset, kind, NULL);
+}
+
+/* The asynchronous forms complete before returning, which the API allows. */
+cudaError_t cudaMemcpyToSymbolAsync(const void *symbol, const void *src, size_t count,
+                                    size_t offset, enum cudaMemcpyKind kind,
+                                    cudaStream_t stream)
+{
+    return to_symbol(symbol, src, count, offset, kind, stream);
+}
+
+cudaError_t cudaMemcpyFromSymbolAsync(void *dst, const void *symbol, size_t count,
+                                      size_t offset, enum cudaMemcpyKind kind,
+                                      cudaStream_t stream)
+{
+    return from_symbol(dst, symbol, count, offset, kind, stream);
 }
 
 /* ---- streams ------------------------------------------------------------- */

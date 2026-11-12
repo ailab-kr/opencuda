@@ -11,7 +11,8 @@ byte for byte, keeping line numbers:
                                   [](auto &&...ocu_a_) { KERNEL(ocu_a_...); }, ARGS)
      The kernel call inside the lambda is an ordinary C++ call, so template
      arguments, overloads and conversions resolve as in any call. A `NULL`
-     argument becomes `nullptr` so it still converts to a pointer after
+     argument becomes `nullptr` and a literal `0` becomes
+     ::ocu_cpu::literal_zero{}, so both still convert to a pointer after
      being copied.
   2. Dynamic shared memory:  extern __shared__ T NAME[];
          ->     static ::ocu_cpu::dyn_shared<T> NAME;
@@ -40,88 +41,107 @@ def _ident_char(c: str) -> bool:
     return c.isalnum() or c == "_"
 
 
-def _code_mask(src: str) -> list[bool]:
-    """mask[i] is True when src[i] is code, False inside comments, literals
-    and preprocessor directives (except the body of a #define)."""
+_INTEREST = re.compile(r"\n|//|/\*|\"|'")
+_DEFINE_HEAD = re.compile(r"#\s*define\s+[A-Za-z_]\w*(\([^)]*\))?")
+_RAW_PREFIX = re.compile(r"(?:u8|u|U|L)?R$")
+_RAW_DELIM = re.compile(r'([^()\\\s]{0,16})\(')
+
+
+def _line_end(src: str, i: int) -> int:
+    """Index of the newline ending the logical line at i (continuations
+    joined), or len(src)."""
     n = len(src)
-    mask = [True] * n
-    i = 0
-    at_line_start = True
-    while i < n:
-        c = src[i]
-        if at_line_start and c in " \t":
-            i += 1
+    while True:
+        j = src.find("\n", i)
+        if j < 0:
+            return n
+        if j > 0 and src[j - 1] == "\\":
+            i = j + 1
             continue
-        if at_line_start and c == "#":
-            m = re.match(r"#\s*define\s+[A-Za-z_]\w*(\([^)]*\))?", src[i:])
+        return j
+
+
+def _skip_literal(src: str, s: int, quote: str, clear) -> int:
+    n = len(src)
+    j = s + 1
+    while j < n and src[j] != quote:
+        if src[j] == "\\":
+            j += 1
+        elif src[j] == "\n":
+            raise RewriteError(f"unterminated literal at offset {s}")
+        j += 1
+    j += 1
+    # A prefix (L, u, U, u8) belongs to the literal.
+    start = s
+    while start > 0 and src[start - 1] in "LuU8" and not (
+            start > 1 and _ident_char(src[start - 2])):
+        start -= 1
+    clear(start, min(j, n))
+    return j
+
+
+def _code_mask(src: str) -> bytearray:
+    """mask[i] is 1 when src[i] is code, 0 inside comments, literals and
+    preprocessor directives (except the body of a #define). Jumps between
+    interesting characters, so a preprocessed translation unit (megabytes)
+    takes a fraction of a second."""
+    n = len(src)
+    mask = bytearray(b"\x01") * n
+
+    def clear(a: int, b: int) -> None:
+        if b > a:
+            mask[a:b] = bytes(b - a)
+
+    def line_start(i: int) -> int:
+        while i < n and src[i] in " \t":
+            i += 1
+        if i < n and src[i] == "#":
+            m = _DEFINE_HEAD.match(src, i)
             if m:
                 # Mask the head only; the body is code (it may hold launches).
-                for k in range(i, i + m.end()):
-                    mask[k] = False
-                i += m.end()
-                at_line_start = False
-                continue
-            j = i  # any other directive: skip it, with continuations
-            while j < n:
-                if src[j] == "\n" and (j == 0 or src[j - 1] != "\\"):
-                    break
-                j += 1
-            for k in range(i, j):
-                mask[k] = False
+                clear(i, m.end())
+                return m.end()
+            j = _line_end(src, i)
+            clear(i, j)
+            return j
+        return i
+
+    i = line_start(0)
+    while True:
+        m = _INTEREST.search(src, i)
+        if m is None:
+            break
+        s, tok = m.start(), m.group()
+        if tok == "\n":
+            i = line_start(s + 1)
+        elif tok == "//":
+            j = _line_end(src, s)
+            clear(s, j)
             i = j
-            continue
-        at_line_start = False
-        if c == "\n":
-            at_line_start = True
-            i += 1
-            continue
-        if src.startswith("//", i):
-            j = i
-            while j < n and not (src[j] == "\n" and src[j - 1] != "\\"):
-                j += 1
-            for k in range(i, j):
-                mask[k] = False
-            i = j
-            continue
-        if src.startswith("/*", i):
-            j = src.find("*/", i + 2)
+        elif tok == "/*":
+            j = src.find("*/", s + 2)
             j = n if j < 0 else j + 2
-            for k in range(i, j):
-                mask[k] = False
+            clear(s, j)
             i = j
-            continue
-        raw = re.match(r'(?:u8|u|U|L)?R"([^()\\\s]{0,16})\(', src[i:i + 24])
-        if raw and (i == 0 or not _ident_char(src[i - 1])):
-            end = src.find(")" + raw.group(1) + '"', i + raw.end())
-            if end < 0:
-                raise RewriteError("unterminated raw string")
-            j = end + len(raw.group(1)) + 2
-            for k in range(i, j):
-                mask[k] = False
-            i = j
-            continue
-        if c in "\"'":
-            if c == "'" and _is_digit_separator(src, i):
-                i += 1
+        elif tok == '"':
+            pre = _RAW_PREFIX.search(src, max(0, s - 3), s)
+            if pre and (pre.start() == 0 or not _ident_char(src[pre.start() - 1])):
+                d = _RAW_DELIM.match(src, s + 1)
+                if d is None:
+                    raise RewriteError("bad raw string delimiter")
+                end = src.find(")" + d.group(1) + '"', d.end())
+                if end < 0:
+                    raise RewriteError("unterminated raw string")
+                j = end + len(d.group(1)) + 2
+                clear(pre.start(), j)
+                i = j
                 continue
-            j = i + 1
-            while j < n and src[j] != c:
-                if src[j] == "\\":
-                    j += 1
-                elif src[j] == "\n":
-                    raise RewriteError(f"unterminated literal at offset {i}")
-                j += 1
-            j += 1
-            # A prefix (L, u, U, u8) belongs to the literal.
-            start = i
-            while start > 0 and src[start - 1] in "LuU8" and not (
-                    start > 1 and _ident_char(src[start - 2])):
-                start -= 1
-            for k in range(start, min(j, n)):
-                mask[k] = False
-            i = j
-            continue
-        i += 1
+            i = _skip_literal(src, s, '"', clear)
+        else:  # "'"
+            if _is_digit_separator(src, s):
+                i = s + 1
+                continue
+            i = _skip_literal(src, s, "'", clear)
     return mask
 
 
@@ -205,18 +225,27 @@ def _find_close(src: str, mask: list[bool], start: int) -> int:
     raise RewriteError("no closing ')'")
 
 
-def _find_chevron_end(src: str, mask: list[bool], start: int) -> int:
+_OPEN = re.compile(r"<[ \t]*<[ \t]*<")
+_CLOSE = re.compile(r">[ \t]*>[ \t]*>")
+
+
+def _find_chevron_end(src: str, mask, start: int) -> tuple[int, int]:
+    """(start, end) of the >>> closing the configuration that begins at
+    `start`. The three '>' may be separated by blanks, as nvcc accepts."""
     depth = 0
     i = start
-    while i < len(src):
+    n = len(src)
+    while i < n:
         if mask[i]:
             c = src[i]
             if c in "([{":
                 depth += 1
             elif c in ")]}":
                 depth -= 1
-            elif depth == 0 and src.startswith(">>>", i) and all(mask[i:i + 3]):
-                return i
+            elif depth == 0 and c == ">":
+                m = _CLOSE.match(src, i)
+                if m and mask[m.end() - 1]:
+                    return m.start(), m.end()
         i += 1
     raise RewriteError("no closing >>>")
 
@@ -244,9 +273,24 @@ def _fix_null_args(args: str) -> str:
         return args
     out = []
     for part in _split_top_level(args):
-        if part.strip() == "NULL":
-            part = part.replace("NULL", "nullptr")
-        out.append(part)
+        # Preprocessed text may carry line markers inside an argument.
+        lines = part.split("\n")
+        code = [k for k, line in enumerate(lines) if not line.lstrip().startswith("#")]
+        word = " ".join(lines[k] for k in code).strip()
+        if word in ("NULL", "__null"):  # __null: NULL after GCC preprocessing
+            new = "nullptr"
+        elif word == "0":
+            # A literal 0 converts to a pointer in a direct call; copied into
+            # the launch it would be an int. This type converts to both.
+            new = "::ocu_cpu::literal_zero{}"
+        else:
+            out.append(part)
+            continue
+        for k in code:
+            if word in lines[k]:
+                lines[k] = lines[k].replace(word, new, 1)
+                break
+        out.append("\n".join(lines))
     return ",".join(out)
 
 
@@ -256,45 +300,38 @@ def _layout(text: str) -> str:
 
 
 def _rewrite_launches(src: str) -> tuple[str, int]:
+    mask = _code_mask(src)
+    opens = [m for m in _OPEN.finditer(src) if mask[m.start()] and mask[m.end() - 1]]
     count = 0
-    while True:
-        mask = _code_mask(src)
-        pos = -1
-        i = 0
-        while True:
-            i = src.find("<<<", i)
-            if i < 0:
-                break
-            if all(mask[i:i + 3]):
-                pos = i
-                break
-            i += 3
-        if pos < 0:
-            return src, count
+    # From the end, so earlier offsets and their mask stay valid.
+    for m in reversed(opens):
+        pos, open_end = m.start(), m.end()
         callee_from = _callee_start(src, mask, pos)
         # the callee text ends where the whitespace/comments before <<< start
         callee_end = _skip_back(src, mask, pos)
         callee = src[callee_from:callee_end]
         continued = callee.count("\\\n")  # line continuations in the callee
         callee = callee.replace("\\\n", " ")
-        cfg_end = _find_chevron_end(src, mask, pos + 3)
-        cfg = src[pos + 3:cfg_end]
-        j = _skip_fwd(src, mask, cfg_end + 3)
+        cfg_end, close_end = _find_chevron_end(src, mask, open_end)
+        cfg = src[open_end:cfg_end]
+        j = _skip_fwd(src, mask, close_end)
         if j >= len(src) or src[j] != "(":
             raise RewriteError("launch without an argument list")
         args_end = _find_close(src, mask, j)
         args = _fix_null_args(src[j + 1:args_end])
-        gaps = _layout(src[callee_end:pos] + src[cfg_end + 3:j]) + "\\\n" * continued
+        gaps = _layout(src[callee_end:pos] + src[close_end:j]) + "\\\n" * continued
         sep = ", " if args.strip() else ""
         replacement = (f"::ocu_cpu::launch(::ocu_cpu::cfg({cfg}), "
                        f"[](auto &&...{LAMBDA_ARG}) {{ {callee}({LAMBDA_ARG}...); }}"
                        f"{sep}{args}){gaps}")
         src = src[:callee_from] + replacement + src[args_end + 1:]
+        mask = mask[:callee_from] + bytearray(b"\x01") * len(replacement) + mask[args_end + 1:]
         count += 1
+    return src, count
 
 
 _EXTERN_SHARED = re.compile(
-    r"\bextern\b(?P<pre>[^;{}()\[\]]*?)\b__shared__\b(?P<post>[^;{}\[\]]*?)"
+    r"\bextern\b(?P<pre>[^;{}()\[\]]*?)\b(?:__shared__|__ocu_shared__)\b(?P<post>[^;{}\[\]]*?)"
     r"\b(?P<name>[A-Za-z_]\w*)\s*\[\s*\]\s*;")
 _ALIGN = re.compile(r"__align__\s*\(\s*\d+\s*\)")
 
@@ -320,9 +357,18 @@ def _rewrite_extern_shared(src: str) -> tuple[str, int]:
     return "".join(out), count
 
 
-def rewrite(src: str) -> tuple[str, dict]:
+# What `__shared__` expands to during preprocessing (ocu_cuda_lang_cpu.h).
+_SHARED_MARK = re.compile(r"\b__ocu_shared__\b")
+
+
+def rewrite(src: str, preprocessed: bool = False) -> tuple[str, dict]:
+    """Rewrite one source text. With `preprocessed` the text is a whole
+    preprocessed translation unit, so launches from included files and
+    macros are visible; there `__shared__` appears as __ocu_shared__."""
     src, shared = _rewrite_extern_shared(src)
     src, launches = _rewrite_launches(src)
+    if preprocessed:
+        src = _SHARED_MARK.sub("static thread_local", src)
     return src, {"launches": launches, "extern_shared": shared}
 
 
