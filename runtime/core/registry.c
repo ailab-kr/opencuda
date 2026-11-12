@@ -14,10 +14,17 @@
 
 #define OCU_MAX_BACKENDS 8
 
+/*
+ * All state below is guarded by g_lock. The built-in backends are
+ * registered exactly once (pthread_once), so first use from several
+ * threads at the same time is safe.
+ */
+static pthread_mutex_t    g_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t     g_builtin_once = PTHREAD_ONCE_INIT;
 static const ocu_backend *g_backends[OCU_MAX_BACKENDS];
 static size_t             g_backend_count;
 static const ocu_backend *g_active;
-static int                g_builtin_done;
+static int                g_active_chosen; /* the first-use choice was made */
 
 /* Every entry except get_provider is mandatory. */
 static int table_is_complete(const ocu_backend *b)
@@ -32,6 +39,7 @@ static int table_is_complete(const ocu_backend *b)
            b->marker_query && b->marker_elapsed_ms;
 }
 
+/* Caller holds g_lock. */
 static const ocu_backend *find_backend(const char *name)
 {
     for (size_t i = 0; i < g_backend_count; ++i) {
@@ -42,7 +50,8 @@ static const ocu_backend *find_backend(const char *name)
     return NULL;
 }
 
-ocu_status ocu_register_backend(const ocu_backend *backend)
+/* Caller holds g_lock. */
+static ocu_status register_locked(const ocu_backend *backend)
 {
     if (backend == NULL || backend->name == NULL || backend->name[0] == '\0') {
         return OCU_ERR_INVALID_VALUE;
@@ -63,15 +72,27 @@ ocu_status ocu_register_backend(const ocu_backend *backend)
     return OCU_OK;
 }
 
+static void register_builtin_once(void)
+{
+    pthread_mutex_lock(&g_lock);
+#ifdef OCU_HAVE_BACKEND_CPU
+    (void)register_locked(ocu_backend_cpu());
+#endif
+    pthread_mutex_unlock(&g_lock);
+}
+
 static void register_builtin_backends(void)
 {
-    if (g_builtin_done) {
-        return;
-    }
-    g_builtin_done = 1;
-#ifdef OCU_HAVE_BACKEND_CPU
-    (void)ocu_register_backend(ocu_backend_cpu());
-#endif
+    pthread_once(&g_builtin_once, register_builtin_once);
+}
+
+ocu_status ocu_register_backend(const ocu_backend *backend)
+{
+    register_builtin_backends();
+    pthread_mutex_lock(&g_lock);
+    ocu_status st = register_locked(backend);
+    pthread_mutex_unlock(&g_lock);
+    return st;
 }
 
 ocu_status ocu_select_backend(const char *name)
@@ -80,30 +101,33 @@ ocu_status ocu_select_backend(const char *name)
     if (name == NULL) {
         return OCU_ERR_INVALID_VALUE;
     }
+    pthread_mutex_lock(&g_lock);
     const ocu_backend *b = find_backend(name);
-    if (b == NULL) {
-        return OCU_ERR_INVALID_VALUE;
+    if (b != NULL) {
+        g_active = b;
+        g_active_chosen = 1;
     }
-    g_active = b;
-    return OCU_OK;
+    pthread_mutex_unlock(&g_lock);
+    return b != NULL ? OCU_OK : OCU_ERR_INVALID_VALUE;
 }
 
 const ocu_backend *ocu_active_backend(void)
 {
     register_builtin_backends();
-    if (g_active != NULL) {
-        return g_active;
+    pthread_mutex_lock(&g_lock);
+    if (!g_active_chosen) {
+        /* First use: OCU_BACKEND picks one; otherwise the first registered. */
+        const char *want = getenv("OCU_BACKEND");
+        if (want != NULL && want[0] != '\0') {
+            g_active = find_backend(want); /* NULL when unknown: caller reports */
+        } else if (g_backend_count > 0) {
+            g_active = g_backends[0];
+        }
+        g_active_chosen = 1;
     }
-    /* First use: OCU_BACKEND picks one; otherwise the first registered. */
-    const char *want = getenv("OCU_BACKEND");
-    if (want != NULL && want[0] != '\0') {
-        g_active = find_backend(want); /* NULL when unknown: caller reports */
-        return g_active;
-    }
-    if (g_backend_count > 0) {
-        g_active = g_backends[0];
-    }
-    return g_active;
+    const ocu_backend *b = g_active;
+    pthread_mutex_unlock(&g_lock);
+    return b;
 }
 
 ocu_status ocu_core_device(const ocu_backend **backend, ocu_device **device)
@@ -132,14 +156,17 @@ ocu_status ocu_core_device(const ocu_backend **backend, ocu_device **device)
 size_t ocu_backend_count(void)
 {
     register_builtin_backends();
-    return g_backend_count;
+    pthread_mutex_lock(&g_lock);
+    size_t n = g_backend_count;
+    pthread_mutex_unlock(&g_lock);
+    return n;
 }
 
 const char *ocu_backend_name_at(size_t index)
 {
     register_builtin_backends();
-    if (index >= g_backend_count) {
-        return NULL;
-    }
-    return g_backends[index]->name;
+    pthread_mutex_lock(&g_lock);
+    const char *name = index < g_backend_count ? g_backends[index]->name : NULL;
+    pthread_mutex_unlock(&g_lock);
+    return name;
 }
