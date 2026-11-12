@@ -99,14 +99,27 @@ static void k_alignment(void **a)
     out[1] = (int)((const wide_arg *)a[0])->v[7];
 }
 
-/* Recurses with 1 KiB frames until `depth` reaches 0. */
-static int __attribute__((noinline)) deep(int depth)
+/* Recurses with 1 KiB frames until `depth` reaches 0. Optimisation is off
+   for this function and each frame is used after the call returns, so no
+   compiler can turn the recursion into a loop (Apple clang did, in Release
+   builds, with the earlier form). */
+#if defined(__clang__)
+#define OCU_NO_OPT __attribute__((noinline, optnone))
+#elif defined(__GNUC__)
+#define OCU_NO_OPT __attribute__((noinline, optimize("O0")))
+#else
+#define OCU_NO_OPT
+#endif
+static int OCU_NO_OPT deep(int depth)
 {
     volatile char frame[1024];
-    for (int i = 0; i < 1024; i += 64) {
-        frame[i] = (char)depth;
+    for (int i = 0; i < 1024; i += 8) {
+        frame[i] = (char)(depth + i);
     }
-    return depth == 0 ? frame[0] : deep(depth - 1) + frame[64];
+    if (depth == 0) return frame[0];
+    int r = deep(depth - 1);
+    frame[(unsigned)r & 1023u] = (char)r;
+    return r + frame[((unsigned)r + (unsigned)depth) & 1023u];
 }
 
 static void k_deep(void **a)
