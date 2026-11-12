@@ -50,9 +50,20 @@ static field *get(kase *k, const char *name)
     exit(2);
 }
 
-static long I(kase *k, const char *n) { return get(k, n)->i; }
-static double R(kase *k, const char *n) { return get(k, n)->r; }
-static char C(kase *k, const char *n) { return get(k, n)->c; }
+static field *typed(kase *k, const char *n, char kind)
+{
+    field *f = get(k, n);
+    if (f->kind != kind) {
+        fprintf(stderr, "driver: case %s field %s is '%c', want '%c'\n", k->id, n,
+                f->kind, kind);
+        exit(2);
+    }
+    return f;
+}
+
+static long I(kase *k, const char *n) { return typed(k, n, 'i')->i; }
+static double R(kase *k, const char *n) { return typed(k, n, 'r')->r; }
+static char C(kase *k, const char *n) { return typed(k, n, 'c')->c; }
 
 static int read_case(kase *k)
 {
@@ -132,15 +143,27 @@ static ocu_blas_fill fill(char c) { return c == 'U' ? OCU_BLAS_UPPER : OCU_BLAS_
 static ocu_blas_diag diag(char c) { return c == 'U' ? OCU_BLAS_UNIT : OCU_BLAS_NON_UNIT; }
 static ocu_blas_side side(char c) { return c == 'L' ? OCU_BLAS_LEFT : OCU_BLAS_RIGHT; }
 
-static void finish(ocu_status st)
+/* Wait for queued work; the first error wins. */
+static ocu_status finish(ocu_status st)
 {
     if (st == OCU_OK && Q != NULL) st = B->queue_sync(Q);
-    (void)st;
+    return st;
+}
+
+static void unsupported(kase *k)
+{
+    fprintf(stderr, "driver: no %s for %s\n", k->fn, k->kind);
+    exit(2);
 }
 
 static void run(kase *k)
 {
     const char *fn = k->fn;
+    /* single-precision only in the phase-0 set */
+    static const char *const s_only[] = {"copy", "swap", "ger", "trsv", "syrk", "trsm"};
+    for (size_t i = 0; i < sizeof(s_only) / sizeof(s_only[0]); ++i) {
+        if (!f32 && strcmp(fn, s_only[i]) == 0) unsupported(k);
+    }
     ocu_status st = OCU_OK;
     char out[4][8] = {{0}};
     void *dev[4] = {0};
@@ -152,7 +175,7 @@ static void run(kase *k)
         void *x = to_dev(k, "x"), *y = to_dev(k, "y");
         st = f32 ? ocu_blas_saxpy(Q, I(k, "n"), (float)R(k, "alpha"), x, I(k, "incx"), y, I(k, "incy"))
                  : ocu_blas_daxpy(Q, I(k, "n"), R(k, "alpha"), x, I(k, "incx"), y, I(k, "incy"));
-        finish(st); OUT("y", y); B->mem_free(D, x);
+        st = finish(st); OUT("y", y); B->mem_free(D, x);
     } else if (strcmp(fn, "dot") == 0) {
         void *x = to_dev(k, "x"), *y = to_dev(k, "y");
         if (f32) { float r; st = ocu_blas_sdot(Q, I(k, "n"), x, I(k, "incx"), y, I(k, "incy"), &r); rres = r; }
@@ -162,10 +185,11 @@ static void run(kase *k)
         void *x = to_dev(k, "x");
         st = f32 ? ocu_blas_sscal(Q, I(k, "n"), (float)R(k, "alpha"), x, I(k, "incx"))
                  : ocu_blas_dscal(Q, I(k, "n"), R(k, "alpha"), x, I(k, "incx"));
-        finish(st); OUT("x", x);
+        st = finish(st); OUT("x", x);
     } else if (strcmp(fn, "nrm2") == 0 || strcmp(fn, "asum") == 0) {
-        void *x = to_dev(k, "x");
         int nrm = fn[0] == 'n';
+        if (!f32 && !nrm) unsupported(k); /* the phase-0 set has no dasum */
+        void *x = to_dev(k, "x");
         if (f32) {
             float r;
             st = nrm ? ocu_blas_snrm2(Q, I(k, "n"), x, I(k, "incx"), &r)
@@ -176,6 +200,7 @@ static void run(kase *k)
         }
         has_r = 1; B->mem_free(D, x);
     } else if (strcmp(fn, "iamax") == 0) {
+        if (!f32) unsupported(k);
         void *x = to_dev(k, "x");
         st = ocu_blas_isamax(Q, I(k, "n"), x, I(k, "incx"), &ires);
         has_i = 1; B->mem_free(D, x);
@@ -183,10 +208,10 @@ static void run(kase *k)
         void *x = to_dev(k, "x"), *y = to_dev(k, "y");
         if (fn[0] == 'c') {
             st = ocu_blas_scopy(Q, I(k, "n"), x, I(k, "incx"), y, I(k, "incy"));
-            finish(st); OUT("y", y); B->mem_free(D, x);
+            st = finish(st); OUT("y", y); B->mem_free(D, x);
         } else {
             st = ocu_blas_sswap(Q, I(k, "n"), x, I(k, "incx"), y, I(k, "incy"));
-            finish(st); OUT("x", x); OUT("y", y);
+            st = finish(st); OUT("x", x); OUT("y", y);
         }
     } else if (strcmp(fn, "gemv") == 0) {
         void *a = to_dev(k, "a"), *x = to_dev(k, "x"), *y = to_dev(k, "y");
@@ -194,17 +219,17 @@ static void run(kase *k)
                                   a, I(k, "lda"), x, I(k, "incx"), (float)R(k, "beta"), y, I(k, "incy"))
                  : ocu_blas_dgemv(Q, op(C(k, "trans")), I(k, "m"), I(k, "n"), R(k, "alpha"),
                                   a, I(k, "lda"), x, I(k, "incx"), R(k, "beta"), y, I(k, "incy"));
-        finish(st); OUT("y", y); B->mem_free(D, a); B->mem_free(D, x);
+        st = finish(st); OUT("y", y); B->mem_free(D, a); B->mem_free(D, x);
     } else if (strcmp(fn, "ger") == 0) {
         void *x = to_dev(k, "x"), *y = to_dev(k, "y"), *a = to_dev(k, "a");
         st = ocu_blas_sger(Q, I(k, "m"), I(k, "n"), (float)R(k, "alpha"), x, I(k, "incx"),
                            y, I(k, "incy"), a, I(k, "lda"));
-        finish(st); OUT("a", a); B->mem_free(D, x); B->mem_free(D, y);
+        st = finish(st); OUT("a", a); B->mem_free(D, x); B->mem_free(D, y);
     } else if (strcmp(fn, "trsv") == 0) {
         void *a = to_dev(k, "a"), *x = to_dev(k, "x");
         st = ocu_blas_strsv(Q, fill(C(k, "uplo")), op(C(k, "trans")), diag(C(k, "diag")),
                             I(k, "n"), a, I(k, "lda"), x, I(k, "incx"));
-        finish(st); OUT("x", x); B->mem_free(D, a);
+        st = finish(st); OUT("x", x); B->mem_free(D, a);
     } else if (strcmp(fn, "gemm") == 0) {
         void *a = to_dev(k, "a"), *b = to_dev(k, "b"), *c = to_dev(k, "c");
         st = f32 ? ocu_blas_sgemm(Q, op(C(k, "transa")), op(C(k, "transb")), I(k, "m"), I(k, "n"),
@@ -213,18 +238,18 @@ static void run(kase *k)
                  : ocu_blas_dgemm(Q, op(C(k, "transa")), op(C(k, "transb")), I(k, "m"), I(k, "n"),
                                   I(k, "k"), R(k, "alpha"), a, I(k, "lda"), b, I(k, "ldb"),
                                   R(k, "beta"), c, I(k, "ldc"));
-        finish(st); OUT("c", c); B->mem_free(D, a); B->mem_free(D, b);
+        st = finish(st); OUT("c", c); B->mem_free(D, a); B->mem_free(D, b);
     } else if (strcmp(fn, "syrk") == 0) {
         void *a = to_dev(k, "a"), *c = to_dev(k, "c");
         st = ocu_blas_ssyrk(Q, fill(C(k, "uplo")), op(C(k, "trans")), I(k, "n"), I(k, "k"),
                             (float)R(k, "alpha"), a, I(k, "lda"), (float)R(k, "beta"), c, I(k, "ldc"));
-        finish(st); OUT("c", c); B->mem_free(D, a);
+        st = finish(st); OUT("c", c); B->mem_free(D, a);
     } else if (strcmp(fn, "trsm") == 0) {
         void *a = to_dev(k, "a"), *b = to_dev(k, "b");
         st = ocu_blas_strsm(Q, side(C(k, "side")), fill(C(k, "uplo")), op(C(k, "trans")),
                             diag(C(k, "diag")), I(k, "m"), I(k, "n"), (float)R(k, "alpha"),
                             a, I(k, "lda"), b, I(k, "ldb"));
-        finish(st); OUT("b", b); B->mem_free(D, a);
+        st = finish(st); OUT("b", b); B->mem_free(D, a);
     } else {
         fprintf(stderr, "driver: unknown fn %s\n", fn);
         exit(2);

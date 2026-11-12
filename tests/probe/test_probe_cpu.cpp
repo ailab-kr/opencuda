@@ -22,6 +22,8 @@ void run_warp_sum(const float *in, float *out, int blocks, int threads);
 void run_group_max(const int *in, int *out, int blocks, int threads);
 void run_misc(const int *in, int *bcast, int *scan, unsigned *ballots,
               int *any_all, int blocks, int threads);
+void run_xor16(const int *in, int *out, int threads);
+void run_partial_mask(int *out);
 // From probe_review.cu
 void run_rotate(float *data, int blocks);
 void run_fill(int *a, double *b, int n);
@@ -208,21 +210,41 @@ int main()
             bad += scan[i] != run;
         }
         CHECK(bad == 0);
-        if (W == 32) { // votes are warp-wide: only the 32-lane case is CUDA's
+        // ballot: each 32-lane group gets its own bits, for warp 32 and 64
+        bad = 0;
+        for (int g = 0; g < n / 32; ++g) {
+            unsigned want = 0;
+            for (int l = 0; l < 32; ++l) want |= unsigned(iin[g * 32 + l] % 3 == 0) << l;
+            bad += ballots[g] != want;
+        }
+        CHECK(bad == 0);
+        if (W == 32) { // any/all span the whole warp: only the 32-lane case is CUDA's
             bad = 0;
             for (int g = 0; g < n / 32; ++g) {
-                unsigned want = 0;
                 int any7 = 0;
-                for (int l = 0; l < 32; ++l) {
-                    want |= unsigned(iin[g * 32 + l] % 3 == 0) << l;
-                    any7 |= iin[g * 32 + l] == 7;
-                }
-                bad += ballots[g] != want;
+                for (int l = 0; l < 32; ++l) any7 |= iin[g * 32 + l] == 7;
                 bad += anyall[2 * g] != any7;
                 bad += anyall[2 * g + 1] != 1;
             }
             CHECK(bad == 0);
         }
+        // xor with width 16: lanes 16-31 read the earlier group (lane ^ 16)
+        int *x16 = dev_alloc<int>(64);
+        run_xor16(iin, x16, 64);
+        CHECK(ocu_cpu::last_status() == OCU_OK);
+        bad = 0;
+        for (int i = 0; i < 64; ++i) {
+            int lane = i % 32;
+            int want = lane >= 16 ? iin[i - 16] : iin[i]; // later group: own value
+            bad += x16[i] != want;
+        }
+        CHECK(bad == 0);
+        dev_free(x16);
+        // partial-mask code is reported, not answered wrongly
+        int *pm = dev_alloc<int>(32);
+        run_partial_mask(pm);
+        CHECK(ocu_cpu::last_status() == OCU_ERR_LAUNCH_FAILED);
+        dev_free(pm);
         dev_free(fin); dev_free(fout); dev_free(iin); dev_free(imax);
         dev_free(bc); dev_free(scan); dev_free(ballots); dev_free(anyall);
     }
