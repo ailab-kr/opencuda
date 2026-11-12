@@ -87,7 +87,7 @@ The 8 additions: `cudaThreadSynchronize` (an old alias, 36 calls in 23 Rodinia f
 ## CPU path limits found so far
 
 - Kernels launched from inside a kernel (dynamic parallelism) are refused with "not supported".
-- Warp-level operations work through a warp barrier and a tagged gather in the backend (`ocu_cpu_warp_gather_tagged`). Every live lane must take part, as code written with a full mask expects. Partial-mask code (lanes of one warp at different calls) is detected through the tag and fails the launch instead of giving wrong values.
+- Warp-level operations work through a warp barrier and a tagged gather in the backend (`ocu_cpu_warp_gather_tagged`). Every live lane must take part, as code written with a full mask expects. Partial-mask code (lanes of one warp at different calls, or at different occurrences of the same call) is detected through the tag and a per-lane sequence number and fails the launch instead of giving wrong values. A lane named in the mask that has already returned is undefined in CUDA; it is tolerated by default and fails the launch under `OCU_CPU_STRICT=1`.
 - `__shfl_xor_sync` with a width below the warp size may read an earlier group and returns its own value for a later one. `__ballot_sync` with a 64-lane warp returns the bits of the caller's own 32-lane half, since CUDA's result has 32 bits; `__any_sync` and `__all_sync` cover the whole warp.
 - A literal `0` passed for a pointer parameter does not convert after being copied (an int is passed); `NULL` is rewritten to `nullptr` and works.
 - The stream argument of a launch is accepted and ignored: the probe runs every launch synchronously.
