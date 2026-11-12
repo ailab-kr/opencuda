@@ -290,6 +290,30 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   add_test(NAME runtime_review2 COMMAND rt_review2)
   ocu_add_cpu_cu_executable(rt_launch_api runtime/rt_launch_api.cu)
   add_test(NAME runtime_launch_api COMMAND rt_launch_api)
+  # card libs-cub-subset: programmatic dependent launch, cudaLaunchKernelEx.
+  ocu_add_cpu_cu_executable(rt_pdl runtime/rt_pdl.cu)
+  add_test(NAME runtime_pdl COMMAND rt_pdl)
+  add_test(NAME runtime_pdl_random COMMAND rt_pdl)
+  set_tests_properties(runtime_pdl_random PROPERTIES
+    ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_THREADS=3")
+  add_executable(rt_pdl_c runtime/rt_pdl_c.c)
+  target_link_libraries(rt_pdl_c PRIVATE ${OCU_CUDART_TARGET})
+  add_test(NAME runtime_pdl_c COMMAND rt_pdl_c)
+  # card libs-cub-subset: CUB subset (cub/cub.cuh), device-wide and block-wide.
+  ocu_add_cpu_cu_executable(cub_device libs/cub_device.cu)
+  add_test(NAME cub_device COMMAND cub_device)
+  set_tests_properties(cub_device PROPERTIES TIMEOUT 1200)
+  add_test(NAME cub_device_random COMMAND cub_device)
+  set_tests_properties(cub_device_random PROPERTIES TIMEOUT 1200
+    ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_THREADS=3")
+  ocu_add_cpu_cu_executable(cub_block libs/cub_block.cu)
+  add_test(NAME cub_block COMMAND cub_block)
+  add_test(NAME cub_block_random COMMAND cub_block)
+  set_tests_properties(cub_block_random PROPERTIES
+    ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_THREADS=3")
+  add_test(NAME cub_block_warp64 COMMAND cub_block)
+  set_tests_properties(cub_block_warp64 PROPERTIES
+    ENVIRONMENT "OCU_CPU_WARP=64;OCU_CPU_ORDER=random;OCU_CPU_SEED=3")
   ocu_add_cpu_cu_executable(rt_review runtime/rt_review.cu)
   add_test(NAME runtime_review COMMAND rt_review)
   add_test(NAME runtime_review_random COMMAND rt_review)
@@ -508,10 +532,16 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
     # sources, on the installed NVIDIA GPU (skipped without one).
     add_executable(run_if_nvidia runtime/run_if_nvidia.c)
     target_link_libraries(run_if_nvidia PRIVATE ocu_backend_nvidia)
-    foreach(t rt_api rt_lang rt_mem rt_misc rt_launch_api rt_review rt_review2 rt_fp16 rt_bf16)
+    foreach(t rt_api rt_lang rt_mem rt_misc rt_launch_api rt_review rt_review2 rt_fp16 rt_bf16 rt_pdl)
       ocu_add_nvidia_cu_executable(${t}_nv runtime/${t}.cu)
       add_test(NAME gpu_${t} COMMAND run_if_nvidia $<TARGET_FILE:${t}_nv>)
       set_tests_properties(gpu_${t} PROPERTIES SKIP_RETURN_CODE 77
+        ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+    endforeach()
+    foreach(t cub_device cub_block)
+      ocu_add_nvidia_cu_executable(${t}_nv libs/${t}.cu)
+      add_test(NAME gpu_${t} COMMAND run_if_nvidia $<TARGET_FILE:${t}_nv>)
+      set_tests_properties(gpu_${t} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200
         ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
     endforeach()
     ocu_add_nvidia_cu_executable(ptx_shift_run_nv compiler/ptx_shift/ptx_shift_run.cu PTX_SHIFT)
