@@ -32,6 +32,10 @@ gcc -O2 "$HERE/hotspot_ref.c" -o "$TOOLS/hotspot_ref" || exit 2
 TARGET=${OCU_TARGET:-cpu}
 LIBS="$BUILD/runtime/libocu_cudart.a $BUILD/runtime/libocu_core.a $BUILD/backends/cpu/libocu_backend_cpu.a"
 [ -f "$BUILD/backends/nvidia/libocu_backend_nvidia.a" ] && LIBS="$LIBS $BUILD/backends/nvidia/libocu_backend_nvidia.a -ldl"
+[ -f "$BUILD/backends/opencl/libocu_backend_opencl.a" ] && LIBS="$LIBS $BUILD/backends/opencl/libocu_backend_opencl.a -ldl"
+# OCU_TARGET=opencl: device code through cu2ocl.py, run on the OpenCL backend
+# (OCU_OPENCL_LIBRARY / OCU_LLVM_SPIRV choose the library and translator).
+[ "$TARGET" = opencl ] && export OCU_BACKEND=opencl
 # build <exe> <sources...> [-- flags]: every source through ocu_cc, as nvcc
 # would take it.
 build() {

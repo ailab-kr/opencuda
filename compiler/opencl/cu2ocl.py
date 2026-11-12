@@ -52,6 +52,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 _spec = importlib.util.spec_from_file_location("cu2msl", HERE.parent / "metal" / "cu2msl.py")
 cu2msl = importlib.util.module_from_spec(_spec)
+sys.dont_write_bytecode = True  # no __pycache__ in the source tree
 _spec.loader.exec_module(cu2msl)
 TranslateError = cu2msl.TranslateError
 
