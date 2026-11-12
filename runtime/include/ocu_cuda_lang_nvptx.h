@@ -272,7 +272,9 @@ OCU_D int __mulhi(int a, int b) { return __nvvm_mulhi_i(a, b); }
 OCU_D unsigned __umulhi(unsigned a, unsigned b) { return __nvvm_mulhi_ui(a, b); }
 OCU_D long long __mul64hi(long long a, long long b) { return __nvvm_mulhi_ll(a, b); }
 OCU_D unsigned long long __umul64hi(unsigned long long a, unsigned long long b) { return __nvvm_mulhi_ull(a, b); }
-OCU_D unsigned __byte_perm(unsigned a, unsigned b, unsigned s) { return __nvvm_prmt(a, b, s); }
+/* 3-bit byte indices only: PTX prmt treats the fourth bit of a selector nibble as
+   "replicate the sign", which __byte_perm does not do. */
+OCU_D unsigned __byte_perm(unsigned a, unsigned b, unsigned s) { return __nvvm_prmt(a, b, s & 0x7777u); }
 OCU_D int __float_as_int(float x) { return __builtin_bit_cast(int, x); }
 OCU_D unsigned __float_as_uint(float x) { return __builtin_bit_cast(unsigned, x); }
 OCU_D float __int_as_float(int x) { return __builtin_bit_cast(float, x); }

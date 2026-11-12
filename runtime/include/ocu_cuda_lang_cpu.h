@@ -562,18 +562,17 @@ inline int __mulhi(int a, int b)
 
 /*
  * __byte_perm(x, y, s): the eight bytes {y,x} (x = bytes 0..3, y = 4..7);
- * result byte i is the byte named by the low 3 bits of selector nibble i.
- * When nibble i's top bit is set, that byte's sign bit is replicated instead.
+ * result byte i is the byte named by bits 4i..4i+2 of s (a 3-bit index;
+ * the fourth bit of each nibble and the upper 16 bits of s are ignored, as
+ * documented: programs rely on it, e.g. 4-bit table indices passed as is).
  */
 inline unsigned __byte_perm(unsigned x, unsigned y, unsigned s)
 {
     unsigned long long v = (static_cast<unsigned long long>(y) << 32) | x;
     unsigned r = 0;
     for (int i = 0; i < 4; ++i) {
-        unsigned sel = (s >> (4 * i)) & 0xfu;
-        unsigned b = static_cast<unsigned>((v >> (8 * (sel & 7u))) & 0xffu);
-        if (sel & 8u) b = (b & 0x80u) ? 0xffu : 0u;
-        r |= b << (8 * i);
+        unsigned sel = (s >> (4 * i)) & 0x7u;
+        r |= static_cast<unsigned>((v >> (8 * sel)) & 0xffu) << (8 * i);
     }
     return r;
 }
