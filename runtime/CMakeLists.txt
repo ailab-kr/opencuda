@@ -37,6 +37,9 @@ endif()
 if(OCU_BACKEND_NVIDIA)
   target_link_libraries(ocu_cudart PUBLIC ocu_backend_nvidia)
 endif()
+if(OCU_BACKEND_OPENCL)
+  target_link_libraries(ocu_cudart PUBLIC ocu_backend_opencl)
+endif()
 
 # CUDA's fma/fmaf round once (IEEE 754 fusedMultiplyAdd). Some C libraries'
 # do not (MinGW-w64). A configure check compares the C library with the

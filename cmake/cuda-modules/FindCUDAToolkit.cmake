@@ -43,7 +43,7 @@ if(EXISTS "${_ocu_root}/include/cuda_runtime_api.h")
 endif()
 
 set(_ocu_runtime)
-foreach(_ocu_name ocu_cudart ocu_core ocu_backend_cpu ocu_backend_nvidia ocu_backend_metal)
+foreach(_ocu_name ocu_cudart ocu_core ocu_backend_cpu ocu_backend_nvidia ocu_backend_opencl ocu_backend_metal)
   if(EXISTS "${_ocu_root}/lib/lib${_ocu_name}.a")
     list(APPEND _ocu_runtime "${_ocu_root}/lib/lib${_ocu_name}.a")
   endif()
