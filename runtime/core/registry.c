@@ -4,6 +4,7 @@
  */
 #include "ocu_core.h"
 
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -103,6 +104,29 @@ const ocu_backend *ocu_active_backend(void)
         g_active = g_backends[0];
     }
     return g_active;
+}
+
+ocu_status ocu_core_device(const ocu_backend **backend, ocu_device **device)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static ocu_device *dev;
+    static const ocu_backend *dev_backend;
+    const ocu_backend *b = ocu_active_backend();
+    if (b == NULL) {
+        return OCU_ERR_INVALID_DEVICE;
+    }
+    ocu_status st = OCU_OK;
+    pthread_mutex_lock(&lock);
+    if (dev == NULL || dev_backend != b) {
+        st = b->dev_open(0, &dev);
+        dev_backend = st == OCU_OK ? b : NULL;
+    }
+    pthread_mutex_unlock(&lock);
+    if (st == OCU_OK) {
+        if (backend != NULL) *backend = b;
+        if (device != NULL) *device = dev;
+    }
+    return st;
 }
 
 size_t ocu_backend_count(void)

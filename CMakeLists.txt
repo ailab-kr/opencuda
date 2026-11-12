@@ -19,6 +19,7 @@ endif()
 
 add_subdirectory(backends)
 add_subdirectory(runtime)
+add_subdirectory(libs)
 
 if(OCU_BUILD_TESTS)
   enable_testing()

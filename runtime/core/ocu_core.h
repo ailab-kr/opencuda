@@ -28,6 +28,12 @@ ocu_status ocu_select_backend(const char *name);
  */
 const ocu_backend *ocu_active_backend(void);
 
+/*
+ * Device 0 of the active backend, opened on first use. The libraries use
+ * this until the runtime layer manages devices per thread.
+ */
+ocu_status ocu_core_device(const ocu_backend **backend, ocu_device **device);
+
 size_t      ocu_backend_count(void);
 const char *ocu_backend_name_at(size_t index); /* NULL when out of range */
 

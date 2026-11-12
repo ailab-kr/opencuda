@@ -13,7 +13,8 @@ set(_ocu_cpu_sources
   cpu_memory.c
   cpu_queue.c
   cpu_exec.c
-  cpu_fiber.c)
+  cpu_fiber.c
+  cpu_blas.c)
 if(_ocu_fast_switch)
   enable_language(ASM)
   list(APPEND _ocu_cpu_sources cpu_fiber_switch.S)
@@ -22,6 +23,9 @@ endif()
 add_library(ocu_backend_cpu STATIC ${_ocu_cpu_sources})
 target_include_directories(ocu_backend_cpu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ocu_backend_cpu PUBLIC ocu_backend_interface Threads::Threads)
+if(NOT APPLE)
+  target_link_libraries(ocu_backend_cpu PUBLIC m)
+endif()
 if(_ocu_fast_switch)
   target_compile_definitions(ocu_backend_cpu PRIVATE OCU_CPU_FAST_SWITCH)
   message(STATUS "ocu: CPU backend fibers use the fast register switch")

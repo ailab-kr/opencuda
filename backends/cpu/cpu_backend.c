@@ -174,7 +174,7 @@ static const ocu_backend cpu_backend = {
     .marker_wait = cpu_marker_wait,
     .marker_query = cpu_marker_query,
     .marker_elapsed_ms = cpu_marker_elapsed_ms,
-    .get_provider = NULL,
+    .get_provider = cpu_get_provider,
 };
 
 const ocu_backend *ocu_backend_cpu(void)
