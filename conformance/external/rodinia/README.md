@@ -25,13 +25,46 @@ Inputs the script generates (fixed seeds): `gaussian_ref.py` (gaussian),
 
 Known results on the CPU path:
 
-- huffman: FAILS its own check. The GPU bitstream differs from the program's
-  CPU encoder (`cpuencode.cpp`, also built by `ocu_cc`): 5,627 differing
-  elements for the 1 MiB input, 1,360 for 256 KiB, 376 for 64 KiB.
-  The cause is in the program (see below, "huffman"); it is left as FAIL on
-  purpose, because the CPU path follows C++ here and the program does not.
+- huffman: FAILS its own check by default. The GPU bitstream differs from
+  the program's CPU encoder (`cpuencode.cpp`, also built by `ocu_cc`): 5,627
+  differing elements for the 1 MiB input, 1,360 for 256 KiB, 376 for 64 KiB.
+  The cause is in the program (see below, "huffman"); by default the CPU
+  path follows C++ here and the program does not. With PTX shift semantics
+  (`OCU_PTX_SHIFT=1`, see "compat" below) it passes.
   At 4 blocks (16 KiB input or less) the Pack2 kernel fails with "invalid
   launch configuration"; that is the program too (see below).
+
+compat (`OCU_PTX_SHIFT=1 run.sh ...`): every program is built with
+`ocu_cc.py --ptx-shift`, which gives shifts in device code the semantics of
+the PTX `shl`/`shr` instructions (amounts at or above the width clamp to
+it; `compiler/probe/ptx_shift.py`, card `cards/compiler/ptx-shift.md`).
+Default runs stay standard C++. Results on 2026-11-13 (CPU path, and the
+NVIDIA path on an RTX 5070 Ti):
+
+| program | cpu, standard | cpu, ptx-shift | nvidia, standard | nvidia, ptx-shift |
+|---|---|---|---|---|
+| huffman 64 KiB | 376 differing | PASS | PASS | PASS |
+| huffman 128 KiB | 766 differing | PASS | PASS | PASS |
+| huffman 256 KiB | 1,360 differing | PASS | PASS | PASS |
+| huffman 512 KiB | 3,836 differing | PASS | PASS | PASS |
+| huffman 1 MiB (5 runs) | 5,627-5,628 differing | PASS (5/5) | PASS (5/5) | PASS (5/5) |
+| the other 17 | 14 equal, 2 built only, kmeans does not build | same | same | same |
+
+The NVIDIA standard column passes by luck, not by rule: Clang turns a C++
+shift into an LLVM shift, whose result is poison at or above the width, and
+the optimizer may use that (`b == 32 ? a << b : 5` compiles to the constant
+5; a store of `dw << (32 - bit)` under `if (bit == 0)` is deleted). The
+huffman kernels happen to compile to plain `shl`. The option makes the
+NVIDIA path follow PTX too.
+
+Cost of the option, on a kernel that does nothing but shift by amounts read
+from memory (none can be folded): NVIDIA, median 7.60 vs 7.60 ms and 7.11 vs
+6.95 ms (off vs on; the device pass uses the clamping `shl`/`shr` directly);
+CPU path (4 threads, three rounds of 41 runs), medians 39.4/36.1/39.4 ms off
+and 39.1/42.4/40.2 ms on, about 6% (an earlier round of 21 runs: 15%); the
+slow 10% move by the same order. Shifts by integer literals below 32 are
+not changed, so ordinary code pays less. Compile time: one Clang syntax pass
+per .cu file (huffman's main file: CPU 4.1 s to 4.9 s, NVIDIA 1.4 s to 4.0 s).
 
 Differences that come from the programs themselves, not from this
 project (checked by reproducing the kernels as written):
@@ -78,10 +111,9 @@ project (checked by reproducing the kernels as written):
   configuration (each grid dimension must be at least 1). Our CPU and NVIDIA
   backends both reject it before launching; the limit is the documented one,
   not one of ours.
-  Not done: making the CPU path give the NVIDIA result for over-wide
-  shifts would mean changing every variable shift in device code, and would
-  take an NVIDIA observation as the reference for behaviour C++ leaves
-  undefined; that is a decision for the project, not made here.
+  The project's decision: the default stays standard C++; the opt-in
+  `--ptx-shift` gives the PTX-defined result (the published instruction
+  semantics, not an observation), see "compat" above.
 
 Not checked:
 

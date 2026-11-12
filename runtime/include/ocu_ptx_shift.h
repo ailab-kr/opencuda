@@ -58,16 +58,78 @@ __host__ __device__ constexpr unsigned amount(C c, unsigned width) {
     return u >= width ? width : static_cast<unsigned>(u);
 }
 
-template <class P>
-__host__ __device__ constexpr P shl(P a, unsigned n) {
+#if defined(__CUDA_ARCH__)
+/* NVIDIA device pass: the PTX instructions clamp by themselves, so a shift
+ * by an amount the compiler cannot see is one instruction (the portable
+ * form below costs a compare and a select). The amount operand is .u32. */
+__device__ inline unsigned ptx_shl(unsigned a, unsigned n) {
+    unsigned r;
+    asm("shl.b32 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(n));
+    return r;
+}
+__device__ inline unsigned long long ptx_shl(unsigned long long a, unsigned n) {
+    unsigned long long r;
+    asm("shl.b64 %0, %1, %2;" : "=l"(r) : "l"(a), "r"(n));
+    return r;
+}
+__device__ inline unsigned ptx_shr(unsigned a, unsigned n) {
+    unsigned r;
+    asm("shr.u32 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(n));
+    return r;
+}
+__device__ inline int ptx_shr(int a, unsigned n) {
+    int r;
+    asm("shr.s32 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(n));
+    return r;
+}
+__device__ inline unsigned long long ptx_shr(unsigned long long a, unsigned n) {
+    unsigned long long r;
+    asm("shr.u64 %0, %1, %2;" : "=l"(r) : "l"(a), "r"(n));
+    return r;
+}
+__device__ inline long long ptx_shr(long long a, unsigned n) {
+    long long r;
+    asm("shr.s64 %0, %1, %2;" : "=l"(r) : "l"(a), "r"(n));
+    return r;
+}
+
+/* The instruction can be used: not a constant evaluation, an amount the
+ * compiler cannot fold (constants keep the portable form, which folds),
+ * of at most 32 bits (wider amounts clamp by value, see above), and a
+ * 32- or 64-bit operand. */
+template <class P, class C>
+__device__ constexpr bool use_ptx(C c) {
+    return !__builtin_is_constant_evaluated() && !__builtin_constant_p(c) &&
+           sizeof(promoted_t<C>) <= 4 && (sizeof(P) == 4 || sizeof(P) == 8);
+}
+#endif
+
+template <class P, class C>
+__host__ __device__ constexpr P shl(P a, C c) {
     constexpr unsigned width = sizeof(P) * 8;
     using U = std::make_unsigned_t<P>;
+#if defined(__CUDA_ARCH__)
+    if (use_ptx<P>(c)) {
+        using W = std::conditional_t<sizeof(P) == 4, unsigned, unsigned long long>;
+        return static_cast<P>(ptx_shl(static_cast<W>(static_cast<U>(a)), static_cast<unsigned>(c)));
+    }
+#endif
+    unsigned n = amount(c, width);
     return n >= width ? P(0) : static_cast<P>(static_cast<U>(static_cast<U>(a) << n));
 }
 
-template <class P>
-__host__ __device__ constexpr P shr(P a, unsigned n) {
+template <class P, class C>
+__host__ __device__ constexpr P shr(P a, C c) {
     constexpr unsigned width = sizeof(P) * 8;
+#if defined(__CUDA_ARCH__)
+    if (use_ptx<P>(c)) {
+        using W = std::conditional_t<
+            std::is_signed<P>::value, std::conditional_t<sizeof(P) == 4, int, long long>,
+            std::conditional_t<sizeof(P) == 4, unsigned, unsigned long long>>;
+        return static_cast<P>(ptx_shr(static_cast<W>(a), static_cast<unsigned>(c)));
+    }
+#endif
+    unsigned n = amount(c, width);
     if constexpr (std::is_signed<P>::value) {
         return static_cast<P>(a >> (n >= width ? width - 1 : n));
     } else {
@@ -81,7 +143,7 @@ template <class A, class C>
 __host__ __device__ constexpr decltype(auto) __ocu_shl(A a, C c) {
     if constexpr (ocu_ptx_shift::integral_v<A, C>) {
         using P = ocu_ptx_shift::promoted_t<A>;
-        return ocu_ptx_shift::shl<P>(static_cast<P>(a), ocu_ptx_shift::amount(c, sizeof(P) * 8));
+        return ocu_ptx_shift::shl<P>(static_cast<P>(a), +c);
     } else {
         return a << c;
     }
@@ -91,7 +153,7 @@ template <class A, class C>
 __host__ __device__ constexpr decltype(auto) __ocu_shr(A a, C c) {
     if constexpr (ocu_ptx_shift::integral_v<A, C>) {
         using P = ocu_ptx_shift::promoted_t<A>;
-        return ocu_ptx_shift::shr<P>(static_cast<P>(a), ocu_ptx_shift::amount(c, sizeof(P) * 8));
+        return ocu_ptx_shift::shr<P>(static_cast<P>(a), +c);
     } else {
         return a >> c;
     }

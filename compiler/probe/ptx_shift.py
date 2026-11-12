@@ -46,6 +46,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -114,10 +115,10 @@ def make_copies(src: Path, dest: Path) -> dict[str, tuple[Path, str]]:
 
 # ---- the syntax tree -------------------------------------------------------------------
 
-def _annotate_files(root) -> None:
+def _annotate_files(root, cur: str | None = None) -> None:
     """Clang's JSON names a location's file only when it differs from the
-    location written before; fill it in everywhere (document order)."""
-    cur = None
+    location written before; fill it in everywhere (document order). `cur`
+    is the file in effect before `root`."""
     stack = [iter((root,))]
     while stack:
         try:
@@ -213,12 +214,15 @@ class Shift:
         self.op_begin, self.op_end, self.helper = op_begin, op_end, helper
 
 
-def find_shifts(tu, copies: dict, ignored) -> tuple[list[Shift], list[str]]:
+def find_shifts(tu, copies: dict, ignored, fields: set[str] | None = None
+                ) -> tuple[list[Shift], list[str]]:
     """Shifts to rewrite in the copies, and messages for those left alone.
-    `ignored(file)` is true for files whose device code is ours or the
-    system's (never reported)."""
-    _annotate_files(tu)
-    fields = _bitfields(tu)
+    `tu` is a syntax tree whose locations name their files (see
+    _annotate_files); `fields` the ids of bit-field declarations (default:
+    those in `tu`). `ignored(file)` is true for files whose device code is
+    ours or the system's (never reported)."""
+    if fields is None:
+        fields = _bitfields(tu)
     found: dict[tuple, Shift] = {}
     notes: set[tuple[str, int, str]] = set()
     texts: dict[str, str] = {}
@@ -325,6 +329,73 @@ def default_ignored(extra_dirs: list[str]):
     return ignored
 
 
+_DECL_START = b"\n    {\n"          # a top-level declaration (indent 4)
+_FILE = re.compile(rb'"file": "((?:[^"\\]|\\.)*)"')
+_BITFIELD = re.compile(rb'"isBitfield": true')
+_DEVICE_ATTR = (b'"CUDAGlobalAttr"', b'"CUDADeviceAttr"')
+
+
+def _json_str(raw: bytes) -> str:
+    if b"\\" in raw:
+        return json.loads(b'"' + raw + b'"')
+    return raw.decode("utf-8", "surrogateescape")
+
+
+def device_decls(stream, ignored) -> tuple[list, set[str]]:
+    """Read Clang's JSON syntax tree from `stream` one top-level declaration
+    at a time and parse only those that hold device functions of files not
+    `ignored` (a whole tree is hundreds of megabytes, nearly all of it the
+    runtime and standard headers). Returns those declarations, with every
+    location's file filled in, and the ids of all bit-field declarations."""
+    decls, fields = [], set()
+    cur = None
+
+    def take(chunk: bytes):
+        nonlocal cur
+        for m in _BITFIELD.finditer(chunk):
+            i = chunk.rfind(b'"id": "', 0, m.start())
+            if i >= 0:
+                fields.add(chunk[i + 7:chunk.index(b'"', i + 7)].decode("ascii"))
+        names = _FILE.findall(chunk)
+        before = cur
+        if names:
+            cur = _json_str(names[-1])
+        if not any(a in chunk for a in _DEVICE_ATTR):
+            return
+        files = {before} | {_json_str(n) for n in names}
+        if not any(f and not ignored(f) for f in files):
+            return
+        # The declaration ends at its closing brace (indent 4); after it
+        # come a comma, or for the last one the end of the tree.
+        end = chunk.rfind(b"\n    }")
+        if end < 0:
+            raise ValueError("no end of a declaration")
+        node = json.loads(chunk[:end + 6].decode("utf-8", "surrogateescape"))
+        _annotate_files(node, before)
+        decls.append(node)
+
+    buf = bytearray()
+    start = None   # where the current declaration begins in buf
+    scan = 0       # where to look for the next start
+    while True:
+        block = stream.read(1 << 22)
+        buf += block
+        while True:
+            i = buf.find(_DECL_START, max(scan, 0))
+            if i < 0:
+                scan = max(0, len(buf) - len(_DECL_START))
+                break
+            if start is not None:
+                take(bytes(buf[start:i + 1]))
+            del buf[:i + 1]  # buf now begins with the new declaration
+            start, scan = 0, 1
+        if not block:
+            if start is not None and buf.strip():
+                take(bytes(buf[start:]))
+            break
+    return decls, fields
+
+
 def prepare(src: Path, dest: Path, ast_cmd: list[str], env: dict, ignored_dirs: list[str],
             warn) -> tuple[Path, int]:
     """Copy and rewrite `src` and its local includes under `dest`. `ast_cmd`
@@ -335,17 +406,29 @@ def prepare(src: Path, dest: Path, ast_cmd: list[str], env: dict, ignored_dirs: 
     copy_src = dest / src.name
     cmd = [*ast_cmd, "-iquote", str(src.parent), "-w", "-fsyntax-only",
            "-Xclang", "-ast-dump=json", str(copy_src)]
-    done = subprocess.run(cmd, capture_output=True, env=env)
-    if done.returncode != 0:
-        err = done.stderr.decode("utf-8", "replace")[-3000:]
-        raise ShiftError(f"--ptx-shift: Clang could not read the source:\n{err}")
-    tu = json.loads(done.stdout.decode("latin-1"))
-    shifts, messages = find_shifts(tu, copies, default_ignored(ignored_dirs))
+    ignored = default_ignored(ignored_dirs)
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env) as proc:
+        err = []
+        reader = threading.Thread(target=lambda: err.append(proc.stderr.read()))
+        reader.start()
+        try:
+            decls, fields = device_decls(proc.stdout, ignored)
+        except ValueError as error:  # unreadable JSON: report Clang's message first
+            decls, fields = None, error
+            proc.stdout.read()
+        proc.wait()
+        reader.join()
+    if proc.returncode != 0:
+        msg = err[0].decode("utf-8", "replace")[-3000:] if err else ""
+        raise ShiftError(f"--ptx-shift: Clang could not read the source:\n{msg}")
+    if decls is None:
+        raise ShiftError(f"--ptx-shift: unexpected syntax tree format ({fields})")
+    shifts, messages = find_shifts({"inner": decls}, copies, ignored, fields)
     for m in messages:
         warn(m)
     by_file: dict[str, list[Shift]] = {}
-    for s in shifts:
-        by_file.setdefault(s.file, []).append(s)
+    for sh in shifts:
+        by_file.setdefault(sh.file, []).append(sh)
     for f, group in by_file.items():
         _, text = copies[f]
         Path(f).write_bytes(apply_edits(text, group).encode("latin-1"))

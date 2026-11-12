@@ -20,7 +20,7 @@ cost: { hours: 3, ai_usage: 0 }
 
 ## 동작
 
-기본은 표준 C++이다. `ocu_cc.py --ptx-shift`(CMake는 `ocu_add_cpu_cu_executable(<대상> PTX_SHIFT ...)` 또는 변수 `OCU_PTX_SHIFT`, Rodinia 스크립트는 `OCU_PTX_SHIFT=1`)를 주면 장치 함수 안의 정수 자리 옮김이 PTX의 `shl`/`shr` 정의를 따른다.
+기본은 표준 C++이다. `ocu_cc.py --ptx-shift`(CMake는 `ocu_add_cpu_cu_executable`·`ocu_add_nvidia_cu_executable`·`ocu_add_cu_library`에 `PTX_SHIFT`, 또는 변수 `OCU_PTX_SHIFT`; Rodinia 스크립트는 `OCU_PTX_SHIFT=1`; `ocu_cc.build_commands`를 쓰는 드라이버는 `args.ptx_shift`)를 주면 장치 함수 안의 정수 자리 옮김이 PTX의 `shl`/`shr` 정의를 따른다.
 
 - 옮김 양은 부호 없는 수로 본다. 너비(정수 승격 뒤 왼쪽 피연산자의 비트 수, 32 또는 64) 이상이면 너비로 줄인다.
 - `<<`: 너비 이상이면 0. 부호 있는 값도 비트를 옮긴다(음수 포함).
@@ -64,7 +64,10 @@ cost: { hours: 3, ai_usage: 0 }
 
 - 엔비디아 경로: Clang은 C++의 자리 옮김을 LLVM `shl`/`lshr`/`ashr`로 내리고, 양이 너비 이상이면 결과가 poison이다. PTX `shl`이 줄여 주는 것은 최적화가 그 값을 건드리지 않았을 때뿐이다. 확인(clang 18, sm_80, -O2): `b == 32 ? a << b : 5`는 상수 5가 되고, `if (bit == 0) o[0] = dw << (32 - bit);`는 저장이 통째로 지워지고, `(unsigned long long)((1 << k) - 1)`은 k=32에서 `ffffffff`(부호 확장이 사라짐)가 된다. 그래서 옵션은 엔비디아 경로에도 같은 변환을 한다.
 - 장치 패스(`--cuda-device-only`)의 구문 트리로 정한다. CPU는 호스트 패스로 본다(`__CUDA_ARCH__` 없음, CPU 경로와 같음). 어느 쪽에서도 보이지 않는 `#if` 분기 안의 자리 옮김은 바뀌지 않는다.
-- Metal(`compiler/metal/cu2msl.py`): 아직 없다. 같은 사본을 파일 겹침(vfs overlay)으로 주고 `msl_prelude.h`에 같은 도우미를 두면 되지만, 이 PC에서 MSL을 컴파일해 확인할 수 없어 넣지 않았다. 옵션을 주면 돌려주는 오류가 없으므로 Metal 쪽 드라이버가 생길 때 함께 정한다.
-- 비용과 Rodinia 결과는 `conformance/external/rodinia/README.md`.
+- 엔비디아 장치 패스에서는 컴파일러가 접을 수 없는 양(32비트 이하)이면 도우미가 PTX `shl`/`shr`를 그대로 쓴다(인라인 PTX, 명령 자체가 양을 줄임). 상수 양은 이식 가능한 형태로 두어 접힌다. CPU 경로는 비교와 선택이 더해진다.
+- 구문 트리는 수백 MB(huffman 374MB)라 Clang 출력을 최상위 선언 단위로 흘려 읽고, 사용자 파일의 장치 함수가 든 선언만 해석한다(최대 메모리 1.3GB → 약 390MB, 그중 Clang 124MB).
+- Metal(`compiler/metal/cu2msl.py`): 아직 없다(`cu2msl.py`에 옵션이 없다). 같은 사본을 파일 겹침(vfs overlay)으로 주고 `msl_prelude.h`에 같은 도우미를 두면 되지만, 이 PC에서 MSL을 컴파일해 확인할 수 없어 넣지 않았다.
+- `ocu-nvcc`(compiler/driver)는 아직 이 옵션을 내놓지 않는다. 내놓을 때 의존 파일(-MD)이 사본 경로를 가리키지 않게 해야 한다.
+- 비용과 Rodinia 결과는 `conformance/external/rodinia/README.md`("compat").
 
 ## 이의
