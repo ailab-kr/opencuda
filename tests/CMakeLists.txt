@@ -607,6 +607,7 @@ if(OCU_BACKEND_CPU AND Python3_FOUND AND NOT WIN32 AND NOT CMAKE_CROSSCOMPILING)
             "-DCFLAGS=${CMAKE_C_FLAGS}" "-DCXXFLAGS=${CMAKE_CXX_FLAGS}"
             "-DLDFLAGS=${CMAKE_EXE_LINKER_FLAGS}"
             -P ${_drv}/cmake_project_test.cmake)
+endif()
 
 # ---- operator table (docs/spec/op-table.md) ------------------------------
 # test_ops <backend>: conformance of one backend's operator table.
