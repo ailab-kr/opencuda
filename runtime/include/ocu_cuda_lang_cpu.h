@@ -633,36 +633,40 @@ inline std::uint64_t warp_tag(unsigned op, unsigned mask, int width)
  * `width` lanes or past the end of the warp. `earlier_ok`: whether an
  * earlier group may be read (xor may; up, down and idx stay in their group).
  */
+/* `x` mod `w` into [0, w), and the start of `lane`'s group of `w` lanes:
+   without a division for the power-of-two widths CUDA allows. */
+inline int lane_mod(int x, int w)
+{
+    return (w & (w - 1)) == 0 ? (x & (w - 1)) : ((x % w) + w) % w;
+}
+
+inline int group_base(int lane, int w)
+{
+    return (w & (w - 1)) == 0 ? (lane & -w) : lane - lane % w;
+}
+
 template <typename T>
 inline T shuffle_from(T v, int src, int width, std::uint64_t tag, unsigned mask,
                       bool earlier_ok = false)
 {
-    std::uint64_t all[OCU_CPU_MAX_WARP];
-    unsigned count = ocu_cpu_warp_gather_masked(to_bits(v), tag, mask, all);
     int lane = static_cast<int>(ocu_cpu_lane_id());
     int w = width > 0 ? width : static_cast<int>(ocu_cpu_warp_size());
-    int base = lane - lane % w;
+    int base = group_base(lane, w);
     bool before = src < base;
-    if ((before && !earlier_ok) || src < 0 || src >= base + w ||
-        src >= static_cast<int>(count)) {
+    if ((before && !earlier_ok) || src < 0 || src >= base + w) {
         src = lane;
     }
-    return from_bits<T>(all[src]);
+    /* A source past the end of a short warp gives our own value. */
+    return from_bits<T>(ocu_cpu_warp_shuffle_masked(to_bits(v), tag, mask,
+                                                    static_cast<unsigned>(src)));
 }
 
 /* Predicates of the lanes the mask names, as bits of the caller's group. */
 inline unsigned vote_bits(unsigned op, unsigned mask, int pred)
 {
-    std::uint64_t all[OCU_CPU_MAX_WARP];
-    unsigned count = ocu_cpu_warp_gather_masked(pred != 0, warp_tag(op, mask, 0), mask, all);
+    std::uint64_t all = ocu_cpu_warp_vote_masked(pred, warp_tag(op, mask, 0), mask);
     unsigned group = ocu_cpu_lane_id() & ~31u;
-    unsigned bits = 0;
-    for (unsigned i = 0; i < 32 && group + i < count; ++i) {
-        if ((mask >> i & 1u) && all[group + i] != 0) {
-            bits |= 1u << i;
-        }
-    }
-    return bits;
+    return static_cast<unsigned>(all >> group) & mask;
 }
 
 } // namespace ocu_cpu
@@ -671,8 +675,8 @@ template <typename T>
 inline T __shfl_sync(unsigned m, T v, int src, int width = warpSize)
 {
     int lane = static_cast<int>(ocu_cpu_lane_id());
-    int base = lane - lane % width;
-    return ::ocu_cpu::shuffle_from(v, base + ((src % width) + width) % width, width,
+    int base = ::ocu_cpu::group_base(lane, width);
+    return ::ocu_cpu::shuffle_from(v, base + ::ocu_cpu::lane_mod(src, width), width,
                                    ::ocu_cpu::warp_tag(1, m, width), m);
 }
 
@@ -705,13 +709,10 @@ inline unsigned __ballot_sync(unsigned m, int pred) { return ::ocu_cpu::vote_bit
 inline int __any_sync(unsigned m, int pred) { return ::ocu_cpu::vote_bits(6, m, pred) != 0; }
 inline int __all_sync(unsigned m, int pred)
 {
-    std::uint64_t all[OCU_CPU_MAX_WARP];
-    unsigned count = ocu_cpu_warp_gather_masked(pred != 0, ::ocu_cpu::warp_tag(7, m, 0), m, all);
+    /* All named lanes hold pred: none of them holds !pred. */
+    std::uint64_t none = ocu_cpu_warp_vote_masked(pred == 0, ::ocu_cpu::warp_tag(7, m, 0), m);
     unsigned group = ocu_cpu_lane_id() & ~31u;
-    for (unsigned i = 0; i < 32 && group + i < count; ++i) {
-        if ((m >> i & 1u) && all[group + i] == 0) return 0;
-    }
-    return 1;
+    return (static_cast<unsigned>(none >> group) & m) == 0;
 }
 /* Lanes of the caller's 32-lane group that exist in this block. It does
    not synchronise, as in CUDA; lanes that returned are still counted. */

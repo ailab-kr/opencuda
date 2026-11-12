@@ -189,6 +189,9 @@ It runs GPU code as is on the CPU. The goal is to check correctness, not speed. 
 - **Switching**: x86-64 and ARM64 use a hand-written register switch (`cpu_fiber_switch.S`). It makes no operating system calls. Other chips use `ucontext`. The build option `-DOCU_CPU_UCONTEXT=ON` lets you compare the two.
     - Measured (24 cores): saxpy with 4 million threads 105 ms → 19 ms. Block sum with 9 syncs per thread 684 ms → 76 ms. A simple loop takes 2.6 ms.
 - **Synchronization**: in one round, run all ready fibers. When all of them have reached the sync point or finished, release them together. A thread that finished before the sync counts as arrived. With `OCU_CPU_STRICT=1` it is an error.
+    - Warp operations: the last lane named by the mask to arrive checks and releases the others, and keeps running without a switch. Values alternate between two slots by sequence parity, so each operation waits once.
+    - In fixed order, a waiting fiber hands over directly to the next ready fiber in number order, without going through the scheduler. A finished thread starts the next not-yet-started thread on the same stack. Stacks are taken on first run and returned when done (last in, first out), so a block with no waits runs on one stack. Random order and sanitizer builds always go through the scheduler.
+    - Measured (x86-64, one OS thread, per GPU thread, before → after, same load): no sync 62 → 5 ns; one block sync 92 → 43 ns; five warp shuffles and one block sync 650 → 146 ns. A small launch (8 blocks × 128 threads, 8 OS threads) averages 350 → 98 µs: pool threads watch for new launches briefly (`OCU_CPU_SPIN_US`) before sleeping.
 - **Block distribution**: blocks are spread over several OS threads. Sharing between blocks needs real atomic operations, as on a GPU.
 - **Order**: there is a fixed order (for reproduction) and a random order (for finding code that depends on order). The random order is reproducible with a seed value.
 - **Stack**: each worker thread takes one large mapping, with one guard page at the very bottom. At the bottom of each fiber stack there is a canary, which is checked when the block ends, and an overflow is reported as an error. Giving each fiber a guard page would double the kernel memory regions to twice the number of GPU threads and hit the operating system limit (`vm.max_map_count`).
@@ -209,6 +212,8 @@ It runs GPU code as is on the CPU. The goal is to check correctness, not speed. 
 | `OCU_CPU_THREADS` | integer | Number of OS threads used for one launch. Default is the core count | Works |
 | `OCU_CPU_STACK_KB` | integer | Fiber stack size. Default 128 | Works |
 | `OCU_CPU_STRICT` | `1` | Treat a thread that finished before a sync as an error | Works |
+| `OCU_CPU_SPIN_US` | integer | How long an idle pool thread watches for a new launch before sleeping (µs). Default 50; 0 sleeps at once | Works |
+| `OCU_CPU_STATS` | `1` | At exit, print per-kernel launches, blocks, fiber switches, waits and time, plus copy time, to standard error | Works |
 | `OCU_OPENCL_LIBRARY` | file path | Library the OpenCL backend opens. If unset, `libOpenCL.so.1` | Works |
 | `OCU_OPENCL_VERBOSE` | `1` | Reasons for missing devices, build failure logs | Works |
 | `OCU_NPUSIM_SCRATCH_KB` | integer | npusim on-chip memory size. Default 256 | Works |

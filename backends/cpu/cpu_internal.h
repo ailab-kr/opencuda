@@ -27,6 +27,10 @@ typedef struct cpu_config {
     size_t    stack_bytes;    /* OCU_CPU_STACK_KB: fiber stack size */
     bool      strict_barrier; /* OCU_CPU_STRICT=1: a barrier with exited
                                  threads is an error */
+    uint32_t  spin_us;        /* OCU_CPU_SPIN_US: how long idle pool threads
+                                 watch for work before sleeping (50) */
+    bool      stats;          /* OCU_CPU_STATS=1: count launches, fiber
+                                 switches and time; printed at exit */
 } cpu_config;
 
 const cpu_config *cpu_get_config(void);
@@ -132,6 +136,9 @@ ocu_status cpu_marker_elapsed_ms(ocu_marker *start, ocu_marker *end,
                                  float *milliseconds);
 
 double cpu_now_ms(void);
+
+/* OCU_CPU_STATS: time spent in a queued copy or fill (cpu_exec.c). */
+void cpu_stats_copy(double ms, size_t bytes);
 
 /* Library providers (cpu_blas.c): "blas", "ops". NULL for anything else. */
 const void *cpu_get_provider(const char *library);

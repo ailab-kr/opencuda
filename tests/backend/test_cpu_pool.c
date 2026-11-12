@@ -46,7 +46,7 @@ static const ocu_cpu_image g_image = {OCU_CPU_IMAGE_MAGIC, OCU_CPU_IMAGE_VERSION
 
 static void *host(void *arg)
 {
-    long id = (long)arg;
+    long id = (long)(intptr_t)arg;
     ocu_kernel *k = NULL;
     B->module_get_kernel(M, "sum", &k);
     ocu_queue *q = NULL;
@@ -88,7 +88,7 @@ int main(void)
         return 1;
     }
     pthread_t t[HOSTS];
-    for (long i = 0; i < HOSTS; ++i) pthread_create(&t[i], NULL, host, (void *)i);
+    for (long i = 0; i < HOSTS; ++i) pthread_create(&t[i], NULL, host, (void *)(intptr_t)i);
     for (int i = 0; i < HOSTS; ++i) pthread_join(t[i], NULL);
     B->module_unload(M);
     int bad = atomic_load(&g_bad);
