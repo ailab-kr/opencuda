@@ -13,6 +13,7 @@
 #ifndef OCU_CUDA_RUNTIME_API_H
 #define OCU_CUDA_RUNTIME_API_H
 
+#include <limits.h> /* INT_MAX and friends: CUDA programs use them without including it */
 #include <stddef.h>
 
 #include "ocu_vector_types.h"
@@ -22,8 +23,16 @@
 extern "C" {
 #endif
 
-/* The runtime version this layer reports (12.3), as major * 1000 + minor * 10. */
+/* The runtime version this layer reports (12.3), as major * 1000 + minor * 10.
+   A program built with -DOCU_CUDART_VERSION=N sees N instead: a lower API
+   profile, for code that picks optional features from this number (for
+   example 11060 leaves out programmatic launch, FP8 and CUB code paths that
+   test for 11.7 or 11.8). The functions declared here do not change. */
+#ifdef OCU_CUDART_VERSION
+#define CUDART_VERSION OCU_CUDART_VERSION
+#else
 #define CUDART_VERSION 12030
+#endif
 
 /* ---- errors ------------------------------------------------------------ */
 

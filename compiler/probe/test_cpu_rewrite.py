@@ -8,7 +8,7 @@ def rw(src):
 
 
 def launch(cfg, callee, args=""):
-    lam = (f"[](auto &&...{LAMBDA_ARG}) -> decltype({callee}({LAMBDA_ARG}...)) "
+    lam = (f"[=](auto &&...{LAMBDA_ARG}) -> decltype({callee}({LAMBDA_ARG}...)) "
            f"{{ {callee}({LAMBDA_ARG}...); }}")
     sep = ", " if args.strip() else ""
     return f"::ocu_cpu::launch(::ocu_cpu::cfg({cfg}), {lam}{sep}{args})"

@@ -62,6 +62,7 @@ CMake 사용: `-DCMAKE_TOOLCHAIN_FILE=<toolkit>/cmake/OcuCUDA.cmake [-DOCU_TARGE
 - `bin/nvcc`라는 이름은 CMake가 툴킷을 찾을 때 그 이름의 파일을 찾기 때문에 둔 링크다. 내용은 우리 드라이버이고 엔비디아 이름이나 문구를 출력하지 않는다. 이 이름도 피하려면 CMake의 식별 단계를 통째로 대신해야 해서(강제 컴파일러 설정) CMake 판마다 깨지기 쉽다.
 - CMake 3.28 기준으로 확인. CMake가 CUDA 컴파일러를 Clang으로 보면 Clang식 옵션(`-x cuda`, `--cuda-gpu-arch=`, `--cuda-path=`)을 붙이고, 프로젝트는 nvcc식 옵션을 붙인다. 드라이버는 둘 다 받는다.
 - llama.cpp(ggml CUDA) 첫 시도: 구성은 통과, 빌드는 없는 헤더(`cublas_v2.h` 등)에서 멈춘다. 다음 오류 목록과 CPU 경로 변환의 한계 2가지는 `docs/compiler-driver.md`.
+- 11/13 이후: 실행 람다 복사 캡처, `__restrict` 인자, 정렬 지정자 순서, CPU 경로 `__CUDA_ARCH__=500`·`__CUDA_ARCH_LIST__=500`, NVIDIA 경로 `__CUDA_ARCH_LIST__`로 llama.cpp 150개 `.cu`가 두 대상 모두 컴파일·링크된다(`cards/apps/llama-cpp.md`).
 - 시험과 구현을 같은 세션이 썼다(카드 backend-cpu와 같은 사정). 다른 세션의 검토가 필요하다.
 
 ## 이의

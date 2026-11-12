@@ -170,6 +170,50 @@ def header_dirs() -> list[Path]:
 FP_CONTRACT = ["-ffp-contract=fast-honor-pragmas"]
 
 
+# The compute capability the CPU backend reports by default (5.0, see
+# cudaGetDeviceProperties in runtime/cudart/cudart.c).
+CPU_CUDA_ARCH = 500
+
+
+def _defines(opts: list[str], name: str) -> bool:
+    """True when the options define or undefine `name` themselves."""
+    for k, o in enumerate(opts):
+        if o in ("-D", "-U") and k + 1 < len(opts):
+            o = o + opts[k + 1]
+        if o.startswith(("-D", "-U")) and o[2:].split("=", 1)[0] == name:
+            return True
+    return False
+
+
+def cpu_arch_macros(args, pre: list[str]) -> list[str]:
+    """On the CPU path a .cu file is compiled once, and that one pass is the
+    device pass too: __CUDA_ARCH__ is defined (as the CUDA compiler does for
+    device code) with the CPU backend's compute capability, and
+    __CUDA_ARCH_LIST__ names that one architecture. Code guarded by
+    `#ifdef __CUDA_ARCH__` (for example a "no device code for this
+    architecture" handler that ends in __trap) then behaves as on a GPU,
+    and host code that caps the device's capability at the highest
+    compiled architecture sees the same value. A -D or -U of either name
+    on the command line wins."""
+    opts = [*(f"-D{d}" for d in getattr(args, "D", []) or []), *pre]
+    out = []
+    for name in ("__CUDA_ARCH__", "__CUDA_ARCH_LIST__"):
+        if not _defines(opts, name):
+            out.append(f"-D{name}={CPU_CUDA_ARCH}")
+    return out
+
+
+def nvidia_arch_list(arch: str, pre: list[str]) -> list[str]:
+    """__CUDA_ARCH_LIST__ for both Clang passes (Clang defines only
+    __CUDA_ARCH__, in the device pass): the one architecture built."""
+    if _defines(pre, "__CUDA_ARCH_LIST__"):
+        return []
+    digits = arch[3:] if arch.startswith("sm_") else ""
+    if not digits.isdigit():
+        return []
+    return [f"-D__CUDA_ARCH_LIST__={int(digits) * 10}"]
+
+
 def source_language(args, src: Path) -> str:
     """"cu", "c" or "cpp": an explicit choice (args.lang, from -x) wins,
     else the file suffix decides, as nvcc does."""
@@ -267,7 +311,7 @@ def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
         shift, src, extra = ptx_shift_step(args, src, work, common, std, "--cuda-host-only")
         return [*shift,
                 [cxx, f"-std={std}", "-x", "c++", "-E", "-DOCU_CPU_PATH",
-                 "-DOCU_CPU_PREPROCESS", "-D__CUDACC__", *ours,
+                 "-DOCU_CPU_PREPROCESS", "-D__CUDACC__", *cpu_arch_macros(args, pre), *ours,
                  # nvcc includes cuda_runtime.h in every .cu file
                  "-include", str(rt / "cuda_runtime.h"), *extra,
                  *common, *host, *deps, str(src), "-o", str(pre_out)],
@@ -311,7 +355,8 @@ def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
                 f"--cuda-path={path}", f"--cuda-gpu-arch={arch}", *ours,
                 # nvcc defines __CUDACC__ for .cu files; Clang only does in
                 # its own CUDA headers, which -nocudainc leaves out.
-                "-D__CUDACC__", "-include", str(dirs[0] / "cuda_runtime.h"),
+                "-D__CUDACC__", *nvidia_arch_list(arch, pre),
+                "-include", str(dirs[0] / "cuda_runtime.h"),
                 "-Wno-unknown-cuda-version", *FP_CONTRACT]
         ptx = work / (src.stem + ".ptx")
         fat = work / (src.stem + ".ocufat")

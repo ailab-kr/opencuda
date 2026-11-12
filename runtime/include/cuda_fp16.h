@@ -140,6 +140,11 @@ struct __half_raw {
     unsigned short x;
 };
 
+/* Two binary16 bit patterns; .x is the low half of a __half2. */
+struct __half2_raw {
+    unsigned short x, y;
+};
+
 struct __half {
     unsigned short __x;
     __half() = default;
