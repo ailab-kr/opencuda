@@ -54,5 +54,12 @@ set(CUDAToolkit_ROOT "${OCU_TOOLKIT_ROOT}")
 list(PREPEND CMAKE_MODULE_PATH "${OCU_TOOLKIT_ROOT}/cmake/modules")
 list(REMOVE_DUPLICATES CMAKE_MODULE_PATH)
 set(CMAKE_USER_MAKE_RULES_OVERRIDE_CUDA "${OCU_TOOLKIT_ROOT}/cmake/OcuCUDARules.cmake")
+# Targets without a CUDA_STANDARD: C++17, the language level nvcc compiles
+# by default. Left alone, some CMake versions (seen on macOS) pass
+# -std=gnu++03, which the CUDA headers cannot be compiled with. A project or
+# target that sets its own standard still wins.
+if(NOT DEFINED CMAKE_CUDA_STANDARD)
+  set(CMAKE_CUDA_STANDARD 17)
+endif()
 # try_compile projects see the same choice.
 list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES OCU_TARGET)
