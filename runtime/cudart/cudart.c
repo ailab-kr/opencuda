@@ -52,6 +52,7 @@ typedef struct mem_range {
     char                *base;
     size_t               size;
     enum cudaMemoryType  type; /* Host (page-locked), Device or Managed */
+    void                *dev;  /* address device code uses (registered host memory) */
 } mem_range;
 
 typedef struct rt_device {
@@ -327,7 +328,7 @@ cudaError_t cudaGetDeviceProperties(struct cudaDeviceProp *prop, int device)
     prop->concurrentKernels = 1;
     prop->unifiedAddressing = info.supports_unified_memory ? 1 : 0;
     prop->integrated = info.supports_unified_memory ? 1 : 0;
-    prop->managedMemory = info.supports_unified_memory ? 1 : 0;
+    prop->managedMemory = (info.supports_unified_memory || g_backend->mem_alloc_shared) ? 1 : 0;
     prop->concurrentManagedAccess = info.supports_unified_memory ? 1 : 0;
     prop->canMapHostMemory = 1;
     prop->l2CacheSize = 4 * 1024 * 1024;
@@ -659,7 +660,9 @@ static cudaError_t device_alloc(void **ptr, size_t size, enum cudaMemoryType typ
     cudaError_t e = current(&d);
     if (e != cudaSuccess) return set_error(e);
     if (ptr == NULL) return set_error(cudaErrorInvalidValue);
-    ocu_status st = g_backend->mem_alloc(d->dev, size, ptr);
+    ocu_status st = (type == cudaMemoryTypeManaged && g_backend->mem_alloc_shared != NULL)
+                        ? g_backend->mem_alloc_shared(d->dev, size, ptr)
+                        : g_backend->mem_alloc(d->dev, size, ptr);
     if (st != OCU_OK) return from(st);
     if (*ptr != NULL && !range_add(d, *ptr, size, type)) {
         (void)g_backend->mem_free(d->dev, *ptr);
@@ -687,7 +690,9 @@ cudaError_t cudaMallocManaged(void **ptr, size_t size, unsigned int flags)
     ocu_dev_info info;
     ocu_status st = g_backend->dev_info((uint32_t)tl_device, &info);
     if (st != OCU_OK) return from(st);
-    if (!info.supports_unified_memory) return set_error(cudaErrorNotSupported);
+    if (!info.supports_unified_memory && g_backend->mem_alloc_shared == NULL) {
+        return set_error(cudaErrorNotSupported);
+    }
     return device_alloc(ptr, size, cudaMemoryTypeManaged);
 }
 
@@ -723,14 +728,26 @@ cudaError_t cudaHostRegister(void *ptr, size_t size, unsigned int flags)
     ocu_dev_info info;
     ocu_status st = g_backend->dev_info((uint32_t)tl_device, &info);
     if (st != OCU_OK) return from(st);
-    if (!info.supports_unified_memory || (flags & cudaHostRegisterIoMemory)) {
+    bool via_backend = !info.supports_unified_memory;
+    if ((via_backend && g_backend->host_register == NULL) || (flags & cudaHostRegisterIoMemory)) {
         return set_error(cudaErrorNotSupported);
     }
     if (size > UINTPTR_MAX - (uintptr_t)ptr) return set_error(cudaErrorInvalidValue);
     if (range_overlaps(d, ptr, size)) {
         return set_error(cudaErrorHostMemoryAlreadyRegistered);
     }
-    if (!range_add(d, ptr, size, cudaMemoryTypeHost)) return set_error(cudaErrorMemoryAllocation);
+    void *dev = ptr;
+    if (via_backend) {
+        st = g_backend->host_register(d->dev, ptr, size, &dev);
+        if (st != OCU_OK) return from(st);
+    }
+    if (!range_add(d, ptr, size, cudaMemoryTypeHost)) {
+        if (via_backend) (void)g_backend->host_unregister(d->dev, ptr);
+        return set_error(cudaErrorMemoryAllocation);
+    }
+    pthread_mutex_lock(&d->lock);
+    d->ranges[d->range_count - 1].dev = dev;
+    pthread_mutex_unlock(&d->lock);
     return cudaSuccess;
 }
 
@@ -747,6 +764,10 @@ cudaError_t cudaHostUnregister(void *ptr)
     /* Work that may still read it finishes first. */
     cudaError_t s = sync_device(d);
     range_remove(d, ptr);
+    if (r.dev != r.base && g_backend->host_unregister != NULL) {
+        ocu_status st = g_backend->host_unregister(d->dev, ptr);
+        if (st != OCU_OK && s == cudaSuccess) s = from(st);
+    }
     return s;
 }
 
@@ -761,6 +782,10 @@ cudaError_t cudaHostGetDevicePointer(void **dptr, void *hptr, unsigned int flags
     mem_range r;
     if (hptr == NULL || !range_find(d, hptr, 1, &r) || r.type == cudaMemoryTypeDevice) {
         return set_error(cudaErrorInvalidValue);
+    }
+    if (r.dev != r.base || r.type == cudaMemoryTypeManaged) { /* registered or managed */
+        *dptr = (char *)r.dev + ((char *)hptr - r.base);
+        return cudaSuccess;
     }
     ocu_dev_info info;
     ocu_status st = g_backend->dev_info((uint32_t)tl_device, &info);
@@ -815,6 +840,7 @@ static bool range_add(rt_device *d, void *p, size_t size, enum cudaMemoryType ty
         d->ranges[d->range_count].base = p;
         d->ranges[d->range_count].size = size;
         d->ranges[d->range_count].type = type;
+        d->ranges[d->range_count].dev = p;
         d->range_count++;
     }
     pthread_mutex_unlock(&d->lock);
@@ -1081,20 +1107,60 @@ cudaError_t cudaMemset2D(void *ptr, size_t pitch, int value, size_t width, size_
  * device address and the copy is a plain copy after the default stream.
  * Other backends need module-level symbol lookup: not supported yet.
  */
-static cudaError_t symbol_copy(void *dst, const void *src, size_t count, cudaStream_t stream)
+/*
+ * Copy to or from a __device__ / __constant__ variable, ordered after the
+ * stream's work and complete on return. Variables registered by compiled
+ * device code are copied through the backend (module_get_global); on a
+ * backend whose device shares host memory the host address is the device
+ * address and the copy is a plain copy.
+ */
+static cudaError_t symbol_copy(const void *symbol, size_t offset, void *host, size_t count,
+                               bool to_device, enum cudaMemcpyKind kind, cudaStream_t stream)
 {
     rt_device *d;
     cudaError_t e = current(&d);
     if (e != cudaSuccess) return set_error(e);
+    void *dptr = NULL;
+    size_t bytes = 0;
+    ocu_status st = ocu_rt_find_symbol(symbol, &dptr, &bytes);
+    if (st == OCU_OK) {
+        if (offset > bytes || count > bytes - offset) return set_error(cudaErrorInvalidValue);
+        if (count == 0) return cudaSuccess;
+        ocu_copy_dir dir;
+        if (kind == cudaMemcpyDeviceToDevice) {
+            dir = OCU_COPY_DEVICE_TO_DEVICE;
+        } else if (kind == cudaMemcpyDefault) {
+            mem_range r;
+            bool other_dev = range_find(d, host, 1, &r) && r.type != cudaMemoryTypeHost;
+            dir = other_dev ? OCU_COPY_DEVICE_TO_DEVICE
+                            : (to_device ? OCU_COPY_HOST_TO_DEVICE : OCU_COPY_DEVICE_TO_HOST);
+        } else {
+            dir = to_device ? OCU_COPY_HOST_TO_DEVICE : OCU_COPY_DEVICE_TO_HOST;
+        }
+        char *dev = (char *)dptr + offset;
+        submission sub;
+        e = submit_begin(d, stream, &sub);
+        if (e != cudaSuccess) return e;
+        st = to_device ? g_backend->mem_copy(d->dev, sub.q, dev, host, count, dir)
+                       : g_backend->mem_copy(d->dev, sub.q, host, dev, count, dir);
+        submit_end(&sub);
+        if (st != OCU_OK) return from(st);
+        return dev_result(d, g_backend->queue_sync(sub.q));
+    }
+    if (st != OCU_ERR_NOT_FOUND) return from(st);
     ocu_dev_info info;
-    ocu_status st = g_backend->dev_info((uint32_t)tl_device, &info);
+    st = g_backend->dev_info((uint32_t)tl_device, &info);
     if (st != OCU_OK) return from(st);
-    if (!info.supports_unified_memory) return set_error(cudaErrorNotSupported);
+    if (!info.supports_unified_memory) return set_error(cudaErrorInvalidSymbol);
     submission sub;
     e = submit_begin(d, stream, &sub); /* ordered after the stream's work */
     if (e != cudaSuccess) return e;
     st = g_backend->queue_sync(sub.q);
-    if (st == OCU_OK && count > 0) memmove(dst, src, count);
+    char *addr = (char *)(uintptr_t)symbol + offset;
+    if (st == OCU_OK && count > 0) {
+        if (to_device) memmove(addr, host, count);
+        else memmove(host, addr, count);
+    }
     submit_end(&sub);
     return dev_result(d, st);
 }
@@ -1107,7 +1173,7 @@ static cudaError_t to_symbol(const void *symbol, const void *src, size_t count,
         kind != cudaMemcpyDefault) {
         return set_error(cudaErrorInvalidMemcpyDirection);
     }
-    return symbol_copy((char *)(uintptr_t)symbol + offset, src, count, stream);
+    return symbol_copy(symbol, offset, (void *)(uintptr_t)src, count, true, kind, stream);
 }
 
 static cudaError_t from_symbol(void *dst, const void *symbol, size_t count, size_t offset,
@@ -1118,7 +1184,38 @@ static cudaError_t from_symbol(void *dst, const void *symbol, size_t count, size
         kind != cudaMemcpyDefault) {
         return set_error(cudaErrorInvalidMemcpyDirection);
     }
-    return symbol_copy(dst, (const char *)symbol + offset, count, stream);
+    return symbol_copy(symbol, offset, dst, count, false, kind, stream);
+}
+
+cudaError_t cudaGetSymbolAddress(void **dev_ptr, const void *symbol)
+{
+    if (dev_ptr == NULL || symbol == NULL) return set_error(cudaErrorInvalidSymbol);
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    size_t bytes = 0;
+    ocu_status st = ocu_rt_find_symbol(symbol, dev_ptr, &bytes);
+    if (st == OCU_OK) return cudaSuccess;
+    if (st != OCU_ERR_NOT_FOUND) return from(st);
+    ocu_dev_info info;
+    if (g_backend->dev_info((uint32_t)tl_device, &info) == OCU_OK && info.supports_unified_memory) {
+        *dev_ptr = (void *)(uintptr_t)symbol;
+        return cudaSuccess;
+    }
+    return set_error(cudaErrorInvalidSymbol);
+}
+
+cudaError_t cudaGetSymbolSize(size_t *size, const void *symbol)
+{
+    if (size == NULL || symbol == NULL) return set_error(cudaErrorInvalidSymbol);
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    void *p = NULL;
+    ocu_status st = ocu_rt_find_symbol(symbol, &p, size);
+    if (st == OCU_OK) return cudaSuccess;
+    if (st != OCU_ERR_NOT_FOUND) return from(st);
+    return set_error(cudaErrorInvalidSymbol); /* sizes are known for registered variables only */
 }
 
 cudaError_t cudaMemcpyToSymbol(const void *symbol, const void *src, size_t count,
@@ -1391,6 +1488,39 @@ cudaError_t cudaEventElapsedTime(float *ms, cudaEvent_t start, cudaEvent_t end)
 }
 
 /* ---- launches ------------------------------------------------------------ */
+
+/*
+ * A launch by the host address of a kernel (the compiler's launch stub, or
+ * a user call of cudaLaunchKernel): the kernel registered under that
+ * address, with argument sizes from the device code.
+ */
+cudaError_t cudaLaunchKernel(const void *func, dim3 grid, dim3 block, void **args,
+                             size_t shared, cudaStream_t stream)
+{
+    if (func == NULL) return set_error(cudaErrorInvalidDeviceFunction);
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    ocu_kernel *k = NULL;
+    uint32_t nargs = 0;
+    const size_t *sizes = NULL;
+    ocu_status st = ocu_rt_find_kernel(func, &k, &nargs, &sizes);
+    if (st == OCU_ERR_NOT_FOUND) return set_error(cudaErrorInvalidDeviceFunction);
+    if (st != OCU_OK) {
+        return set_error(st == OCU_ERR_NOT_SUPPORTED ? cudaErrorNoKernelImageForDevice
+                                                     : ocu_rt_error(st));
+    }
+    if (nargs > 0 && args == NULL) return set_error(cudaErrorInvalidValue);
+    ocu_launch_params p;
+    memset(&p, 0, sizeof(p));
+    p.grid[0] = grid.x; p.grid[1] = grid.y; p.grid[2] = grid.z;
+    p.block[0] = block.x; p.block[1] = block.y; p.block[2] = block.z;
+    p.shared_memory_bytes = shared;
+    p.args = args;
+    p.arg_sizes = sizes;
+    p.num_args = nargs;
+    return ocu_rt_launch(k, &p, stream);
+}
 
 cudaError_t ocu_rt_launch(ocu_kernel *kernel, const ocu_launch_params *params,
                           cudaStream_t stream)

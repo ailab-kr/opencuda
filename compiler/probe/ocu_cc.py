@@ -70,6 +70,59 @@ def _llvm_tool(name: str) -> str:
     return name
 
 
+def write_container(path: Path, images: list[tuple[str, bytes]]) -> None:
+    """Device-code container read by runtime/cudart/fatbin.c:
+    "OCUFAT1\\0", count, header size, then per image a 16-byte backend
+    name with offset and size (little-endian), then the images."""
+    import struct
+    header = 16 + 32 * len(images)
+    out = bytearray(b"OCUFAT1\0" + struct.pack("<II", len(images), header))
+    offset = header
+    for name, data in images:
+        out += name.encode().ljust(16, b"\0")[:16] + struct.pack("<QQ", offset, len(data))
+        offset += len(data)
+    for _, data in images:
+        out += data
+    path.write_bytes(bytes(out))
+
+
+_QUOTE_INCLUDE = None
+
+
+def normalized_copies(src: Path, dest: Path):
+    """If the source or a file it includes with quotes (found next to the
+    including file, under the source's folder) has spaced launch chevrons,
+    copy them under `dest` with the same relative layout, chevrons fixed and
+    a #line marker naming the original; return the copied source, else
+    None. Files outside the source's folder are left alone."""
+    import re
+    from cpu_rewrite import normalize_chevrons
+    root = src.parent.resolve()
+    pattern = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', re.M)
+    seen, todo, files = set(), [src.resolve()], []
+    while todo:
+        f = todo.pop()
+        if f in seen or not f.is_file():
+            continue
+        seen.add(f)
+        try:
+            f.relative_to(root)
+        except ValueError:
+            continue
+        text = f.read_text(encoding="utf-8", errors="surrogateescape")
+        files.append((f, text))
+        for name in pattern.findall(text):
+            todo.append((f.parent / name).resolve())
+    fixed = {f: normalize_chevrons(t) for f, t in files}
+    if not any(n for _, n in fixed.values()):
+        return None
+    for f, (text, _) in fixed.items():
+        out = dest / f.relative_to(root)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(f'#line 1 "{f}"\n' + text, encoding="utf-8", errors="surrogateescape")
+    return dest / src.resolve().relative_to(root)
+
+
 def header_dirs() -> list[Path]:
     """Our headers: one folder in an installed package (<prefix>/include/ocu
     next to <prefix>/libexec/ocu/ocu_cc.py), three in the source tree. The
@@ -115,6 +168,36 @@ def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
                 [cxx, "-std=c++17", "-x", "c++-cpp-output", *codegen,
                  "-c", str(rewritten), "-o", str(out)]]
     clang = _llvm_tool("clang++")
+    if args.target == "nvidia" and not str(out).endswith(".ptx") and src.suffix in (".c",):
+        cc = os.environ.get("CC", "cc")
+        return [[cc, *[f"-I{d}" for d in header_dirs()], *common, "-c", str(src), "-o", str(out)]]
+    if args.target == "nvidia" and not str(out).endswith(".ptx") and src.suffix != ".cu":
+        cxx = os.environ.get("CXX", "c++")
+        return [[cxx, *[f"-I{d}" for d in header_dirs()], *common, "-c", str(src), "-o", str(out)]]
+    if args.target == "nvidia" and not str(out).endswith(".ptx"):
+        # Whole program: device code as PTX in our container, embedded in
+        # the host object Clang compiles; the runtime registers it.
+        arch = args.arch or "sm_80"
+        path = pinned_cuda_path(work.parent if args.cache is None else Path(args.cache))
+        dirs = header_dirs()
+        ours = [f"-I{d}" for d in dirs]
+        cuda = [clang, "-x", "cuda", "-std=c++17", "-nocudainc", "-nocudalib",
+                f"--cuda-path={path}", f"--cuda-gpu-arch={arch}", *ours,
+                "-include", str(dirs[0] / "cuda_runtime.h"),
+                "-Wno-unknown-cuda-version"]
+        ptx = work / (src.stem + ".ptx")
+        fat = work / (src.stem + ".ocufat")
+        # Spaced chevrons ("<< <"), which Clang rejects: compile copies of
+        # the source and its local quoted includes with only those
+        # characters changed (see normalized_copies).
+        copy = normalized_copies(src, work / "src")
+        if copy is not None:
+            cuda += ["-iquote", str(src.parent), "-I", str(src.parent)]
+            src = copy
+        return [[*cuda, "--cuda-device-only", "-S", *common, str(src), "-o", str(ptx)],
+                ["<container>", str(fat), "nvidia", str(ptx)],
+                [*cuda, "--cuda-host-only", "-Xclang", "-fcuda-include-gpubinary",
+                 "-Xclang", str(fat), *common, "-c", str(src), "-o", str(out)]]
     if args.target == "nvidia":
         arch = args.arch or "sm_80"
         path = pinned_cuda_path(work.parent if args.cache is None else Path(args.cache))
@@ -161,6 +244,9 @@ def main(argv: list[str]) -> int:
         for cmd in commands:
             if args.print_commands:
                 print(" ".join(shlex.quote(c) for c in cmd))
+                continue
+            if cmd[0] == "<container>":
+                write_container(Path(cmd[1]), [(cmd[2], Path(cmd[3]).read_bytes())])
                 continue
             if cmd[0] == "<rewrite>":
                 try:

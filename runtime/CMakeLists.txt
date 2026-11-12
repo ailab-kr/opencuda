@@ -16,7 +16,7 @@ if(OCU_BACKEND_NVIDIA)
 endif()
 
 # ocu_cudart: the runtime API (cuda_runtime_api.h) on the backend interface.
-add_library(ocu_cudart STATIC cudart/cudart.c)
+add_library(ocu_cudart STATIC cudart/cudart.c cudart/fatbin.c)
 target_include_directories(ocu_cudart PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${OCU_INSTALL_INCLUDEDIR}>)
@@ -25,6 +25,9 @@ target_link_libraries(ocu_cudart PUBLIC ocu_core ocu_backend_interface)
 if(OCU_BACKEND_CPU)
   # Programs built for the CPU path also need the CPU device-side API.
   target_link_libraries(ocu_cudart PUBLIC ocu_backend_cpu)
+endif()
+if(OCU_BACKEND_NVIDIA)
+  target_link_libraries(ocu_cudart PUBLIC ocu_backend_nvidia)
 endif()
 
 install(TARGETS ocu_core ocu_cudart EXPORT OcuTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})

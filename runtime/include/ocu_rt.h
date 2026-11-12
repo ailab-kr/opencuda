@@ -27,6 +27,15 @@ ocu_device *ocu_rt_device(void);
 cudaError_t ocu_rt_launch(ocu_kernel *kernel, const ocu_launch_params *params,
                           cudaStream_t stream);
 
+/*
+ * Device code registered by compiled host code (runtime/cudart/fatbin.c).
+ * OCU_ERR_NOT_FOUND when the address was never registered.
+ */
+ocu_status ocu_rt_find_kernel(const void *stub, ocu_kernel **kernel, uint32_t *nargs,
+                              const size_t **arg_sizes);
+ocu_status ocu_rt_find_symbol(const void *host, void **device, size_t *bytes);
+int ocu_rt_has_device_code(void);
+
 /* Map a backend status to the runtime error it stands for. */
 cudaError_t ocu_rt_error(ocu_status status);
 

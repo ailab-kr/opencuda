@@ -6,9 +6,8 @@
  * runtime and language. Not derived from any vendor header.
  *
  *   OCU_CPU_PATH   the CPU path (rewritten .cu compiled as C++17)
+ *   __CUDA__       Clang's CUDA mode (host pass and NVPTX device pass)
  *   neither        plain host code: the runtime API only
- * The GPU paths (clang CUDA and HIP modes) get their language support from
- * the compiler driver; see compiler/.
  */
 #ifndef OCU_CUDA_RUNTIME_H
 #define OCU_CUDA_RUNTIME_H
@@ -17,6 +16,8 @@
 
 #if defined(OCU_CPU_PATH)
 #include "ocu_cuda_lang_cpu.h"
+#elif defined(__CUDA__) && !defined(__HIP__)
+#include "ocu_cuda_lang_nvptx.h"
 #endif
 
 #endif /* OCU_CUDA_RUNTIME_H */

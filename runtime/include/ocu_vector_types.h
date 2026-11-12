@@ -9,7 +9,11 @@
 #ifndef OCU_VECTOR_TYPES_H
 #define OCU_VECTOR_TYPES_H
 
-#if defined(__cplusplus)
+#if defined(__cplusplus) && defined(__CUDA__)
+/* Clang's CUDA mode: the constructors are host and device functions. */
+#define OCU_VT_ALIGN(n) alignas(n)
+#define OCU_VT_INLINE static inline __attribute__((host)) __attribute__((device))
+#elif defined(__cplusplus)
 #define OCU_VT_ALIGN(n) alignas(n)
 #define OCU_VT_INLINE static inline
 #else

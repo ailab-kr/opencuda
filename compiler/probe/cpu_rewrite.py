@@ -338,6 +338,30 @@ def _rewrite_launches(src: str) -> tuple[str, int]:
     return src, count
 
 
+def normalize_chevrons(src: str) -> tuple[str, int]:
+    """Spaced launch chevrons ("k << < g, b >> > (x)") as "<<<" and ">>>",
+    which some compilers require; lengths are kept (blanks move to the end),
+    so line and column positions stay the same. Returns (text, changes)."""
+    mask = _code_mask(src)
+    out = list(src)
+    changes = 0
+    for m in _OPEN.finditer(src):
+        if not (mask[m.start()] and mask[m.end() - 1]):
+            continue
+        before = src[:_skip_back(src, mask, m.start())]
+        if re.search(r"\boperator$", before):
+            continue
+        try:
+            close_start, close_end = _find_chevron_end(src, mask, m.end())
+        except RewriteError:
+            continue
+        for a, b, ch in ((m.start(), m.end(), "<"), (close_start, close_end, ">")):
+            if b - a != 3:
+                out[a:b] = list(ch * 3 + " " * (b - a - 3))
+                changes += 1
+    return "".join(out), changes
+
+
 _EXTERN_SHARED = re.compile(
     r"\bextern\b(?P<pre>[^;{}()\[\]]*?)\b(?:__shared__|__ocu_shared__)\b(?P<post>[^;{}\[\]]*?)"
     r"\b(?P<name>[A-Za-z_]\w*)\s*\[\s*\]\s*;")

@@ -44,3 +44,32 @@ function(ocu_add_cpu_cu_executable target)
   set_target_properties(${target} PROPERTIES LINKER_LANGUAGE CXX)
   target_link_libraries(${target} PRIVATE ${OCU_CUDART_TARGET})
 endfunction()
+
+# ocu_add_nvidia_cu_executable(<target> <source.cu|.c|.cpp>...)
+#
+# The same program for NVIDIA GPUs: every .cu source goes through
+# ocu_cc.py --target nvidia (device code as PTX in a container embedded in
+# the host object, host code by Clang's CUDA mode); links the runtime with
+# the NVIDIA backend. Needs an LLVM Clang with the NVPTX target.
+function(ocu_add_nvidia_cu_executable target)
+  get_filename_component(_cc_dir ${OCU_CC_SCRIPT} DIRECTORY)
+  set(objs)
+  foreach(src IN LISTS ARGN)
+    get_filename_component(abs ${src} ABSOLUTE)
+    get_filename_component(name ${src} NAME)
+    set(obj ${CMAKE_CURRENT_BINARY_DIR}/${target}.dir/${name}.o)
+    add_custom_command(
+      OUTPUT ${obj}
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/${target}.dir
+      COMMAND ${CMAKE_COMMAND} -E env CXX=${CMAKE_CXX_COMPILER} CC=${CMAKE_C_COMPILER}
+              ${Python3_EXECUTABLE} ${OCU_CC_SCRIPT}
+              --target nvidia -O2 -c ${abs} -o ${obj}
+      DEPENDS ${abs} ${OCU_CC_SCRIPT} ${_cc_dir}/cpu_rewrite.py ${OCU_CC_DEPENDS}
+      IMPLICIT_DEPENDS CXX ${abs}
+      COMMENT "ocu_cc --target nvidia ${src}")
+    list(APPEND objs ${obj})
+  endforeach()
+  add_executable(${target} ${objs})
+  set_target_properties(${target} PROPERTIES LINKER_LANGUAGE CXX)
+  target_link_libraries(${target} PRIVATE ${OCU_CUDART_TARGET})
+endfunction()

@@ -363,6 +363,8 @@ cudaError_t cudaMemcpyToSymbol(const void *symbol, const void *src, size_t count
                                size_t offset, enum cudaMemcpyKind kind);
 cudaError_t cudaMemcpyFromSymbol(void *dst, const void *symbol, size_t count,
                                  size_t offset, enum cudaMemcpyKind kind);
+cudaError_t cudaGetSymbolAddress(void **dev_ptr, const void *symbol);
+cudaError_t cudaGetSymbolSize(size_t *size, const void *symbol);
 cudaError_t cudaMemcpyToSymbolAsync(const void *symbol, const void *src, size_t count,
                                     size_t offset, enum cudaMemcpyKind kind,
                                     cudaStream_t stream);
@@ -384,6 +386,13 @@ cudaError_t cudaStreamGetFlags(cudaStream_t stream, unsigned int *flags);
 cudaError_t cudaStreamIsCapturing(cudaStream_t stream, enum cudaStreamCaptureStatus *status);
 cudaError_t cudaStreamBeginCapture(cudaStream_t stream, enum cudaStreamCaptureMode mode);
 cudaError_t cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void *user_data);
+
+/* ---- launches ---------------------------------------------------------- */
+
+/* Launch the kernel whose host address (launch stub) is `func`; args[i]
+   points at the i-th argument value. */
+cudaError_t cudaLaunchKernel(const void *func, dim3 grid, dim3 block, void **args,
+                             size_t shared, cudaStream_t stream);
 
 /* ---- events ------------------------------------------------------------ */
 
