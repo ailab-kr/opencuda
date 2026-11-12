@@ -18,7 +18,7 @@ cost: { hours: 1, ai_usage: 0 }
 
 ## 동작
 
-칩과 무관한 층(`libs/blas`)이 BLAS 표준의 인자 규칙과 빠른 반환을 맡고, 계산은 활성 백엔드의 제공자(`get_provider("blas")`)가 한다. 스칼라 결과(dot, nrm2, asum, iamax)는 층이 호스트로 가져온다. 이름은 내부 이름(`ocu_blas_*`)이며, CUDA 이름의 라이브러리는 법률 검토 뒤에 이 위에 얹는다.
+칩과 무관한 층(`libs/blas`)이 BLAS 표준의 인자 규칙과 빠른 반환을 맡고, 계산은 활성 백엔드의 제공자(`get_provider("blas")`)가 한다. 스칼라 결과(dot, nrm2, asum, iamax)는 층이 호스트로 가져온다. 이름은 내부 이름(`ocu_blas_*`)이며, CUDA 이름의 라이브러리(libs/cublas)는 이 위에 얹는다.
 
 ## 시험 목록
 

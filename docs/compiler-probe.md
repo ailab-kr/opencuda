@@ -59,7 +59,7 @@ Launch symbols the compiler emits calls to:
 | Rodinia (CUDA part, public mirror `yuhc/gpu-rodinia`) | 89 | 81 | 81 | 0 | 0 | 2 |
 | llama.cpp `ggml/src/ggml-cuda` (MIT) | 303 | 192 | 192 | 0 | 0 | 20 |
 
-Line counts were preserved in every file. Whether the rewritten files then compile was not checked: they also need the CUDA runtime API, which waits for legal review.
+Line counts were preserved in every file. Whether the rewritten files then compile was not checked: they also needed the CUDA runtime API, which did not exist yet at the time.
 
 Features those files use that the CPU path does not support yet (number of files):
 
