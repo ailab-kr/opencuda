@@ -113,7 +113,13 @@ def normalized_copies(src: Path, dest: Path):
         files.append((f, text))
         for name in pattern.findall(text):
             todo.append((f.parent / name).resolve())
-    fixed = {f: normalize_chevrons(t) for f, t in files}
+    from cpu_rewrite import RewriteError as _RewriteError
+    fixed = {}
+    for f, t in files:
+        try:
+            fixed[f] = normalize_chevrons(t)
+        except _RewriteError:
+            fixed[f] = (t, 0)  # leave it to the compiler to report
     if not any(n for _, n in fixed.values()):
         return None
     for f, (text, _) in fixed.items():

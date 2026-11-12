@@ -14,6 +14,62 @@
 #ifndef OCU_CUDA_LANG_NVPTX_H
 #define OCU_CUDA_LANG_NVPTX_H
 
+/*
+ * Device math first. In the device pass the standard library's own math
+ * functions (libstdc++'s float overloads and integer templates call the
+ * compiler's __builtin_<name>) are pointed at it, so std::exp(1.0f) or
+ * pow(x, 2) in device code use this library instead of a missing vendor
+ * function.
+ */
+#define OCU_DM_FN static inline __attribute__((device))
+#include "ocu_device_math.h"
+#if defined(__CUDA_ARCH__)
+#define __builtin_acos(x) ::ocu_dm::acos(x)
+#define __builtin_acosf(x) ::ocu_dm::acosf(x)
+#define __builtin_asin(x) ::ocu_dm::asin(x)
+#define __builtin_asinf(x) ::ocu_dm::asinf(x)
+#define __builtin_atan(x) ::ocu_dm::atan(x)
+#define __builtin_atanf(x) ::ocu_dm::atanf(x)
+#define __builtin_cos(x) ::ocu_dm::cos(x)
+#define __builtin_cosf(x) ::ocu_dm::cosf(x)
+#define __builtin_cosh(x) ::ocu_dm::cosh(x)
+#define __builtin_coshf(x) ::ocu_dm::coshf(x)
+#define __builtin_exp(x) ::ocu_dm::exp(x)
+#define __builtin_expf(x) ::ocu_dm::expf(x)
+#define __builtin_log(x) ::ocu_dm::log(x)
+#define __builtin_logf(x) ::ocu_dm::logf(x)
+#define __builtin_log10(x) ::ocu_dm::log10(x)
+#define __builtin_log10f(x) ::ocu_dm::log10f(x)
+#define __builtin_sin(x) ::ocu_dm::sin(x)
+#define __builtin_sinf(x) ::ocu_dm::sinf(x)
+#define __builtin_sinh(x) ::ocu_dm::sinh(x)
+#define __builtin_sinhf(x) ::ocu_dm::sinhf(x)
+#define __builtin_tan(x) ::ocu_dm::tan(x)
+#define __builtin_tanf(x) ::ocu_dm::tanf(x)
+#define __builtin_tanh(x) ::ocu_dm::tanh(x)
+#define __builtin_tanhf(x) ::ocu_dm::tanhf(x)
+#define __builtin_cbrt(x) ::ocu_dm::cbrt(x)
+#define __builtin_cbrtf(x) ::ocu_dm::cbrtf(x)
+#define __builtin_exp2(x) ::ocu_dm::exp2(x)
+#define __builtin_exp2f(x) ::ocu_dm::exp2f(x)
+#define __builtin_expm1(x) ::ocu_dm::expm1(x)
+#define __builtin_expm1f(x) ::ocu_dm::expm1f(x)
+#define __builtin_log1p(x) ::ocu_dm::log1p(x)
+#define __builtin_log1pf(x) ::ocu_dm::log1pf(x)
+#define __builtin_log2(x) ::ocu_dm::log2(x)
+#define __builtin_log2f(x) ::ocu_dm::log2f(x)
+#define __builtin_atan2(x, y) ::ocu_dm::atan2(x, y)
+#define __builtin_atan2f(x, y) ::ocu_dm::atan2f(x, y)
+#define __builtin_fmod(x, y) ::ocu_dm::fmod(x, y)
+#define __builtin_fmodf(x, y) ::ocu_dm::fmodf(x, y)
+#define __builtin_hypot(x, y) ::ocu_dm::hypot(x, y)
+#define __builtin_hypotf(x, y) ::ocu_dm::hypotf(x, y)
+#define __builtin_pow(x, y) ::ocu_dm::pow(x, y)
+#define __builtin_powf(x, y) ::ocu_dm::powf(x, y)
+#define __builtin_ldexp(x, n) ::ocu_dm::ldexp(x, n)
+#define __builtin_ldexpf(x, n) ((float)::ocu_dm::ldexp((double)(x), n))
+#endif
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -243,9 +299,6 @@ OCU_HD double max(double a, float b) { return __builtin_fmax(a, b); }
 
 /* ---- device math ---------------------------------------------------------------------- */
 
-#define OCU_DM_FN static inline __attribute__((device))
-#include "ocu_device_math.h"
-
 /* Functions computed exactly by hardware operations. */
 #define OCU_EXACT1(name, b)                                                           \
     OCU_D double name(double x) { return __builtin_##b(x); }                          \
@@ -311,6 +364,14 @@ OCU_LIB1(tanh)
 OCU_LIB1(cbrt)
 #undef OCU_LIB1
 OCU_D double pow(double x, double y) { return ocu_dm::pow(x, y); }
+/* Mixed argument types, exact matches before the standard library's
+   templates (which would call host functions). */
+OCU_D double pow(double x, int y) { return ocu_dm::pow(x, (double)y); }
+OCU_D float pow(float x, int y) { return ocu_dm::powf(x, (float)y); }
+OCU_D double pow(int x, int y) { return ocu_dm::pow((double)x, (double)y); }
+OCU_D double pow(int x, double y) { return ocu_dm::pow((double)x, y); }
+OCU_D double pow(double x, float y) { return ocu_dm::pow(x, (double)y); }
+OCU_D double pow(float x, double y) { return ocu_dm::pow((double)x, y); }
 OCU_D float powf(float x, float y) { return ocu_dm::powf(x, y); }
 OCU_D double atan2(double y, double x) { return ocu_dm::atan2(y, x); }
 OCU_D float atan2f(float y, float x) { return ocu_dm::atan2f(y, x); }
@@ -346,7 +407,16 @@ OCU_D double __drcp_rn(double x) { return __nvvm_rcp_rn_d(x); }
 OCU_D double __dsqrt_rn(double x) { return __nvvm_sqrt_rn_d(x); }
 
 /* std:: spellings: libstdc++'s float overloads are constexpr (host and
-   device in Clang); the double ones are the global functions above. */
+   device in Clang, and use the library above in device code); the double
+   ones are the global functions, made visible in std here. */
+namespace std {
+using ::sqrt; using ::fabs; using ::floor; using ::ceil; using ::trunc; using ::round;
+using ::rint; using ::exp; using ::expm1; using ::exp2; using ::log; using ::log2;
+using ::log10; using ::log1p; using ::sin; using ::cos; using ::tan; using ::asin;
+using ::acos; using ::atan; using ::sinh; using ::cosh; using ::tanh; using ::cbrt;
+using ::pow; using ::atan2; using ::hypot; using ::fmod; using ::fmin; using ::fmax;
+using ::fma; using ::ldexp; using ::frexp; using ::copysign;
+} // namespace std
 OCU_D bool isnan(double x) { return __builtin_isnan(x); }
 OCU_D bool isinf(double x) { return __builtin_isinf(x); }
 OCU_D bool isfinite(double x) { return __builtin_isfinite(x); }
