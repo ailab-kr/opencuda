@@ -37,6 +37,9 @@ add_subdirectory(backends)
 add_subdirectory(runtime)
 add_subdirectory(libs)
 add_subdirectory(tuning)
+# The toolkit folder for other build systems: ocu-nvcc, headers, libraries
+# and the CMake files that make them a project's CUDA toolkit.
+include(OcuToolkit)
 
 # Install: libraries, headers, the CPU-path driver, and a CMake package so
 # other projects can `find_package(Ocu)` and use ocu::cudart and
