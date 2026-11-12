@@ -205,16 +205,40 @@ struct lhs {
     }
 };
 
+/* The result of a compound shift of a volatile integer. The built-in form
+ * gives the volatile object itself; returning that reference from a
+ * function makes GCC warn ("implicit dereference will not access object")
+ * whenever the expression is a statement, which is the usual case. This
+ * object reads the variable when the result is used as a value (one
+ * volatile read, as the built-in form's lvalue-to-rvalue conversion) and
+ * does nothing when discarded. Binding the result to a reference is not
+ * possible (a compile error, not a silent difference). */
+template <class A>
+struct volatile_result {
+    A *a;
+    __host__ __device__ constexpr operator std::remove_cv_t<A>() const { return *a; }
+};
+
 template <class A>
 struct ref {
     A *a;
     template <class C>
     __host__ __device__ constexpr decltype(auto) operator<<=(C c) {
-        return __ocu_shl_assign(*a, c);
+        if constexpr (std::is_volatile<A>::value && integral_v<A &, C>) {
+            *a = static_cast<std::remove_cv_t<A>>(__ocu_shl(*a, c));
+            return volatile_result<A>{a};
+        } else {
+            return __ocu_shl_assign(*a, c);
+        }
     }
     template <class C>
     __host__ __device__ constexpr decltype(auto) operator>>=(C c) {
-        return __ocu_shr_assign(*a, c);
+        if constexpr (std::is_volatile<A>::value && integral_v<A &, C>) {
+            *a = static_cast<std::remove_cv_t<A>>(__ocu_shr(*a, c));
+            return volatile_result<A>{a};
+        } else {
+            return __ocu_shr_assign(*a, c);
+        }
     }
 };
 
