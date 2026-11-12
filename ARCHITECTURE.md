@@ -44,7 +44,7 @@ compiler/         runtime/         libs/
 | `backends/amd/`, `backends/intel/` | 칩별 구현 | 없음 |
 | `runtime/core/` | 백엔드 등록과 선택 | 있음 |
 | `runtime/include/` | 사용자 프로그램이 보는 실행 API 헤더 | 없음 |
-| `libs/` | 라이브러리별 호환 층 | 없음 |
+| `libs/` | 라이브러리별 호환 층 | `libs/blas`: 20개 함수(내부 이름), CPU에서 기준 사례 526건 통과 |
 | `compiler/` | 명령 호환, 빌드 도구 연동, 장치용 수학 함수 | 실현성 실험(`compiler/probe/`)만 |
 | `conformance/` | 적합성 시험, 채점기, 결과 형식 | BLAS 20개 함수의 기준 답 526건, 오차 한계, 자체 검증 |
 | `tuning/` | 속도 측정, 자동 튜닝, 칩별 설정 표 | 없음 |
@@ -110,7 +110,8 @@ libs/blas  ──(get_provider("blas"))──▶  백엔드
    └─ 없으면 ─▶ libs 안의 공통 구현 (kernel_launch로 실행)
 ```
 
-- 제공자 표의 모양은 `libs` 쪽이 정한다(라이브러리마다 헤더 하나).
+- 제공자 표의 모양은 `libs` 쪽이 정하고, 두 쪽이 함께 쓰므로 헤더는 `backends/interface/`에 둔다(라이브러리마다 하나, 예: `ocu_blas_provider.h`).
+- 지금 있는 것: BLAS 제공자 표(14개 연산, f32·f64)와 CPU 백엔드의 구현(`backends/cpu/cpu_blas.c`). `libs/blas`가 그 위에서 20개 함수를 내놓는다.
 - `libs`는 인자 검사, 오류 코드, 색인 기준 같은 CUDA 쪽 동작을 맡고, 실제 계산만 제공자에게 넘긴다.
 - 제공자가 없는 칩에서도 공통 구현으로 동작한다. 느릴 뿐 틀리지 않는다.
 

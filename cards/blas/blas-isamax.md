@@ -5,13 +5,13 @@ name: isamax (BLAS standard operation `iamax`, element type f32)
 spec_sources:
   - BLAS standard, netlib reference BLAS definition of ISAMAX (public)
 backend_map:
-  cpu: none yet
+  cpu: backends/cpu/cpu_blas.c (provider) via libs/blas
   amd: none yet
-state: tests
+state: cpu-pass
 tolerance: conformance/tolerances/blas.json
 owner_spec: AI Lab 2026-11-12
 owner_tests: AI Lab 2026-11-12
-owner_impl: (none)
+owner_impl: AI Lab 2026-11-12
 cost: { hours: 0, ai_usage: 0 }
 ---
 
@@ -23,7 +23,7 @@ BLAS 표준의 `iamax` 연산. 기준 답은 `conformance/oracle/blas_ref.py`의
 
 - [x] 기준 답과 시험 사례: `conformance/oracle/cases.py` (카드 `blas-isamax`)
 - [ ] CUDA 이름의 라이브러리 함수에 대한 사례 대응 (함수 이름·인자 형식은 공개 문서 기준)
-- [ ] CPU 백엔드에서 통과
+- [x] CPU 백엔드에서 통과 (11/12, `conformance_blas_cpu`: 이 카드의 사례 전부, 동기·대기열·무작위 순서)
 - [ ] AMD GPU에서 통과
 
 ## 메모
