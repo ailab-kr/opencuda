@@ -4,8 +4,9 @@
  * point runs inside an autorelease pool.
  *
  * Device code images are Metal Shading Language source with a small
- * header (see mt_image below). Kernels read their arguments from buffer 0
- * at the offsets in buffer 1 (README.md, section 5).
+ * header (see mt_module_load). Kernels read their arguments from buffer 0
+ * at the offsets in buffer 1 (README.md, section 5), and the module's
+ * __device__ / __constant__ variables from buffer 2.
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -58,9 +59,12 @@ struct ocu_kernel {
 struct ocu_module {
     ocu_device        *dev;
     id<MTLLibrary>     library;   /* retained */
-    char              *meta;      /* the image's parameter lines */
+    char              *meta;      /* the image's header lines */
     pthread_mutex_t    lock;
     struct ocu_kernel *kernels;
+    void              *globals;   /* device address of the variables, or NULL */
+    size_t             globals_size;
+    id<MTLBuffer>      globals_buf; /* retained; nil without variables */
 };
 
 struct ocu_marker {
@@ -112,6 +116,21 @@ static char *table_cpu(ocu_device *d, uint64_t gpu, size_t n)
     }
     pthread_mutex_unlock(&d->lock);
     return cpu;
+}
+
+/* The buffer (retained) of the allocation that starts at `gpu`, or nil. */
+static id<MTLBuffer> table_buffer(ocu_device *d, uint64_t gpu)
+{
+    id<MTLBuffer> b = nil;
+    pthread_mutex_lock(&d->lock);
+    for (size_t i = 0; i < d->count; ++i) {
+        if (d->allocs[i].gpu == gpu) {
+            b = [d->allocs[i].buffer retain];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&d->lock);
+    return b;
 }
 
 /* ---- device ------------------------------------------------------------------------ */
@@ -428,9 +447,100 @@ static ocu_status mt_host_free_pinned(ocu_device *d, void *ptr)
 /* ---- code ------------------------------------------------------------------------------------- */
 
 /*
- * Image: "OCUMSL1\n", then lines "param <kernel> <size> <size> ...\n",
- * then a line "---\n", then the MSL source.
+ * Image: "OCUMSL1\n", then header lines, then a line "---\n", then the MSL
+ * source. Header lines (compiler/metal/cu2msl.py writes them):
+ *   param <kernel> <size> <size> ...   argument sizes of a kernel
+ *   global <name> <offset> <size>      a variable, in the module's buffer
+ *   init <offset> <hex bytes>          initial bytes there (zero elsewhere)
  */
+
+/* Next header line after `line`, or NULL. */
+static const char *next_line(const char *line)
+{
+    const char *nl = strchr(line, '\n');
+    return nl != NULL && nl[1] != '\0' ? nl + 1 : NULL;
+}
+
+/* "global <name> <offset> <size>": the name (not terminated) and numbers. */
+static bool parse_global(const char *line, const char **name, size_t *name_len, size_t *offset,
+                         size_t *size)
+{
+    if (strncmp(line, "global ", 7) != 0) return false;
+    const char *p = line + 7;
+    const char *e = p;
+    while (*e != '\0' && *e != ' ' && *e != '\n') ++e;
+    if (e == p || *e != ' ') return false;
+    char *end1, *end2;
+    unsigned long long off = strtoull(e + 1, &end1, 10);
+    if (end1 == e + 1 || *end1 != ' ') return false;
+    unsigned long long sz = strtoull(end1 + 1, &end2, 10);
+    if (end2 == end1 + 1 || (*end2 != '\n' && *end2 != '\0')) return false;
+    *name = p;
+    *name_len = (size_t)(e - p);
+    *offset = (size_t)off;
+    *size = (size_t)sz;
+    return true;
+}
+
+static int hex_digit(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Allocate the module's variables (one buffer, zero-filled) and write
+   the initial values. */
+static ocu_status load_globals(ocu_module *m)
+{
+    size_t total = 0;
+    for (const char *line = m->meta; line != NULL && *line; line = next_line(line)) {
+        const char *name;
+        size_t len, off, size;
+        if (strncmp(line, "global ", 7) != 0) continue;
+        if (!parse_global(line, &name, &len, &off, &size) || off + size < off) return OCU_ERR_INVALID_VALUE;
+        if (off + size > total) total = off + size;
+    }
+    if (total == 0) return OCU_OK;
+    void *gpu = NULL;
+    ocu_status st = mt_mem_alloc(m->dev, total, &gpu);
+    if (st != OCU_OK) return st;
+    char *cpu = table_cpu(m->dev, (uint64_t)(uintptr_t)gpu, total);
+    id<MTLBuffer> buf = table_buffer(m->dev, (uint64_t)(uintptr_t)gpu);
+    if (cpu == NULL || buf == nil) {
+        [buf release];
+        mt_mem_free(m->dev, gpu);
+        return OCU_ERR_INVALID_VALUE;
+    }
+    memset(cpu, 0, total);
+    for (const char *line = m->meta; line != NULL && *line; line = next_line(line)) {
+        if (strncmp(line, "init ", 5) != 0) continue;
+        char *end;
+        unsigned long long off = strtoull(line + 5, &end, 10);
+        if (end == line + 5 || *end != ' ') st = OCU_ERR_INVALID_VALUE;
+        const char *h = end + 1;
+        for (size_t at = (size_t)off; st == OCU_OK && *h != '\n' && *h != '\0'; h += 2, ++at) {
+            int hi = hex_digit(h[0]), lo = hi >= 0 ? hex_digit(h[1]) : -1;
+            if (hi < 0 || lo < 0 || at >= total) {
+                st = OCU_ERR_INVALID_VALUE;
+            } else {
+                cpu[at] = (char)(hi * 16 + lo);
+            }
+        }
+        if (st != OCU_OK) break;
+    }
+    if (st != OCU_OK) {
+        [buf release];
+        mt_mem_free(m->dev, gpu);
+        return st;
+    }
+    m->globals = gpu;
+    m->globals_size = total;
+    m->globals_buf = buf;
+    return OCU_OK;
+}
+
 static ocu_status mt_module_load(ocu_device *d, const void *image, size_t bytes, ocu_module **out)
 {
     if (d == NULL) return OCU_ERR_INVALID_HANDLE;
@@ -476,6 +586,13 @@ static ocu_status mt_module_load(ocu_device *d, const void *image, size_t bytes,
         m->library = lib;
     }
     m->dev = d;
+    ocu_status gst = load_globals(m);
+    if (gst != OCU_OK) {
+        [m->library release];
+        free(m->meta);
+        free(m);
+        return gst;
+    }
     pthread_mutex_init(&m->lock, NULL);
     *out = m;
     return OCU_OK;
@@ -494,10 +611,35 @@ static ocu_status mt_module_unload(ocu_module *m)
         k = next;
     }
     [m->library release];
+    if (m->globals != NULL) {
+        [m->globals_buf release];
+        ocu_status fst = mt_mem_free(m->dev, m->globals);
+        if (st == OCU_OK) st = fst;
+    }
     free(m->meta);
     pthread_mutex_destroy(&m->lock);
     free(m);
     return st;
+}
+
+/* A variable of the module, by the name the image gives (the device-code
+   name the host side registers). */
+static ocu_status mt_module_get_global(ocu_module *m, const char *name, void **ptr, size_t *bytes)
+{
+    if (m == NULL) return OCU_ERR_INVALID_HANDLE;
+    if (name == NULL || ptr == NULL || bytes == NULL) return OCU_ERR_INVALID_VALUE;
+    size_t want = strlen(name);
+    for (const char *line = m->meta; line != NULL && *line; line = next_line(line)) {
+        const char *n;
+        size_t len, off, size;
+        if (!parse_global(line, &n, &len, &off, &size)) continue;
+        if (len != want || memcmp(n, name, len) != 0) continue;
+        if (m->globals == NULL || off + size > m->globals_size) return OCU_ERR_INVALID_VALUE;
+        *ptr = (char *)m->globals + off;
+        *bytes = size;
+        return OCU_OK;
+    }
+    return OCU_ERR_NOT_FOUND;
 }
 
 static void parse_params(struct ocu_kernel *k, const char *meta)
@@ -638,6 +780,9 @@ static ocu_status mt_kernel_launch(ocu_queue *q, ocu_kernel *k, const ocu_launch
                                                  options:MTLResourceStorageModeShared];
         [enc setBuffer:argbuf offset:0 atIndex:0];
         [enc setBuffer:offbuf offset:0 atIndex:1];
+        /* The module's variables (translated kernels of a module with
+           variables declare buffer 2). */
+        if (k->module->globals_buf != nil) [enc setBuffer:k->module->globals_buf offset:0 atIndex:2];
         /* Translated kernels always declare threadgroup memory 0; give it
            at least the minimum length even when the launch asks for none. */
         NSUInteger len = (p->shared_memory_bytes + 15) / 16 * 16;
@@ -801,7 +946,7 @@ static const ocu_backend g_metal = {
     .marker_query = mt_marker_query,
     .marker_elapsed_ms = mt_marker_elapsed_ms,
     .get_provider = mt_get_provider,
-    .module_get_global = NULL,
+    .module_get_global = mt_module_get_global,
     .kernel_arg_sizes = mt_kernel_arg_sizes,
     .mem_alloc_shared = NULL,
     .host_register = NULL,
