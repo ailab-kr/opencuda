@@ -6,7 +6,7 @@
 
 공개 기준 구현, 공개 적합성 시험, 그리고 어떤 칩이든 꽂을 수 있는 얇은 규격.
 
-[English](README.md) · [인터랙티브 개요](docs/site/index.html) · [구조](ARCHITECTURE.md) · [칩 추가하기](docs/public/BACKEND_GUIDE.md)
+[English](README.md) · [인터랙티브 개요](docs/site/index.html) · [구조](ARCHITECTURE.ko.md) · [칩 추가하기](docs/public/BACKEND_GUIDE.ko.md)
 
 <img src="docs/img/overview.svg" alt="개요: 애플리케이션, 호환 층, 핵심 세 부분, 칩" width="900">
 
@@ -245,7 +245,7 @@ flowchart LR
 ### 함께 나누는 지식
 
 - **규격:** 백엔드 인터페이스(`backends/interface/ocu_backend.h`)와 연산 표
-  ([`docs/spec/op-table.md`](docs/spec/op-table.md)). 연산 표에는 EXACT, ULP, ROW,
+  ([`docs/spec/op-table.ko.md`](docs/spec/op-table.ko.md)). 연산 표에는 EXACT, ULP, ROW,
   DOT의 허용 오차 등급이 있다.
 - **기능 카드**(`cards/`): 기능마다 범위, 참고한 공개 자료, 시험, 열린 질문을 적었다.
   같은 기능을 구현하는 사람에게 읽기 목록 역할을 한다.
@@ -354,13 +354,13 @@ flowchart LR
 4. **실제 프로그램이 이끄는 범위 확장.** ggml 기반 프로그램, 그다음 cuBLASLt식 행렬곱,
    그다음 CUB 부분집합 위의 Thrust 순서다.
 
-항목별 완료 기준은 [docs/public/ROADMAP.md](docs/public/ROADMAP.md)를 본다.
+항목별 완료 기준은 [docs/public/ROADMAP.ko.md](docs/public/ROADMAP.ko.md)를 본다.
 
 ## 기여
 
-[CONTRIBUTING.md](CONTRIBUTING.md)와 [ALLOWLIST.md](ALLOWLIST.md)를 먼저 읽는다.
+[CONTRIBUTING.ko.md](CONTRIBUTING.ko.md)와 [ALLOWLIST.ko.md](ALLOWLIST.ko.md)를 먼저 읽는다.
 클린룸 규칙은 엄격하다. 공개 문서만 보고, 칩 회사의 헤더·SDK 파일·소스·바이너리는
-절대 보지 않는다. 운영 방식은 [docs/public/GOVERNANCE.md](docs/public/GOVERNANCE.md)에 있다.
+절대 보지 않는다. 운영 방식은 [docs/public/GOVERNANCE.ko.md](docs/public/GOVERNANCE.ko.md)에 있다.
 
 ## 라이선스
 
