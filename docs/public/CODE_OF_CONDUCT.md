@@ -1,19 +1,21 @@
 # Code of conduct
 
+**English** · [한국어](CODE_OF_CONDUCT.ko.md)
+
 > DRAFT for review.
 
-This project follows the Contributor Covenant, version 2.1. The full text is
+OpenCuda follows the Contributor Covenant, version 2.1. The full text is
 not copied into this repository; it is published by the Contributor Covenant
 project at:
 
 <https://www.contributor-covenant.org/version/2/1/code_of_conduct/>
 
-By taking part in this project you agree to follow it in all project spaces
+By taking part in OpenCuda you agree to follow it in all OpenCuda spaces
 (repositories, issue trackers, chat, mailing lists, events), and when
-officially representing the project elsewhere.
+officially representing OpenCuda elsewhere.
 
 Reports of unacceptable behaviour go to `CONDUCT_CONTACT` (a placeholder for a
-monitored address that is not read by the project's maintainers individually,
+monitored address that is not read by the maintainers individually,
 so that reports about maintainers can be handled by the steward board). The
 enforcement guidelines in the Covenant apply. Reports are treated as
 confidential.

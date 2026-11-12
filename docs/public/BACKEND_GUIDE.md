@@ -1,5 +1,7 @@
 # Backend guide
 
+**English** · [한국어](BACKEND_GUIDE.ko.md)
+
 > DRAFT for review. Code identifiers use the short prefix `ocu` (for OpenCuda).
 
 This guide is for chip vendors and community members who want to run
