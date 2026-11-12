@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -169,3 +170,108 @@ inline void __syncthreads() { ocu_cpu_barrier(); }
 
 template <typename T>
 inline T atomicAdd(T *addr, T v) { return ::ocu_cpu::atomic_add(addr, v); }
+
+/* ---- warp-level intrinsics (CPU path) ----------------------------------
+ * Built on ocu_cpu_warp_gather. The mask argument is accepted and not used:
+ * every live lane of the warp takes part, which is what code written with
+ * a full mask (0xffffffff) expects.
+ */
+namespace ocu_cpu {
+
+template <typename T>
+inline std::uint64_t to_bits(T v)
+{
+    static_assert(sizeof(T) <= 8 && std::is_trivially_copyable_v<T>,
+                  "warp shuffles move values of at most 8 bytes");
+    std::uint64_t b = 0;
+    std::memcpy(&b, &v, sizeof(T));
+    return b;
+}
+
+template <typename T>
+inline T from_bits(std::uint64_t b)
+{
+    T v;
+    std::memcpy(&v, &b, sizeof(T));
+    return v;
+}
+
+/* Value of lane `src` (or our own when `src` is outside our segment). */
+template <typename T>
+inline T shuffle_from(T v, int src, int width)
+{
+    std::uint64_t all[OCU_CPU_MAX_WARP];
+    unsigned count = ocu_cpu_warp_gather(to_bits(v), all);
+    int lane = static_cast<int>(ocu_cpu_lane_id());
+    int w = width > 0 ? width : static_cast<int>(ocu_cpu_warp_size());
+    int base = lane - lane % w;
+    if (src < base || src >= base + w || src >= static_cast<int>(count)) {
+        src = lane;
+    }
+    return from_bits<T>(all[src]);
+}
+
+} // namespace ocu_cpu
+
+template <typename T>
+inline T __shfl_sync(unsigned, T v, int src, int width = warpSize)
+{
+    int lane = static_cast<int>(ocu_cpu_lane_id());
+    int base = lane - lane % width;
+    return ::ocu_cpu::shuffle_from(v, base + ((src % width) + width) % width, width);
+}
+
+template <typename T>
+inline T __shfl_up_sync(unsigned, T v, unsigned delta, int width = warpSize)
+{
+    int lane = static_cast<int>(ocu_cpu_lane_id());
+    return ::ocu_cpu::shuffle_from(v, lane - static_cast<int>(delta), width);
+}
+
+template <typename T>
+inline T __shfl_down_sync(unsigned, T v, unsigned delta, int width = warpSize)
+{
+    int lane = static_cast<int>(ocu_cpu_lane_id());
+    return ::ocu_cpu::shuffle_from(v, lane + static_cast<int>(delta), width);
+}
+
+template <typename T>
+inline T __shfl_xor_sync(unsigned, T v, int mask, int width = warpSize)
+{
+    int lane = static_cast<int>(ocu_cpu_lane_id());
+    return ::ocu_cpu::shuffle_from(v, lane ^ mask, width);
+}
+
+/* Lanes whose predicate is true, one bit per lane (low 32 lanes). */
+inline unsigned __ballot_sync(unsigned, int pred)
+{
+    std::uint64_t all[OCU_CPU_MAX_WARP];
+    unsigned count = ocu_cpu_warp_gather(pred != 0, all);
+    unsigned bits = 0;
+    for (unsigned i = 0; i < count && i < 32; ++i) {
+        bits |= static_cast<unsigned>(all[i] != 0) << i;
+    }
+    return bits;
+}
+
+inline int __any_sync(unsigned, int pred)
+{
+    std::uint64_t all[OCU_CPU_MAX_WARP];
+    unsigned count = ocu_cpu_warp_gather(pred != 0, all);
+    for (unsigned i = 0; i < count; ++i) {
+        if (all[i]) return 1;
+    }
+    return 0;
+}
+
+inline int __all_sync(unsigned, int pred)
+{
+    std::uint64_t all[OCU_CPU_MAX_WARP];
+    unsigned count = ocu_cpu_warp_gather(pred != 0, all);
+    for (unsigned i = 0; i < count; ++i) {
+        if (!all[i]) return 0;
+    }
+    return 1;
+}
+
+inline void __syncwarp(unsigned = 0xffffffffu) { ocu_cpu_warp_sync(); }
