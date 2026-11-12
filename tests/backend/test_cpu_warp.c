@@ -142,13 +142,52 @@ static void k_two_sites(void **a)
     }
 }
 
+/* Partial masks that CUDA allows (fourth review). Lanes refer to a
+   32-lane group; the warp may be 32 or 64 lanes. */
+#define LANE32 (ocu_cpu_lane_id() % 32u)
+/* each half syncs with its own mask */
+static void k_disjoint_sync(void **a)
+{
+    (void)a;
+    if (LANE32 < 16) ocu_cpu_warp_sync_masked(0x0000ffffu);
+    else ocu_cpu_warp_sync_masked(0xffff0000u);
+}
+/* low half syncs, high half goes straight to the block barrier */
+static void k_half_then_barrier(void **a)
+{
+    (void)a;
+    if (LANE32 < 16) ocu_cpu_warp_sync_masked(0x0000ffffu);
+    ocu_cpu_barrier();
+}
+/* each half exchanges values among itself only */
+static void k_disjoint_gather(void **a)
+{
+    uint64_t *out = *(uint64_t **)a[0];
+    uint64_t all[OCU_CPU_MAX_WARP];
+    uint32_t t = ocu_cpu_thread_idx().x;
+    uint32_t group = t - t % 32u;
+    uint32_t mask = LANE32 < 16 ? 0x0000ffffu : 0xffff0000u;
+    ocu_cpu_warp_gather_masked(t * 10u, 0x5A, mask, all);
+    /* the first lane of my half, as seen through the gather */
+    uint32_t first = group + (LANE32 < 16 ? 0u : 16u);
+    out[t] = all[first - (t - t % ocu_cpu_warp_size())];
+}
+/* full mask, but the high half has returned: undefined in CUDA */
+static void k_full_mask_exited(void **a)
+{
+    (void)a;
+    if (LANE32 < 16) ocu_cpu_warp_sync_masked(0xffffffffu);
+}
+
 static const ocu_cpu_kernel_entry g_entries[] = {
     {"gather", k_gather}, {"early_exit", k_early_exit},
     {"split", k_split}, {"two_level", k_two_level},
     {"skip_iteration", k_skip_iteration}, {"two_sites", k_two_sites},
+    {"disjoint_sync", k_disjoint_sync}, {"half_then_barrier", k_half_then_barrier},
+    {"disjoint_gather", k_disjoint_gather}, {"full_mask_exited", k_full_mask_exited},
 };
 static const ocu_cpu_image g_image = {OCU_CPU_IMAGE_MAGIC, OCU_CPU_IMAGE_VERSION,
-                                      6, g_entries};
+                                      10, g_entries};
 
 static ocu_kernel *kernel(const char *name)
 {
@@ -264,6 +303,30 @@ static void test_mismatched_calls(void)
     B->mem_free(D, out);
 }
 
+static void test_partial_masks(void)
+{
+    g_test = "partial_masks_as_in_cuda";
+    const char *strict = getenv("OCU_CPU_STRICT");
+    int is_strict = strict != NULL && strcmp(strict, "1") == 0;
+    uint64_t *out = NULL;
+    B->mem_alloc(D, 64 * sizeof(uint64_t), (void **)&out);
+    void *args[] = {&out};
+    size_t sz[] = {sizeof(out)};
+    ocu_launch_params p = params(1, 64, args, sz, 1);
+    CHECK(B->kernel_launch(NULL, kernel("disjoint_sync"), &p) == OCU_OK);
+    CHECK(B->kernel_launch(NULL, kernel("half_then_barrier"), &p) == OCU_OK);
+    CHECK(B->kernel_launch(NULL, kernel("disjoint_gather"), &p) == OCU_OK);
+    int bad = 0;
+    for (uint32_t t = 0; t < 64; ++t) {
+        uint32_t first = t - t % 32u + (t % 32u < 16 ? 0u : 16u);
+        bad += out[t] != (uint64_t)first * 10u;
+    }
+    CHECK(bad == 0);
+    ocu_status st = B->kernel_launch(NULL, kernel("full_mask_exited"), &p);
+    CHECK(st == (is_strict ? OCU_ERR_LAUNCH_FAILED : OCU_OK));
+    B->mem_free(D, out);
+}
+
 int main(void)
 {
     B = ocu_backend_cpu();
@@ -279,6 +342,7 @@ int main(void)
     test_split_is_reported();
     test_two_level();
     test_mismatched_calls();
+    test_partial_masks();
     B->module_unload(M);
     if (g_failures == 0) {
         printf("test_cpu_warp: ok (%d checks, warp %u)\n", g_checks, W);
