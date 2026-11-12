@@ -156,6 +156,13 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
     ${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu)
   add_test(NAME ocu_cc_cpu_saxpy COMMAND ocu_cc_saxpy)
 
+  # The Metal backend on a real Apple GPU (SKIP without one).
+  if(OCU_BACKEND_METAL)
+    add_executable(test_metal_backend backend/test_metal_backend.c)
+    target_link_libraries(test_metal_backend PRIVATE ocu_backend_metal)
+    add_test(NAME metal_backend COMMAND test_metal_backend)
+  endif()
+
   # Device math library, compiled for the host, against long double.
   add_executable(test_device_math runtime/test_device_math.cpp)
   target_include_directories(test_device_math PRIVATE ${PROJECT_SOURCE_DIR}/runtime/include)
