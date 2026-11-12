@@ -287,7 +287,8 @@ static void test_exec_pointers(void)
         return;
     }
     uint8_t *da = dalloc(1024), *db = dalloc(1024), *dy = dalloc(1024);
-    float *host = aligned_alloc(64, 1024);
+    static _Alignas(64) float host_buf[256]; /* aligned_alloc is missing on Windows */
+    float *host = host_buf;
     if (!da || !db || !dy || !host) {
         return;
     }
@@ -353,7 +354,6 @@ static void test_exec_pointers(void)
             CHECK_ST(G.t->destroy(p), OCU_OK);
         }
     }
-    free(host);
     dfree(da);
     dfree(db);
     dfree(dy);
@@ -606,9 +606,14 @@ static void test_dtype_set(void)
 
 static double now_ms(void)
 {
+#if defined(_WIN32)
+    /* MinGW's C library lacks timespec_get; Windows' clock() is wall time. */
+    return (double)clock() * 1e3 / CLOCKS_PER_SEC;
+#else
     struct timespec ts;
     timespec_get(&ts, TIME_UTC);
     return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+#endif
 }
 
 static void test_plan_latency(void)
