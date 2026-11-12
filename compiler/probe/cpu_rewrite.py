@@ -8,19 +8,24 @@ byte for byte, keeping line numbers:
 
   1. Launches:  KERNEL<<<CFG>>>(ARGS)
          ->     ::ocu_cpu::launch(::ocu_cpu::cfg(CFG),
-                                  [](auto &&...ocu_a_) { KERNEL(ocu_a_...); }, ARGS)
+                                  [=](auto &&...ocu_a_) { KERNEL(ocu_a_...); }, ARGS)
      The kernel call inside the lambda is an ordinary C++ call, so template
      arguments, overloads and conversions resolve as in any call; the
      lambda's return type names that call, so the launch can test which
      argument types the kernel accepts (literal 0, below). A `NULL`
      argument becomes `nullptr` and a literal `0` becomes
      ::ocu_cpu::literal_zero{}, so both still convert to a pointer after
-     being copied.
+     being copied. The lambda captures by copy, so KERNEL may also be a
+     function pointer held in a variable or parameter (a launch helper's
+     `Kernel kernel` argument); a named kernel function captures nothing.
   2. Dynamic shared memory:  extern __shared__ T NAME[];
          ->     T *const NAME = static_cast<T *>(::ocu_cpu::dynamic_shared());
                 inside a function, or static ::ocu_cpu::dyn_shared<T> NAME;
                 at namespace scope (looked up at each use)
-     (qualifiers kept, __align__ dropped: the backend aligns to 64 bytes).
+     (qualifiers kept, __align__/alignas dropped: the backend aligns to 64
+     bytes). A static `__shared__ alignas(N) T a[]` becomes
+     `alignas(N) static thread_local T a[]` (the specifier may not follow
+     `static thread_local`).
 
 Comments, string and character literals (including raw strings and
 prefixed literals) and preprocessor directives other than #define are never
@@ -329,7 +334,7 @@ def _rewrite_launches(src: str) -> tuple[str, int]:
         gaps = _layout(src[callee_end:pos] + src[close_end:j]) + "\\\n" * continued
         sep = ", " if args.strip() else ""
         replacement = (f"::ocu_cpu::launch(::ocu_cpu::cfg({_fix_null_args(cfg, zero=False)}), "
-                       f"[](auto &&...{LAMBDA_ARG}) -> decltype({callee}({LAMBDA_ARG}...)) "
+                       f"[=](auto &&...{LAMBDA_ARG}) -> decltype({callee}({LAMBDA_ARG}...)) "
                        f"{{ {callee}({LAMBDA_ARG}...); }}"
                        f"{sep}{args}){gaps}")
         src = src[:callee_from] + replacement + src[args_end + 1:]
@@ -366,6 +371,14 @@ _EXTERN_SHARED = re.compile(
     r"\bextern\b(?P<pre>[^;{}()\[\]]*?)\b(?:__shared__|__ocu_shared__)\b(?P<post>[^;{}\[\]]*?)"
     r"\b(?P<name>[A-Za-z_]\w*)\s*\[\s*\]\s*;")
 _ALIGN = re.compile(r"__align__\s*\(\s*\d+\s*\)")
+# alignas(...) with one level of nested parentheses (alignas(sizeof(T))).
+_ALIGNAS = r"\balignas\s*\((?:[^()]|\([^()]*\))*\)"
+
+
+def _drop_align(text: str) -> str:
+    """An extern __shared__ array's type without its alignment: __align__(n)
+    as written, or alignas(...) as it is after preprocessing."""
+    return re.sub(_ALIGNAS, " ", _ALIGN.sub(" ", text))
 
 
 _BODY_TAIL = re.compile(r"\)\s*(?:(?:const|volatile|noexcept|override|final|mutable)\s*)*$")
@@ -400,7 +413,7 @@ def _rewrite_extern_shared(src: str) -> tuple[str, int]:
     for m in _EXTERN_SHARED.finditer(src):
         if not all(mask[m.start():m.end()]):
             continue
-        type_ = _ALIGN.sub(" ", m.group("pre") + " " + m.group("post"))
+        type_ = _drop_align(m.group("pre") + " " + m.group("post"))
         type_ = " ".join(type_.split())
         if not type_:
             raise RewriteError(f"extern __shared__ {m.group('name')} has no type")
@@ -421,6 +434,14 @@ def _rewrite_extern_shared(src: str) -> tuple[str, int]:
 
 # What `__shared__` expands to during preprocessing (ocu_cuda_lang_cpu.h).
 _SHARED_MARK = re.compile(r"\b__ocu_shared__\b")
+# `__shared__ __align__(16) T a[n]` (alignas after preprocessing): an
+# alignment specifier may not follow `static thread_local`, so it moves in
+# front of them.
+_SHARED_ALIGNED = re.compile(r"\b__ocu_shared__((?:\s*" + _ALIGNAS + r")+)")
+# `const alignas(16) T a[n]`: the CUDA compiler accepts an alignment
+# specifier after cv-qualifiers and storage classes, C++ only before them.
+_LATE_ALIGNAS = re.compile(
+    r"\b((?:(?:const|volatile|static|thread_local|constexpr|register)\s+)+)(" + _ALIGNAS + r")")
 
 
 def rewrite(src: str, preprocessed: bool = False) -> tuple[str, dict]:
@@ -430,7 +451,10 @@ def rewrite(src: str, preprocessed: bool = False) -> tuple[str, dict]:
     src, shared = _rewrite_extern_shared(src)
     src, launches = _rewrite_launches(src)
     if preprocessed:
+        src = _SHARED_ALIGNED.sub(
+            lambda m: " ".join(m.group(1).split()) + " static thread_local", src)
         src = _SHARED_MARK.sub("static thread_local", src)
+        src = _LATE_ALIGNAS.sub(lambda m: m.group(2) + " " + m.group(1), src)
     return src, {"launches": launches, "extern_shared": shared}
 
 

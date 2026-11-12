@@ -165,9 +165,16 @@ struct thunk {
 /* A literal 0 argument is passed as int when the kernel accepts an int
    there (a template parameter deduces int, as in a direct call), and as
    literal_zero (which converts to a pointer) otherwise. */
+/* The value an argument is copied as: decayed, and without a __restrict
+   qualifier on a pointer object (`T *__restrict p` passed on to a launch);
+   the kernel's own parameter keeps whatever qualifier it declares. */
+template <typename T> struct no_restrict_ { using type = T; };
+template <typename T> struct no_restrict_<T *__restrict> { using type = T *; };
+template <typename A> using value_t = typename no_restrict_<std::decay_t<A>>::type;
+
 template <typename A>
 using zero_as_int = std::conditional_t<std::is_same_v<std::decay_t<A>, literal_zero>, int,
-                                       std::decay_t<A>>;
+                                       value_t<A>>;
 
 template <typename F, typename... V, typename... A>
 cudaError_t launch_values(const config &c, F f, A &&...a);
@@ -175,12 +182,16 @@ cudaError_t launch_values(const config &c, F f, A &&...a);
 template <typename F, typename... A>
 cudaError_t launch(const config &c, F f, A &&...a)
 {
-    static_assert(std::is_empty_v<F>, "launch lambda must not capture");
+    /* The lambda is empty for a named kernel; launching through a function
+       pointer (a variable or a launch helper's parameter) captures that
+       pointer by copy. Its bytes travel with the arguments. */
+    static_assert(std::is_trivially_copyable_v<F> && std::is_trivially_destructible_v<F>,
+                  "launch lambda may capture only trivially copyable values");
     if constexpr ((std::is_same_v<std::decay_t<A>, literal_zero> || ...) &&
                   std::is_invocable_v<F &, zero_as_int<A> &...>) {
         return launch_values<F, zero_as_int<A>...>(c, f, std::forward<A>(a)...);
     } else {
-        return launch_values<F, std::decay_t<A>...>(c, f, std::forward<A>(a)...);
+        return launch_values<F, value_t<A>...>(c, f, std::forward<A>(a)...);
     }
 }
 
@@ -448,6 +459,12 @@ inline float __fsqrt_rn(float x) { return std::sqrt(x); }
 inline float __fmaf_rn(float a, float b, float c) { return std::fma(a, b, c); }
 inline float __fmul_rn(float a, float b) { return a * b; }
 inline float __fadd_rn(float a, float b) { return a + b; }
+inline float __fsub_rn(float a, float b) { return a - b; }
+inline float __fdiv_rn(float a, float b) { return a / b; }
+inline float __frcp_rn(float x) { return 1.0f / x; }
+inline double __dadd_rn(double a, double b) { return a + b; }
+inline double __dmul_rn(double a, double b) { return a * b; }
+inline double __drcp_rn(double x) { return 1.0 / x; }
 inline float __int_as_float(int v) { float f; std::memcpy(&f, &v, 4); return f; }
 inline int __float_as_int(float f) { int v; std::memcpy(&v, &f, 4); return v; }
 inline unsigned __float_as_uint(float f) { unsigned v; std::memcpy(&v, &f, 4); return v; }
