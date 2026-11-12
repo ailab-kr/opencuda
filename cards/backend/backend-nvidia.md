@@ -47,7 +47,9 @@ cost: { hours: 1.5, ai_usage: 0 }
 
 - 프로그램 시작 비용: 빈 프로그램 약 165ms(드라이버 초기화), 첫 실행 1.6s(PTX 번역, 이후 드라이버가 캐시).
 - lavaMD(boxes 10): 커널 43.6ms, 드라이버 초기화 154ms. 짧은 벤치마크는 전체 시간보다 커널 시간으로 비교해야 한다.
-- float 수학 함수는 double로 계산 후 반올림하므로, GeForce(FP64 속도가 1/64)에서 float 초월 함수가 많은 커널은 느리다. float 전용 구현이 다음 과제.
+- float 수학 함수(expf·sinf·powf·erff 등 24개)를 float 연산만으로 계산한다(`ocu_device_mathf.h`). 호스트에서 float 입력 2^32개 전부로 잰 최대 오차는 모두 CUDA 수학 API 문서의 상한 안(최대 atanf 1.01ulp, 나머지 1ulp 미만). GPU 결과는 같은 코드의 호스트 계산과 비트까지 같다(`gpu_rt_mathf`, 함수마다 419만 입력).
+- 커널 시간(104만 스레드 × 64회, 10회 중앙값): expf 6.33→0.22ms(29배), sinf 16.3→0.26ms(62배), powf 22.7→0.49ms(47배). 이전 값은 double로 계산 후 반올림하던 방식.
+- 장치 코드는 `-ffp-contract=fast-honor-pragmas`로 번역한다. Clang의 CUDA 기본값(fast)은 `#pragma clang fp contract(off)`를 무시해 수학 함수의 결과가 호스트와 달라졌다.
 
 ## 메모
 

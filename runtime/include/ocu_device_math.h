@@ -13,7 +13,8 @@
  * approximation alone would lose accuracy, sums are carried in two doubles
  * (pow, log2, log10, exp2, exp10).
  *
- * float functions evaluate the double function and round once.
+ * float functions (ocu_device_mathf.h) use float arithmetic only, except
+ * fmodf (exact through double).
  *
  * Known limit: sin, cos and tan reduce their argument with a three-part
  * pi/2 (accurate for |x| < 2^20 * pi/2); larger arguments lose accuracy.
@@ -675,33 +676,12 @@ OCU_DM_FN double fmod(double x, double y)
 OCU_DM_FN double fmin(double a, double b) { return isnan(a) ? b : isnan(b) ? a : (a < b || (a == b && signbit(a))) ? a : b; }
 OCU_DM_FN double fmax(double a, double b) { return isnan(a) ? b : isnan(b) ? a : (a > b || (a == b && !signbit(a))) ? a : b; }
 
-/* ---- float versions: the double function, rounded once ----------------------------- */
-
-#define OCU_DM_F1(name) OCU_DM_FN float name##f(float x) { return (float)name((double)x); }
-OCU_DM_F1(exp)
-OCU_DM_F1(expm1)
-OCU_DM_F1(exp2)
-OCU_DM_F1(exp10)
-OCU_DM_F1(log)
-OCU_DM_F1(log2)
-OCU_DM_F1(log10)
-OCU_DM_F1(log1p)
-OCU_DM_F1(sin)
-OCU_DM_F1(cos)
-OCU_DM_F1(tan)
-OCU_DM_F1(asin)
-OCU_DM_F1(acos)
-OCU_DM_F1(atan)
-OCU_DM_F1(sinh)
-OCU_DM_F1(cosh)
-OCU_DM_F1(tanh)
-OCU_DM_F1(cbrt)
-#undef OCU_DM_F1
-OCU_DM_FN float powf(float x, float y) { return (float)pow((double)x, (double)y); }
-OCU_DM_FN float atan2f(float y, float x) { return (float)atan2((double)y, (double)x); }
-OCU_DM_FN float hypotf(float x, float y) { return (float)hypot((double)x, (double)y); }
+/* fmod is exact, so the double version rounded is exact too. */
 OCU_DM_FN float fmodf(float x, float y) { return (float)fmod((double)x, (double)y); }
 
 } // namespace ocu_dm
+
+/* The float functions, from float operations only. */
+#include "ocu_device_mathf.h"
 
 #endif /* OCU_DEVICE_MATH_H */
