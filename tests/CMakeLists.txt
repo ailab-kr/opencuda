@@ -73,3 +73,19 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
     COMMAND ${Python3_EXECUTABLE} -m unittest test_cpu_rewrite
     WORKING_DIRECTORY ${OCU_PROBE_DIR})
 endif()
+
+# ---- conformance: BLAS reference cases on the CPU backend ---------------
+if(OCU_BACKEND_CPU AND Python3_FOUND)
+  add_executable(blas_driver conformance/blas_driver.c)
+  target_link_libraries(blas_driver PRIVATE ocu_blas)
+  add_test(NAME conformance_blas_cpu
+    COMMAND ${Python3_EXECUTABLE} -m ocu_conf.blas_run $<TARGET_FILE:blas_driver>
+            --out ${CMAKE_CURRENT_BINARY_DIR}/blas_cpu_result.json
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/conformance/harness)
+  set_tests_properties(conformance_blas_cpu PROPERTIES ENVIRONMENT "OCU_BACKEND=cpu")
+  add_test(NAME conformance_blas_cpu_queue
+    COMMAND ${Python3_EXECUTABLE} -m ocu_conf.blas_run $<TARGET_FILE:blas_driver>
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/conformance/harness)
+  set_tests_properties(conformance_blas_cpu_queue PROPERTIES
+    ENVIRONMENT "OCU_BACKEND=cpu;OCU_DRIVER_QUEUE=1;OCU_CPU_ORDER=random")
+endif()
