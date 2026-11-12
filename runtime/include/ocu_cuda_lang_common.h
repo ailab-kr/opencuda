@@ -45,7 +45,9 @@ OCU_LANG_FN unsigned int __vcmpne4(unsigned int a, unsigned int b)
 }
 
 /* Classification of a float: 1 for NaN (__isnanf) or infinity (__isinff), else 0. */
+#if !defined(__MINGW32__) /* MinGW's math.h has its own __isnanf (nonzero for NaN) */
 OCU_LANG_HD int __isnanf(float x) { return __builtin_isnan(x) ? 1 : 0; }
+#endif
 OCU_LANG_HD int __isinff(float x) { return __builtin_isinf(x) ? 1 : 0; }
 
 /*
