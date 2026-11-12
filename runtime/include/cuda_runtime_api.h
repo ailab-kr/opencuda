@@ -538,8 +538,8 @@ static inline cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t e
 }
 
 /* Kernel function pointers, as in the C++ overloads of the documented API. */
-template <typename T>
-static inline cudaError_t cudaLaunchCooperativeKernel(const T *func, dim3 grid, dim3 block,
+template <typename... P>
+static inline cudaError_t cudaLaunchCooperativeKernel(void (*func)(P...), dim3 grid, dim3 block,
                                                       void **args, size_t shared_mem = 0,
                                                       cudaStream_t stream = nullptr)
 {

@@ -91,7 +91,7 @@ class thread_block_tile {
                   "tile size must be a power of two up to 32");
 
     __device__ static unsigned lane() { return detail::linear_tid() & 31u; }
-    __device__ static unsigned tile_bits() { return N == 32 ? 0xffffffffu : ((1u << N) - 1u); }
+    __device__ static unsigned tile_bits() { return 0xffffffffu >> (32 - N); }
     /* Bits of the lanes of this thread's tile. */
     __device__ static unsigned mask() { return tile_bits() << (lane() / N * N); }
 
