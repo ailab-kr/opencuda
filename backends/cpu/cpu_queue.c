@@ -206,12 +206,20 @@ struct cpu_op {
 static ocu_status op_run(cpu_op *op)
 {
     switch (op->kind) {
-    case OP_COPY:
+    case OP_COPY: {
+        bool stats = cpu_get_config()->stats;
+        double t0 = stats ? cpu_now_ms() : 0.0;
         memmove(op->u.copy.dst, op->u.copy.src, op->u.copy.bytes);
+        if (stats) cpu_stats_copy(cpu_now_ms() - t0, op->u.copy.bytes);
         return OCU_OK;
-    case OP_SET:
+    }
+    case OP_SET: {
+        bool stats = cpu_get_config()->stats;
+        double t0 = stats ? cpu_now_ms() : 0.0;
         memset(op->u.set.dst, op->u.set.value, op->u.set.bytes);
+        if (stats) cpu_stats_copy(cpu_now_ms() - t0, op->u.set.bytes);
         return OCU_OK;
+    }
     case OP_LAUNCH:
         return cpu_run_grid(op->u.launch.fn, op->u.launch.grid,
                             op->u.launch.block, op->u.launch.shared_bytes,

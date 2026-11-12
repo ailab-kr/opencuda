@@ -8,7 +8,8 @@
  *      and block indices, the block barrier, dynamic shared memory.
  *
  * Kernel bodies run on lightweight fibers. All threads of one block run on
- * one OS thread, one after another, switching only at the barrier, so a
+ * one OS thread, one after another, switching only at the block barrier
+ * and at warp operations, so a
  * block never needs locks for its own shared memory. Different blocks run
  * on different OS threads at the same time, so device memory shared across
  * blocks needs real atomics, as on a GPU.
@@ -134,6 +135,21 @@ uint32_t ocu_cpu_warp_gather_masked(uint64_t value, uint64_t tag, uint32_t mask,
 
 /* Warp barrier with a participation mask (see above). */
 void ocu_cpu_warp_sync_masked(uint32_t mask);
+
+/*
+ * The same meeting as ocu_cpu_warp_gather_masked, returning one value
+ * only: lane `src`'s (warp-relative), or the caller's own when `src` is not
+ * a lane of this warp. Cheaper than a gather for shuffles.
+ */
+uint64_t ocu_cpu_warp_shuffle_masked(uint64_t value, uint64_t tag, uint32_t mask,
+                                     uint32_t src);
+
+/*
+ * The same meeting, for votes: bit i of the result is set when lane i
+ * (warp-relative) passed a nonzero `pred`. Lanes the warp does not have
+ * read as 0.
+ */
+uint64_t ocu_cpu_warp_vote_masked(int pred, uint64_t tag, uint32_t mask);
 
 #ifdef __cplusplus
 }

@@ -117,6 +117,14 @@ static void load_config(void)
 
     const char *strict = getenv("OCU_CPU_STRICT");
     g_config.strict_barrier = strict != NULL && strcmp(strict, "1") == 0;
+
+    g_config.spin_us = (uint32_t)env_u64("OCU_CPU_SPIN_US", 50);
+    if (g_config.spin_us > 100000) {
+        g_config.spin_us = 100000;
+    }
+
+    const char *stats = getenv("OCU_CPU_STATS");
+    g_config.stats = stats != NULL && strcmp(stats, "1") == 0;
 }
 
 const cpu_config *cpu_get_config(void)
@@ -183,16 +191,42 @@ typedef enum fiber_state {
 } fiber_state;
 
 typedef struct fiber {
-    cpu_ctx     ctx;
-    fiber_state state;
-    char       *stack;      /* usable stack, above the guard page */
+    cpu_ctx      ctx;
+    fiber_state  state;
+    bool         started;    /* has a stack and a context in this block */
+    bool         nonfull;    /* waits at a warp operation for part of its warp */
+    uint32_t     slot;       /* its stack, while started */
+    uint64_t     warp_seq;   /* warp operations done in this block */
+    ocu_cpu_dim3 tid;        /* threadIdx */
+    char        *stack;      /* usable stack of `slot`, above the guard page */
 #ifdef OCU_ASAN
-    void       *fake_stack;
+    void        *fake_stack;
 #endif
 #ifdef OCU_TSAN
-    void       *tsan_fiber;
+    void        *tsan_fiber;
 #endif
 } fiber;
+
+/*
+ * What a lane declared at the warp operation it waits at. Read only while
+ * the lane is parked there, by the lane that releases it.
+ */
+typedef struct warp_rec {
+    uint64_t tag;
+    uint64_t seq;    /* the lane's warp operations so far in this block */
+    uint64_t named;  /* lanes it waits for (warp-relative) */
+    bool     masked; /* an explicit mask (not the whole-warp form) */
+} warp_rec;
+
+/* Per warp: which lanes are parked (waiting at a warp operation or
+   returned) and which of those wait, kept up to date at every arrival so a
+   release costs no scan of the block. */
+typedef struct warp_state {
+    uint64_t lanes;   /* lanes that exist */
+    uint64_t parked;  /* waiting at a warp operation, or returned */
+    uint64_t waiting; /* waiting at a warp operation */
+    uint32_t nonfull; /* waiting lanes whose mask names less than the warp */
+} warp_state;
 
 typedef struct block_exec {
     cpu_ctx           sched_ctx;
@@ -202,21 +236,45 @@ typedef struct block_exec {
     uint32_t          current;
     ocu_cpu_dim3      block_idx;
     ocu_cpu_dim3      block_dim;
+    ocu_cpu_dim3      tid_dim;       /* block_dim the fibers' tid were made for */
     ocu_cpu_dim3      grid_dim;
     ocu_cpu_kernel_fn fn;
     void            **args;
     void             *dyn_shared;
     size_t            dyn_shared_bytes;
-    uint64_t         *warp_slots;    /* one value per thread, for gathers */
-    uint64_t         *warp_tags;     /* the call each lane's gather came from */
-    uint64_t         *warp_seq;      /* how many warp operations each lane did */
-    uint64_t         *warp_masks;    /* lanes each waiting lane waits for (warp-relative) */
+    warp_rec         *warp_recs;     /* one per thread */
+    /* Values of a warp operation, two per thread picked by the parity of
+       the lane's operation count: a lane cannot start operation s + 2
+       before every lane it waits for has arrived at s + 1, so by then they
+       have all read the values of s, and one wait per operation is enough. */
+    uint64_t         *warp_vals;
+    warp_state       *warps;
+    uint32_t          nwarps;
     uint32_t          warp_size;
+    uint32_t          warp_shift;    /* log2(warp_size): lane math without division */
     bool              warp_mismatch; /* lanes of a warp met at different calls */
+    uint64_t         *ready_bits;    /* READY fibers not running now */
+    uint64_t         *barrier_bits;  /* fibers waiting at the block barrier */
+    uint32_t          nwords;        /* words in each bit set */
+    uint32_t          n_barrier;     /* fibers waiting at the block barrier */
+    uint32_t          n_warp;        /* fibers waiting at a warp operation */
+    uint32_t          n_done;
+    bool              chain;         /* CPU_CHAIN and fixed order */
+    /* Stacks are handed out when a fiber first runs and taken back when it
+       returns, last in first out: a block whose threads never wait runs
+       them all on one warm stack. */
+    uint32_t         *free_slots;
+    uint32_t          nfree;
+    uint32_t          lowest_slot;   /* lowest slot handed out in this block */
     char             *stack_region;  /* one mmap for all fiber stacks */
     size_t            stack_region_bytes;
     size_t            stack_bytes;   /* usable bytes per fiber */
     uint64_t          rng;
+    /* counters for OCU_CPU_STATS (cheap enough to keep always) */
+    uint64_t          st_visits;     /* scheduler -> fiber switches */
+    uint64_t          st_barriers;   /* block barrier waits */
+    uint64_t          st_warp_waits; /* warp operation waits */
+    uint64_t          st_rounds;     /* scheduler rounds */
 #ifdef OCU_ASAN
     void             *sched_fake_stack;
     const void       *sched_bottom;
@@ -227,7 +285,18 @@ typedef struct block_exec {
 #endif
 } block_exec;
 
-static _Thread_local block_exec *tl_exec;
+/*
+ * Read by every device-side call. The library is position independent, so
+ * the default model would look the variable up through __tls_get_addr on
+ * each read; initial-exec is one load. It takes 8 bytes of the static TLS
+ * reserve when the library ends up in a shared object loaded at run time.
+ */
+#if defined(__ELF__) && (defined(__GNUC__) || defined(__clang__))
+#define CPU_TLS_FAST __attribute__((tls_model("initial-exec")))
+#else
+#define CPU_TLS_FAST
+#endif
+static _Thread_local block_exec *tl_exec CPU_TLS_FAST;
 
 _Thread_local ocu_cpu_dim3 ocu_cpu_tls_thread_idx;
 _Thread_local ocu_cpu_dim3 ocu_cpu_tls_block_idx;
@@ -236,6 +305,7 @@ _Thread_local ocu_cpu_dim3 ocu_cpu_tls_grid_dim;
 _Thread_local int          ocu_cpu_tls_warp_size;
 
 static ocu_cpu_dim3 linear_to_dim3(uint32_t linear, ocu_cpu_dim3 dim);
+static void fiber_entry(void);
 
 static uint64_t rng_next(uint64_t *s)
 {
@@ -248,29 +318,170 @@ static uint64_t rng_next(uint64_t *s)
     return x * 0x2545F4914F6CDD1DULL;
 }
 
-/* Switch from the scheduler into fiber `i`; returns when it yields. */
-static void switch_to_fiber(block_exec *ex, uint32_t i)
+static void ready_set(block_exec *ex, uint32_t i)
+{
+    ex->ready_bits[i >> 6] |= 1ULL << (i & 63u);
+}
+
+static void ready_clear(block_exec *ex, uint32_t i)
+{
+    ex->ready_bits[i >> 6] &= ~(1ULL << (i & 63u));
+}
+
+/* First fiber at or after `i` that is ready; nthreads when none. */
+static uint32_t next_ready(const block_exec *ex, uint32_t i)
+{
+    uint32_t wd = i >> 6;
+    if (wd >= ex->nwords) {
+        return ex->nthreads;
+    }
+    uint64_t m = ex->ready_bits[wd] & (~0ULL << (i & 63u));
+    while (m == 0) {
+        if (++wd >= ex->nwords) {
+            return ex->nthreads;
+        }
+        m = ex->ready_bits[wd];
+    }
+    return (wd << 6) + (uint32_t)__builtin_ctzll(m);
+}
+
+/*
+ * Chaining: a fiber whose thread returned starts the next thread itself, on
+ * the same stack, when that is the thread the scheduler would run next
+ * (fixed order, next index, not started yet). Saves two switches and a
+ * context set-up per thread of blocks that never wait. Only where fibers
+ * run on our own stacks, and not under the sanitizers, which are told
+ * about each GPU thread as its own fiber.
+ */
+#if CPU_OS_OWN_STACKS && !CPU_CTX_REUSED && !defined(OCU_TSAN) && !defined(OCU_ASAN)
+#define CPU_CHAIN 1
+#else
+#define CPU_CHAIN 0
+#endif
+
+/*
+ * The register switch called directly, one call level less than through
+ * cpu_ctx_switch: the switch returns by an indirect jump into the other
+ * context, so every return on the way back out of it is mispredicted.
+ * The sanitizer builds keep the wrappers (see cpu_fiber.h).
+ */
+#if defined(OCU_CPU_FAST_SWITCH) && !defined(OCU_TSAN) && !defined(OCU_ASAN)
+void ocu_cpu_ctx_switch(void **save_sp, void *load_sp);
+#define CTX_SWITCH(from, to) ocu_cpu_ctx_switch(&(from)->sp, (to)->sp)
+#define CTX_FINISH(from, to) ocu_cpu_ctx_switch(&(from)->sp, (to)->sp)
+#else
+#define CTX_SWITCH(from, to) cpu_ctx_switch(from, to)
+#define CTX_FINISH(from, to) cpu_ctx_finish(from, to)
+#endif
+
+static char *slot_stack(const block_exec *ex, uint32_t slot)
+{
+#if CPU_OS_OWN_STACKS
+    size_t pg = cpu_os_page_size();
+    return ex->stack_region + pg + (size_t)slot * (ex->stack_bytes + pg);
+#else
+    (void)ex;
+    (void)slot;
+    return NULL;
+#endif
+}
+
+/*
+ * Bytes of the slot's stack given to the fiber. Slots are a page longer
+ * than the configured stack, and each fiber's stack top sits a different
+ * number of cache lines into that page: tops a power of two apart would all
+ * fall into the same cache sets.
+ */
+static size_t slot_bytes(const block_exec *ex, uint32_t slot)
+{
+    size_t lines = cpu_os_page_size() / 64u;
+    return ex->stack_bytes + ((size_t)slot * 37u % lines) * 64u;
+}
+
+/* Give fiber `i` a stack and a fresh context: it starts running the kernel. */
+static ocu_status start_fiber(block_exec *ex, uint32_t i)
 {
     fiber *f = &ex->fibers[i];
+    uint32_t slot = ex->free_slots[--ex->nfree];
+    if (slot < ex->lowest_slot) {
+        ex->lowest_slot = slot;
+    }
+    f->slot = slot;
+    f->stack = slot_stack(ex, slot);
+    if (cpu_ctx_make(&f->ctx, f->stack, slot_bytes(ex, slot), fiber_entry) != 0) {
+        ex->free_slots[ex->nfree++] = slot;
+        return OCU_ERR_LAUNCH_FAILED;
+    }
+#ifdef OCU_TSAN
+    f->tsan_fiber = __tsan_create_fiber(0);
+#endif
+    f->started = true;
+    return OCU_OK;
+}
+
+/* Switch from the scheduler into fiber `i`; returns when it yields. */
+static ocu_status switch_to_fiber(block_exec *ex, uint32_t i)
+{
+    fiber *f = &ex->fibers[i];
+    if (!f->started) {
+        ocu_status st = start_fiber(ex, i);
+        if (st != OCU_OK) {
+            return st;
+        }
+    }
     ex->current = i;
-    ocu_cpu_tls_thread_idx = linear_to_dim3(i, ex->block_dim);
+    ex->st_visits++;
+    ocu_cpu_tls_thread_idx = f->tid;
 #ifdef OCU_ASAN
     __sanitizer_start_switch_fiber(&ex->sched_fake_stack, f->stack,
-                                   ex->stack_bytes);
+                                   slot_bytes(ex, f->slot));
 #endif
 #ifdef OCU_TSAN
     __tsan_switch_to_fiber(f->tsan_fiber, 0);
 #endif
-    cpu_ctx_switch(&ex->sched_ctx, &f->ctx);
+    CTX_SWITCH(&ex->sched_ctx, &f->ctx);
 #ifdef OCU_ASAN
     __sanitizer_finish_switch_fiber(ex->sched_fake_stack, NULL, NULL);
 #endif
+    /* The fiber that yielded: `i`, or a thread it chained to. */
+    fiber *last = &ex->fibers[ex->current];
+    if (last->state == FIBER_DONE) {
+        ex->free_slots[ex->nfree++] = last->slot; /* its stack is free again */
+    }
+    return OCU_OK;
 }
 
-/* Switch from the running fiber back to the scheduler. */
+/*
+ * Switch from the running fiber back to the scheduler. With chaining (fixed
+ * order), hand over directly to the fiber the scheduler would run next, the
+ * next ready one by index: one switch instead of two.
+ */
 static void yield_to_scheduler(block_exec *ex, bool exiting)
 {
     fiber *f = &ex->fibers[ex->current];
+#if CPU_CHAIN
+    if (ex->chain) {
+        uint32_t next = next_ready(ex, ex->current + 1);
+        if (next < ex->nthreads &&
+            (ex->fibers[next].started || start_fiber(ex, next) == OCU_OK)) {
+            fiber *to = &ex->fibers[next];
+            ready_clear(ex, next);
+            ex->current = next;
+            ex->st_visits++;
+            ocu_cpu_tls_thread_idx = to->tid;
+            if (exiting) {
+                /* Free once the next one has its stack: nobody takes this
+                   one before we have left it. */
+                ex->free_slots[ex->nfree++] = f->slot;
+                CTX_FINISH(&f->ctx, &to->ctx);
+            } else {
+                CTX_SWITCH(&f->ctx, &to->ctx);
+            }
+            return;
+        }
+        /* None left in this pass (or no stack for the next): the scheduler. */
+    }
+#endif
 #ifdef OCU_ASAN
     __sanitizer_start_switch_fiber(exiting ? NULL : &f->fake_stack,
                                    ex->sched_bottom, ex->sched_size);
@@ -281,13 +492,108 @@ static void yield_to_scheduler(block_exec *ex, bool exiting)
     __tsan_switch_to_fiber(ex->sched_tsan_fiber, 0);
 #endif
     if (exiting) {
-        cpu_ctx_finish(&f->ctx, &ex->sched_ctx);
+        CTX_FINISH(&f->ctx, &ex->sched_ctx);
     } else {
-        cpu_ctx_switch(&f->ctx, &ex->sched_ctx);
+        CTX_SWITCH(&f->ctx, &ex->sched_ctx);
     }
 #ifdef OCU_ASAN
     __sanitizer_finish_switch_fiber(f->fake_stack, NULL, NULL);
 #endif
+}
+
+/*
+ * The lanes `go` of warp `w` are about to be released: check that each met
+ * the lanes it names at the same call, the same occurrence of it and with
+ * the same mask (a lane that skipped an iteration has a different sequence
+ * number). A named lane that returned before reaching the operation is
+ * tolerated, or an error under OCU_CPU_STRICT=1 when the mask was explicit.
+ */
+static void check_release(block_exec *ex, uint32_t w, uint64_t go, bool full)
+{
+    const warp_state *ws = &ex->warps[w];
+    uint32_t base = w * ex->warp_size;
+    const warp_rec *recs = &ex->warp_recs[base];
+    uint64_t returned = ws->parked & ~ws->waiting;
+    bool strict = cpu_get_config()->strict_barrier;
+    if (full) {
+        /* Everyone names the whole warp: compare all against one. */
+        const warp_rec *ref = &recs[__builtin_ctzll(go)];
+        bool masked = false;
+        for (uint64_t m = go; m != 0; m &= m - 1) {
+            const warp_rec *r = &recs[__builtin_ctzll(m)];
+            if (r->tag != ref->tag || r->seq != ref->seq) {
+                ex->warp_mismatch = true;
+            }
+            masked |= r->masked;
+        }
+        if (strict && masked && returned != 0) {
+            ex->warp_mismatch = true; /* explicitly named lane has returned */
+        }
+        return;
+    }
+    for (uint64_t m = go; m != 0; m &= m - 1) {
+        const warp_rec *me = &recs[__builtin_ctzll(m)];
+        for (uint64_t n = me->named; n != 0; n &= n - 1) {
+            uint32_t b = (uint32_t)__builtin_ctzll(n);
+            if (returned >> b & 1u) {
+                if (strict && me->masked) {
+                    ex->warp_mismatch = true;
+                }
+                continue;
+            }
+            const warp_rec *r = &recs[b];
+            if (r->tag != me->tag || r->seq != me->seq || r->named != me->named) {
+                ex->warp_mismatch = true; /* a different call, occurrence or mask */
+            }
+        }
+    }
+}
+
+/*
+ * Release the lanes of warp `w` whose named lanes are all parked. Decide
+ * first, change states after: a decision must not see the result of
+ * another one made in the same pass.
+ */
+static void try_release_warp(block_exec *ex, uint32_t w)
+{
+    warp_state *ws = &ex->warps[w];
+    if (ws->waiting == 0) {
+        return;
+    }
+    uint32_t base = w * ex->warp_size;
+    uint64_t go;
+    bool full = ws->nonfull == 0;
+    if (full) {
+        /* Every waiter waits for the whole warp. */
+        go = ws->parked == ws->lanes ? ws->waiting : 0;
+    } else {
+        go = 0;
+        for (uint64_t m = ws->waiting; m != 0; m &= m - 1) {
+            uint32_t b = (uint32_t)__builtin_ctzll(m);
+            if ((ex->warp_recs[base + b].named & ~ws->parked) == 0) {
+                go |= 1ULL << b;
+            }
+        }
+    }
+    if (go == 0) {
+        return;
+    }
+    check_release(ex, w, go, full);
+    for (uint64_t m = go; m != 0; m &= m - 1) {
+        uint32_t b = (uint32_t)__builtin_ctzll(m);
+        fiber *f = &ex->fibers[base + b];
+        f->state = FIBER_READY;
+        if (base + b != ex->current) {
+            ready_set(ex, base + b); /* the running lane just goes on */
+        }
+        if (f->nonfull) {
+            f->nonfull = false;
+            ws->nonfull--;
+        }
+        ex->n_warp--;
+    }
+    ws->parked &= ~go;
+    ws->waiting &= ~go;
 }
 
 static void fiber_entry(void)
@@ -296,13 +602,71 @@ static void fiber_entry(void)
 #ifdef OCU_ASAN
     __sanitizer_finish_switch_fiber(NULL, &ex->sched_bottom, &ex->sched_size);
 #endif
-    ex->fn(ex->args);
-    ex->fibers[ex->current].state = FIBER_DONE;
+    for (;;) {
+        ex->fn(ex->args);
+        uint32_t me = ex->current;
+        ex->fibers[me].state = FIBER_DONE;
+        ex->n_done++;
+        /* A returned lane counts as arrived for the warp operations of the
+           others. */
+        uint32_t w = me >> ex->warp_shift;
+        ex->warps[w].parked |= 1ULL << (me & (ex->warp_size - 1));
+        try_release_warp(ex, w);
+#if CPU_CHAIN
+        uint32_t next = me + 1;
+        if (ex->chain && next < ex->nthreads && !ex->fibers[next].started) {
+            fiber *n = &ex->fibers[next];
+            n->started = true;
+            n->slot = ex->fibers[me].slot; /* the stack passes on */
+            n->stack = ex->fibers[me].stack;
+            ready_clear(ex, next);
+            ex->current = next;
+            ex->st_visits++;
+            ocu_cpu_tls_thread_idx = n->tid;
+            continue;
+        }
+#endif
+        break;
+    }
     yield_to_scheduler(ex, true);
 #if !CPU_CTX_REUSED
     abort(); /* a finished fiber is never resumed */
 #endif
     /* Reused (Windows): return; the fiber runs this entry again next block. */
+}
+
+/* Fibers' threadIdx for the block shape `dim`. */
+static void set_thread_indices(block_exec *ex, ocu_cpu_dim3 dim)
+{
+    for (uint32_t i = 0; i < ex->nthreads; ++i) {
+        ex->fibers[i].tid = linear_to_dim3(i, dim);
+    }
+    ex->tid_dim = dim;
+}
+
+/* Canary at the low end of each fiber stack: an overflow hits it first. */
+#define CANARY_WORDS 32
+#define CANARY_VALUE 0x6f63754361727921ULL
+
+static void canary_set(char *stack)
+{
+    if (!CPU_OS_OWN_STACKS) return; /* system fiber stacks: the system guards them */
+    uint64_t *w = (uint64_t *)(void *)stack;
+    for (int i = 0; i < CANARY_WORDS; ++i) {
+        w[i] = CANARY_VALUE;
+    }
+}
+
+static bool canary_ok(const char *stack)
+{
+    if (!CPU_OS_OWN_STACKS) return true;
+    const uint64_t *w = (const uint64_t *)(const void *)stack;
+    for (int i = 0; i < CANARY_WORDS; ++i) {
+        if (w[i] != CANARY_VALUE) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static ocu_status block_exec_init(block_exec *ex, uint32_t nthreads,
@@ -314,7 +678,7 @@ static ocu_status block_exec_init(block_exec *ex, uint32_t nthreads,
     size_t pg = cpu_os_page_size();
     ex->stack_bytes = (cfg->stack_bytes + pg - 1) & ~(pg - 1);
 #if CPU_OS_OWN_STACKS
-    ex->stack_region_bytes = pg + ex->stack_bytes * nthreads;
+    ex->stack_region_bytes = pg + (ex->stack_bytes + pg) * nthreads;
     void *region = cpu_os_map(ex->stack_region_bytes);
     if (region == NULL) {
         return OCU_ERR_OUT_OF_MEMORY;
@@ -324,22 +688,33 @@ static ocu_status block_exec_init(block_exec *ex, uint32_t nthreads,
         return OCU_ERR_OUT_OF_MEMORY;
     }
 #endif
+    ex->warp_size = cfg->warp_size;
+    ex->warp_shift = (uint32_t)__builtin_ctz(ex->warp_size);
+    ex->nwarps = (nthreads + ex->warp_size - 1) / ex->warp_size;
     ex->fibers = calloc(nthreads, sizeof(*ex->fibers));
     ex->order = calloc(nthreads, sizeof(*ex->order));
-    ex->warp_slots = calloc(nthreads, sizeof(*ex->warp_slots));
-    ex->warp_tags = calloc(nthreads, sizeof(*ex->warp_tags));
-    ex->warp_seq = calloc(nthreads, sizeof(*ex->warp_seq));
-    ex->warp_masks = calloc(nthreads, sizeof(*ex->warp_masks));
-    ex->warp_size = cfg->warp_size;
-    if (ex->fibers == NULL || ex->order == NULL || ex->warp_slots == NULL ||
-        ex->warp_tags == NULL || ex->warp_seq == NULL || ex->warp_masks == NULL) {
+    ex->warp_recs = calloc(nthreads, sizeof(*ex->warp_recs));
+    ex->warp_vals = calloc(2 * (size_t)nthreads, sizeof(*ex->warp_vals));
+    ex->warps = calloc(ex->nwarps, sizeof(*ex->warps));
+    ex->free_slots = calloc(nthreads, sizeof(*ex->free_slots));
+    ex->nwords = (nthreads + 63) / 64;
+    ex->ready_bits = calloc(ex->nwords, sizeof(*ex->ready_bits));
+    ex->barrier_bits = calloc(ex->nwords, sizeof(*ex->barrier_bits));
+    ex->chain = CPU_CHAIN && cfg->order == CPU_ORDER_FIXED;
+    if (ex->ready_bits == NULL || ex->barrier_bits == NULL ||
+        ex->fibers == NULL || ex->order == NULL || ex->warp_recs == NULL ||
+        ex->warp_vals == NULL ||
+        ex->warps == NULL || ex->free_slots == NULL) {
         return OCU_ERR_OUT_OF_MEMORY;
     }
-#if CPU_OS_OWN_STACKS
     for (uint32_t i = 0; i < nthreads; ++i) {
-        ex->fibers[i].stack = ex->stack_region + pg + (size_t)i * ex->stack_bytes;
+        canary_set(slot_stack(ex, i));
     }
-#endif
+    for (uint32_t w = 0; w < ex->nwarps; ++w) {
+        uint32_t count = nthreads - w * ex->warp_size;
+        if (count > ex->warp_size) count = ex->warp_size;
+        ex->warps[w].lanes = count == 64 ? ~0ULL : ((1ULL << count) - 1u);
+    }
     if (shared_bytes > 0) {
         size_t a = CPU_SHARED_ALIGN;
         ex->dyn_shared = cpu_os_aligned_alloc(a, (shared_bytes + a - 1) & ~(a - 1));
@@ -366,37 +741,14 @@ static void block_exec_release(block_exec *ex)
     }
     free(ex->fibers);
     free(ex->order);
-    free(ex->warp_slots);
-    free(ex->warp_tags);
-    free(ex->warp_seq);
-    free(ex->warp_masks);
+    free(ex->warp_recs);
+    free(ex->warp_vals);
+    free(ex->warps);
+    free(ex->free_slots);
+    free(ex->ready_bits);
+    free(ex->barrier_bits);
     cpu_os_aligned_free(ex->dyn_shared);
     memset(ex, 0, sizeof(*ex));
-}
-
-/* Canary at the low end of each fiber stack: an overflow hits it first. */
-#define CANARY_WORDS 32
-#define CANARY_VALUE 0x6f63754361727921ULL
-
-static void canary_set(const fiber *f)
-{
-    if (!CPU_OS_OWN_STACKS) return; /* system fiber stacks: the system guards them */
-    uint64_t *w = (uint64_t *)(void *)f->stack;
-    for (int i = 0; i < CANARY_WORDS; ++i) {
-        w[i] = CANARY_VALUE;
-    }
-}
-
-static bool canary_ok(const fiber *f)
-{
-    if (!CPU_OS_OWN_STACKS) return true;
-    const uint64_t *w = (const uint64_t *)(const void *)f->stack;
-    for (int i = 0; i < CANARY_WORDS; ++i) {
-        if (w[i] != CANARY_VALUE) {
-            return false;
-        }
-    }
-    return true;
 }
 
 static void report_deadlock(void)
@@ -407,45 +759,6 @@ static void report_deadlock(void)
                         "other at different barriers (warp operation vs "
                         "block barrier); the launch fails\n");
     }
-}
-
-/*
- * Release the warps whose live lanes all wait at a warp operation.
- * Returns true when at least one warp was released.
- */
-static bool release_warps(block_exec *ex)
-{
-    bool released = false;
-    uint32_t w = ex->warp_size;
-    for (uint32_t base = 0; base < ex->nthreads; base += w) {
-        uint32_t end = base + w < ex->nthreads ? base + w : ex->nthreads;
-        /* Decide first, change states after: a decision must not see the
-           result of another one made in the same pass. */
-        uint64_t go = 0;
-        for (uint32_t i = base; i < end; ++i) {
-            if (ex->fibers[i].state != FIBER_WAITING_WARP) {
-                continue;
-            }
-            uint64_t need = ex->warp_masks[i];
-            bool ok = true;
-            for (uint32_t b = 0; b < end - base && ok; ++b) {
-                if (need >> b & 1u) {
-                    fiber_state s = ex->fibers[base + b].state;
-                    ok = s == FIBER_WAITING_WARP || s == FIBER_DONE;
-                }
-            }
-            if (ok) {
-                go |= 1ULL << (i - base);
-            }
-        }
-        for (uint32_t i = base; i < end; ++i) {
-            if (go >> (i - base) & 1u) {
-                ex->fibers[i].state = FIBER_READY;
-                released = true;
-            }
-        }
-    }
-    return released;
 }
 
 static void report_warp_mismatch(void)
@@ -468,7 +781,16 @@ static void report_stack_overflow(void)
     }
 }
 
-/* Run one block to completion. */
+/*
+ * Run one block to completion.
+ *
+ * A round runs every ready fiber until it waits or returns. Warp
+ * operations release their lanes as soon as the last named lane arrives
+ * (that lane goes on without a switch); in fixed order a round visits
+ * threads 0, 1, 2, ... and also runs lanes released earlier in the same
+ * round, in random order it runs the ready ones in a fresh shuffle. When no
+ * fiber is ready, the block barrier's waiters are released together.
+ */
 static ocu_status run_block(block_exec *ex, uint64_t linear_block)
 {
     const cpu_config *cfg = cpu_get_config();
@@ -477,81 +799,115 @@ static ocu_status run_block(block_exec *ex, uint64_t linear_block)
         /* Shared memory starts with garbage on a GPU; make it visible. */
         memset(ex->dyn_shared, 0xA5, ex->dyn_shared_bytes);
     }
-    memset(ex->warp_slots, 0, ex->nthreads * sizeof(*ex->warp_slots));
-    memset(ex->warp_tags, 0, ex->nthreads * sizeof(*ex->warp_tags));
-    memset(ex->warp_seq, 0, ex->nthreads * sizeof(*ex->warp_seq));
-    memset(ex->warp_masks, 0, ex->nthreads * sizeof(*ex->warp_masks));
     ex->warp_mismatch = false;
+    ex->n_barrier = ex->n_warp = ex->n_done = 0;
+    for (uint32_t w = 0; w < ex->nwarps; ++w) {
+        ex->warps[w].parked = ex->warps[w].waiting = 0;
+        ex->warps[w].nonfull = 0;
+    }
+    ex->nfree = 0;
+    /* The highest slot is handed out first: an overflow of the stack most
+       used runs into a neighbour's memory and is caught by the canary,
+       rather than into the guard page below slot 0. */
+    for (uint32_t i = 0; i < ex->nthreads; ++i) {
+        ex->free_slots[ex->nfree++] = i;
+    }
+    ex->lowest_slot = ex->nthreads;
     for (uint32_t i = 0; i < ex->nthreads; ++i) {
         fiber *f = &ex->fibers[i];
         f->state = FIBER_READY;
-        canary_set(f);
-        if (cpu_ctx_make(&f->ctx, f->stack, ex->stack_bytes, fiber_entry) != 0) {
-            return OCU_ERR_LAUNCH_FAILED;
-        }
-#ifdef OCU_TSAN
-        f->tsan_fiber = __tsan_create_fiber(0);
-#endif
+        f->started = false;
+        f->nonfull = false;
+        f->warp_seq = 0;
+    }
+    for (uint32_t wd = 0; wd < ex->nwords; ++wd) {
+        uint32_t left = ex->nthreads - wd * 64u;
+        ex->ready_bits[wd] = left >= 64 ? ~0ULL : ((1ULL << left) - 1u);
+        ex->barrier_bits[wd] = 0;
     }
 
     ocu_status st = OCU_OK;
     for (;;) {
-        uint32_t ready = 0;
-        for (uint32_t i = 0; i < ex->nthreads; ++i) {
-            if (ex->fibers[i].state == FIBER_READY) {
+        bool ran = false;
+        if (cfg->order == CPU_ORDER_RANDOM) {
+            uint32_t ready = 0;
+            for (uint32_t i = next_ready(ex, 0); i < ex->nthreads; i = next_ready(ex, i + 1)) {
                 ex->order[ready++] = i;
             }
-        }
-        if (cfg->order == CPU_ORDER_RANDOM) {
             for (uint32_t i = ready; i > 1; --i) {
                 uint32_t j = (uint32_t)(rng_next(&ex->rng) % i);
                 uint32_t t = ex->order[i - 1];
                 ex->order[i - 1] = ex->order[j];
                 ex->order[j] = t;
             }
+            for (uint32_t k = 0; k < ready && st == OCU_OK; ++k) {
+                ready_clear(ex, ex->order[k]);
+                st = switch_to_fiber(ex, ex->order[k]);
+            }
+            ran = ready > 0;
+        } else {
+            /* Increasing index, including fibers released during the pass. */
+            /* Fibers hand over to each other (yield_to_scheduler): go on
+               after the one that came back. */
+            for (uint32_t i = next_ready(ex, 0); i < ex->nthreads && st == OCU_OK;
+                 i = next_ready(ex, ex->current + 1)) {
+                ready_clear(ex, i);
+                st = switch_to_fiber(ex, i);
+                ran = true;
+            }
         }
-        for (uint32_t k = 0; k < ready; ++k) {
-            switch_to_fiber(ex, ex->order[k]);
+        ex->st_rounds++;
+        if (st != OCU_OK) {
+            break;
+        }
+        if (ran) {
+            continue; /* go on until no fiber is ready */
         }
 
-        /* After a round no fiber is ready: each waits or has returned. */
-        uint32_t waiting = 0, waiting_warp = 0, done = 0;
-        for (uint32_t i = 0; i < ex->nthreads; ++i) {
-            waiting += ex->fibers[i].state == FIBER_WAITING;
-            waiting_warp += ex->fibers[i].state == FIBER_WAITING_WARP;
-            done += ex->fibers[i].state == FIBER_DONE;
-        }
-        if (waiting == 0 && waiting_warp == 0) {
+        /* No fiber is ready: each waits or has returned. Warp operations
+           whose lanes could go have been released already. */
+        if (ex->n_barrier == 0 && ex->n_warp == 0) {
             break; /* every fiber returned */
         }
-        if (waiting_warp > 0 && release_warps(ex)) {
-            continue; /* warps first; block waiters stay waiting */
-        }
-        if (waiting_warp > 0) {
+        if (ex->n_warp > 0) {
             report_deadlock(); /* lanes split between warp op and barrier */
             st = OCU_ERR_LAUNCH_FAILED;
             break;
         }
-        if (done > 0 && cfg->strict_barrier) {
+        if (ex->n_done > 0 && cfg->strict_barrier) {
             st = OCU_ERR_LAUNCH_FAILED; /* barrier not reached by all */
             break;
         }
-        for (uint32_t i = 0; i < ex->nthreads; ++i) {
-            if (ex->fibers[i].state == FIBER_WAITING) {
-                ex->fibers[i].state = FIBER_READY;
+        for (uint32_t wd = 0; wd < ex->nwords; ++wd) {
+            for (uint64_t m = ex->barrier_bits[wd]; m != 0; m &= m - 1) {
+                ex->fibers[(wd << 6) + (uint32_t)__builtin_ctzll(m)].state = FIBER_READY;
             }
+            ex->ready_bits[wd] |= ex->barrier_bits[wd];
+            ex->barrier_bits[wd] = 0;
         }
+        ex->n_barrier = 0;
     }
+    bool overflow = false;
+    for (uint32_t i = 0; i < ex->nthreads; ++i) {
+        fiber *f = &ex->fibers[i];
+        if (!f->started) {
+            continue;
+        }
+        f->started = false;
 #ifdef OCU_TSAN
-    for (uint32_t i = 0; i < ex->nthreads; ++i) {
-        __tsan_destroy_fiber(ex->fibers[i].tsan_fiber);
-    }
+        __tsan_destroy_fiber(f->tsan_fiber);
 #endif
-    for (uint32_t i = 0; i < ex->nthreads; ++i) {
-        if (!canary_ok(&ex->fibers[i])) {
-            report_stack_overflow();
-            return OCU_ERR_LAUNCH_FAILED;
+    }
+    for (uint32_t s = ex->lowest_slot; s < ex->nthreads; ++s) {
+        char *stack = slot_stack(ex, s);
+        if (!canary_ok(stack)) {
+            overflow = true;
+            canary_set(stack); /* for the next launch on these stacks */
         }
+    }
+    if (overflow) {
+        report_stack_overflow();
+        return OCU_ERR_LAUNCH_FAILED;
     }
     if (st == OCU_OK && ex->warp_mismatch) {
         report_warp_mismatch();
@@ -583,6 +939,10 @@ typedef struct grid_job {
     uint32_t          attached;   /* pool threads working on it now */
     pthread_cond_t    detached_cv;
     struct grid_job  *next_open;
+    /* OCU_CPU_STATS, summed over the threads that worked on it */
+    _Atomic uint64_t  st_visits, st_barriers, st_warp_waits, st_rounds;
+    _Atomic uint64_t  st_busy_ns;  /* time threads spent running blocks */
+    _Atomic uint32_t  st_threads;  /* threads that ran at least one block */
 } grid_job;
 
 static pthread_mutex_t g_pool_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -590,6 +950,43 @@ static pthread_cond_t  g_pool_cv = PTHREAD_COND_INITIALIZER;
 static grid_job       *g_open_jobs;
 static uint32_t        g_pool_threads;  /* started so far */
 static uint32_t        g_pool_idle;     /* waiting for work */
+static _Atomic uint32_t g_pool_gen;     /* bumped whenever a job opens */
+
+/*
+ * Waking a sleeping thread costs tens of microseconds, about as long as a
+ * small launch takes to run. Pool threads therefore watch for new work for
+ * a short while (OCU_CPU_SPIN_US, default 50) before they sleep, and the
+ * launching thread does the same while its helpers finish.
+ */
+static void cpu_relax(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    __asm__ volatile("pause");
+#elif defined(__aarch64__)
+    __asm__ volatile("yield");
+#endif
+}
+
+/* Spin until `*gen` differs from `seen` or the spin time is up. */
+static bool spin_for_new_job(uint32_t seen)
+{
+    double limit = cpu_get_config()->spin_us / 1e3;
+    if (limit <= 0) {
+        return false;
+    }
+    double start = cpu_now_ms();
+    for (;;) {
+        for (int i = 0; i < 64; ++i) {
+            if (atomic_load_explicit(&g_pool_gen, memory_order_relaxed) != seen) {
+                return true;
+            }
+            cpu_relax();
+        }
+        if (cpu_now_ms() - start > limit) {
+            return false;
+        }
+    }
+}
 
 static void record_error(grid_job *job, ocu_status st)
 {
@@ -696,11 +1093,19 @@ static bool work_on(grid_job *job, bool primary)
     ex->args = job->args;
     ex->dyn_shared_bytes = job->shared_bytes;
     ex->block_dim = (ocu_cpu_dim3){job->block[0], job->block[1], job->block[2]};
+    if (ex->tid_dim.x != ex->block_dim.x || ex->tid_dim.y != ex->block_dim.y ||
+        ex->tid_dim.z != ex->block_dim.z) {
+        set_thread_indices(ex, ex->block_dim);
+    }
     ex->grid_dim = (ocu_cpu_dim3){job->grid[0], job->grid[1], job->grid[2]};
     tl_exec = ex;
     ocu_cpu_tls_block_dim = ex->block_dim;
     ocu_cpu_tls_grid_dim = ex->grid_dim;
     ocu_cpu_tls_warp_size = (int)ex->warp_size;
+    ex->st_visits = ex->st_barriers = ex->st_warp_waits = ex->st_rounds = 0;
+    bool stats = cpu_get_config()->stats;
+    double t0 = stats ? cpu_now_ms() : 0.0;
+    uint64_t ran = 0;
     for (;;) {
         if (atomic_load(&job->status) != OCU_OK) {
             break;
@@ -714,11 +1119,20 @@ static bool work_on(grid_job *job, bool primary)
         ex->block_idx.y = (uint32_t)((b / gx) % gy);
         ex->block_idx.z = (uint32_t)(b / (gx * gy));
         ocu_cpu_tls_block_idx = ex->block_idx;
+        ran++;
         st = run_block(ex, b);
         if (st != OCU_OK) {
             record_error(job, st);
             break;
         }
+    }
+    if (stats && ran > 0) {
+        atomic_fetch_add(&job->st_visits, ex->st_visits);
+        atomic_fetch_add(&job->st_barriers, ex->st_barriers);
+        atomic_fetch_add(&job->st_warp_waits, ex->st_warp_waits);
+        atomic_fetch_add(&job->st_rounds, ex->st_rounds);
+        atomic_fetch_add(&job->st_busy_ns, (uint64_t)((cpu_now_ms() - t0) * 1e6));
+        atomic_fetch_add(&job->st_threads, 1u);
     }
     tl_exec = NULL;
     const ocu_cpu_dim3 zero = {0, 0, 0};
@@ -750,6 +1164,13 @@ static void *pool_thread(void *unused)
     for (;;) {
         grid_job *job;
         while ((job = job_wanting_help()) == NULL) {
+            uint32_t seen = atomic_load(&g_pool_gen);
+            pthread_mutex_unlock(&g_pool_lock);
+            bool more = spin_for_new_job(seen);
+            pthread_mutex_lock(&g_pool_lock);
+            if (more) {
+                continue; /* look again, under the lock */
+            }
             g_pool_idle++;
             pthread_cond_wait(&g_pool_cv, &g_pool_lock);
             g_pool_idle--;
@@ -817,6 +1238,111 @@ static void grow_pool(uint32_t want)
     }
 }
 
+/* ---- OCU_CPU_STATS ------------------------------------------------------
+ * Per kernel entry point: launches, blocks, fiber switches, waits and
+ * time. Printed to stderr at exit, kernels as addresses relative to
+ * cpu_run_grid (resolve with nm / addr2line on the executable).
+ */
+typedef struct kstat {
+    ocu_cpu_kernel_fn fn;
+    uint32_t threads_per_block;
+    uint64_t launches, blocks, visits, barriers, warp_waits, rounds, threads;
+    double   wall_ms, busy_ms;
+} kstat;
+
+#define KSTAT_MAX 512
+static pthread_mutex_t g_stats_lock = PTHREAD_MUTEX_INITIALIZER;
+static kstat           g_kstats[KSTAT_MAX];
+static uint32_t        g_nkstats;
+static uint64_t        g_copies, g_copy_bytes;
+static double          g_copy_ms;
+static pthread_once_t  g_stats_once = PTHREAD_ONCE_INIT;
+
+static int kstat_by_wall(const void *a, const void *b)
+{
+    double x = ((const kstat *)a)->wall_ms, y = ((const kstat *)b)->wall_ms;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+static void stats_print(void)
+{
+    pthread_mutex_lock(&g_stats_lock);
+    qsort(g_kstats, g_nkstats, sizeof(kstat), kstat_by_wall);
+    kstat t;
+    memset(&t, 0, sizeof(t));
+    for (uint32_t i = 0; i < g_nkstats; ++i) {
+        t.launches += g_kstats[i].launches;
+        t.blocks += g_kstats[i].blocks;
+        t.visits += g_kstats[i].visits;
+        t.barriers += g_kstats[i].barriers;
+        t.warp_waits += g_kstats[i].warp_waits;
+        t.rounds += g_kstats[i].rounds;
+        t.wall_ms += g_kstats[i].wall_ms;
+        t.busy_ms += g_kstats[i].busy_ms;
+    }
+    fprintf(stderr, "ocu cpu stats: %llu launches, %.1f ms in kernels (busy %.1f ms "
+                    "over threads), %llu blocks, %llu fiber switches, %llu barrier "
+                    "waits, %llu warp waits, %llu rounds; %llu copies %.1f MB %.1f ms\n",
+            (unsigned long long)t.launches, t.wall_ms, t.busy_ms,
+            (unsigned long long)t.blocks, (unsigned long long)t.visits,
+            (unsigned long long)t.barriers, (unsigned long long)t.warp_waits,
+            (unsigned long long)t.rounds, (unsigned long long)g_copies,
+            (double)g_copy_bytes / 1e6, g_copy_ms);
+    fprintf(stderr, "ocu cpu stats: kernel(+off) tpb launches blocks wall_ms busy_ms "
+                    "thr/launch switches barriers warp_waits rounds\n");
+    for (uint32_t i = 0; i < g_nkstats && i < 40; ++i) {
+        const kstat *k = &g_kstats[i];
+        fprintf(stderr, "ocu cpu stats: %+lld %u %llu %llu %.1f %.1f %.1f %llu %llu %llu %llu\n",
+                (long long)((intptr_t)k->fn - (intptr_t)cpu_run_grid),
+                k->threads_per_block, (unsigned long long)k->launches,
+                (unsigned long long)k->blocks, k->wall_ms, k->busy_ms,
+                (double)k->threads / (double)k->launches,
+                (unsigned long long)k->visits, (unsigned long long)k->barriers,
+                (unsigned long long)k->warp_waits, (unsigned long long)k->rounds);
+    }
+    pthread_mutex_unlock(&g_stats_lock);
+}
+
+static void stats_install(void) { atexit(stats_print); }
+
+static kstat *stats_slot(ocu_cpu_kernel_fn fn)
+{
+    for (uint32_t i = 0; i < g_nkstats; ++i) {
+        if (g_kstats[i].fn == fn) return &g_kstats[i];
+    }
+    if (g_nkstats == KSTAT_MAX) return &g_kstats[KSTAT_MAX - 1]; /* lumped */
+    g_kstats[g_nkstats].fn = fn;
+    return &g_kstats[g_nkstats++];
+}
+
+static void stats_record(grid_job *job, double wall_ms)
+{
+    pthread_once(&g_stats_once, stats_install);
+    pthread_mutex_lock(&g_stats_lock);
+    kstat *k = stats_slot(job->fn);
+    k->threads_per_block = job->block[0] * job->block[1] * job->block[2];
+    k->launches++;
+    k->blocks += job->nblocks;
+    k->visits += atomic_load(&job->st_visits);
+    k->barriers += atomic_load(&job->st_barriers);
+    k->warp_waits += atomic_load(&job->st_warp_waits);
+    k->rounds += atomic_load(&job->st_rounds);
+    k->threads += atomic_load(&job->st_threads);
+    k->busy_ms += (double)atomic_load(&job->st_busy_ns) / 1e6;
+    k->wall_ms += wall_ms;
+    pthread_mutex_unlock(&g_stats_lock);
+}
+
+void cpu_stats_copy(double ms, size_t bytes)
+{
+    pthread_once(&g_stats_once, stats_install);
+    pthread_mutex_lock(&g_stats_lock);
+    g_copies++;
+    g_copy_bytes += bytes;
+    g_copy_ms += ms;
+    pthread_mutex_unlock(&g_stats_lock);
+}
+
 ocu_status cpu_run_grid(ocu_cpu_kernel_fn fn, const uint32_t grid[3],
                         const uint32_t block[3], size_t shared_bytes,
                         void **args)
@@ -835,6 +1361,8 @@ ocu_status cpu_run_grid(ocu_cpu_kernel_fn fn, const uint32_t grid[3],
     atomic_init(&job.next, 0);
     atomic_init(&job.status, OCU_OK);
 
+    bool stats = cpu_get_config()->stats;
+    double t_start = stats ? cpu_now_ms() : 0.0;
     uint64_t workers = cpu_get_config()->workers;
     uint64_t helpers = (workers < job.nblocks ? workers : job.nblocks);
     helpers = helpers > 0 ? helpers - 1 : 0;
@@ -847,6 +1375,7 @@ ocu_status cpu_run_grid(ocu_cpu_kernel_fn fn, const uint32_t grid[3],
         grow_pool(cpu_get_config()->workers - 1);
         job.next_open = g_open_jobs;
         g_open_jobs = &job;
+        atomic_fetch_add(&g_pool_gen, 1u);
         pthread_cond_broadcast(&g_pool_cv);
         pthread_mutex_unlock(&g_pool_lock);
     }
@@ -861,11 +1390,25 @@ ocu_status cpu_run_grid(ocu_cpu_kernel_fn fn, const uint32_t grid[3],
                 break;
             }
         }
+        /* Helpers usually finish within microseconds of us: poll a little
+           before sleeping. */
+        double limit = cpu_get_config()->spin_us / 1e3;
+        double start = cpu_now_ms();
+        while (job.attached > 0 && limit > 0 && cpu_now_ms() - start <= limit) {
+            pthread_mutex_unlock(&g_pool_lock);
+            for (int i = 0; i < 32; ++i) {
+                cpu_relax();
+            }
+            pthread_mutex_lock(&g_pool_lock);
+        }
         while (job.attached > 0) {
             pthread_cond_wait(&job.detached_cv, &g_pool_lock);
         }
         pthread_mutex_unlock(&g_pool_lock);
         pthread_cond_destroy(&job.detached_cv);
+    }
+    if (stats) {
+        stats_record(&job, cpu_now_ms() - t_start);
     }
     return (ocu_status)atomic_load(&job.status);
 }
@@ -888,18 +1431,26 @@ static ocu_cpu_dim3 linear_to_dim3(uint32_t linear, ocu_cpu_dim3 dim)
 
 ocu_cpu_dim3 ocu_cpu_thread_idx(void)
 {
-    return linear_to_dim3(tl_exec->current, tl_exec->block_dim);
+    return tl_exec->fibers[tl_exec->current].tid;
 }
 
 ocu_cpu_dim3 ocu_cpu_block_idx(void) { return tl_exec->block_idx; }
 ocu_cpu_dim3 ocu_cpu_block_dim(void) { return tl_exec->block_dim; }
 ocu_cpu_dim3 ocu_cpu_grid_dim(void) { return tl_exec->grid_dim; }
-uint32_t ocu_cpu_warp_size(void) { return cpu_get_config()->warp_size; }
+uint32_t ocu_cpu_warp_size(void)
+{
+    const block_exec *ex = tl_exec;
+    return ex != NULL ? ex->warp_size : cpu_get_config()->warp_size;
+}
 
 void ocu_cpu_barrier(void)
 {
     block_exec *ex = tl_exec;
-    ex->fibers[ex->current].state = FIBER_WAITING;
+    uint32_t me = ex->current;
+    ex->fibers[me].state = FIBER_WAITING;
+    ex->barrier_bits[me >> 6] |= 1ULL << (me & 63u);
+    ex->n_barrier++;
+    ex->st_barriers++;
     yield_to_scheduler(ex, false);
 }
 
@@ -910,94 +1461,121 @@ void *ocu_cpu_dynamic_shared(void)
 
 uint32_t ocu_cpu_lane_id(void)
 {
-    return tl_exec->current % tl_exec->warp_size;
-}
-
-static void warp_wait(block_exec *ex)
-{
-    ex->fibers[ex->current].state = FIBER_WAITING_WARP;
-    yield_to_scheduler(ex, false);
+    return tl_exec->current & (tl_exec->warp_size - 1);
 }
 
 /*
- * Every lane of a warp operation records (tag, sequence number) and waits;
- * after the release each lane checks that all live lanes of its warp are at
- * the same operation and the same occurrence of it (a lane that skipped an
- * iteration has a different sequence number). A second wait keeps the
- * records stable until every lane has checked them.
+ * Every lane of a warp operation records (tag, sequence number, mask) and
+ * its value, and waits until the lanes it names are parked; the last of
+ * them checks that they all met at the same operation (check_release),
+ * releases them and goes on without a switch.
  */
 #define OCU_SYNC_TAG 0x53594e43ULL
 
-static uint32_t warp_meet(block_exec *ex, uint64_t tag, uint32_t mask, uint64_t value,
-                          uint64_t *all)
+static const uint64_t *warp_meet(block_exec *ex, uint64_t tag, uint32_t mask,
+                                 uint64_t value, uint32_t *count_out)
 {
     uint32_t me = ex->current;
     uint32_t w = ex->warp_size;
-    uint32_t base = me - me % w;
+    uint32_t wi = me >> ex->warp_shift;
+    uint32_t base = wi * w;
+    uint32_t lane = me - base;
     uint32_t count = ex->nthreads - base < w ? ex->nthreads - base : w;
+    warp_state *ws = &ex->warps[wi];
     /* The lanes this call waits for, relative to the warp: the mask's 32
        lanes in the caller's own 32-lane group, or every lane (mask 0).
        The caller itself is always included. */
     uint64_t named;
     if (mask == 0) {
-        named = count == 64 ? ~0ULL : ((1ULL << count) - 1u);
+        named = ws->lanes;
     } else {
-        uint32_t group = (me - base) & ~31u;
-        named = (uint64_t)mask << group;
-        if (count < 64) {
-            named &= (1ULL << count) - 1u;
-        }
+        uint32_t group = lane & ~31u;
+        named = ((uint64_t)mask << group) & ws->lanes;
     }
-    named |= 1ULL << (me - base);
-    ex->warp_slots[me] = value;
-    ex->warp_tags[me] = tag;
-    ex->warp_masks[me] = named;
-    uint64_t seq = ++ex->warp_seq[me];
-    warp_wait(ex); /* every named lane has written (or returned) */
-    bool strict = cpu_get_config()->strict_barrier;
-    for (uint32_t b = 0; b < count; ++b) {
-        if (!(named >> b & 1u)) {
-            continue;
-        }
-        uint32_t i = base + b;
-        if (ex->fibers[i].state == FIBER_DONE) {
-            if (strict && mask != 0) {
-                ex->warp_mismatch = true; /* explicitly named lane has returned */
-            }
-        } else if (ex->warp_tags[i] != tag || ex->warp_seq[i] != seq ||
-                   ex->warp_masks[i] != named) {
-            ex->warp_mismatch = true;     /* a different call, occurrence or mask */
-        }
+    named |= 1ULL << lane;
+    fiber *f = &ex->fibers[me];
+    uint64_t seq = ++f->warp_seq;
+    uint64_t *vals = &ex->warp_vals[(seq & 1) * ex->nthreads];
+    vals[me] = value;
+    warp_rec *mine = &ex->warp_recs[me];
+    mine->tag = tag;
+    mine->seq = seq;
+    mine->named = named;
+    mine->masked = mask != 0;
+
+    /* Arrive; wait unless this arrival releases us. */
+    f->state = FIBER_WAITING_WARP;
+    ex->n_warp++;
+    ex->st_warp_waits++;
+    ws->parked |= 1ULL << lane;
+    ws->waiting |= 1ULL << lane;
+    if (named != ws->lanes) {
+        f->nonfull = true;
+        ws->nonfull++;
     }
+    try_release_warp(ex, wi);
+    if (f->state == FIBER_WAITING_WARP) {
+        yield_to_scheduler(ex, false);
+    }
+    *count_out = count;
+    return &vals[base]; /* stable until this lane's next warp operation */
+}
+
+static uint32_t warp_gather(uint64_t tag, uint32_t mask, uint64_t value, uint64_t *all)
+{
+    uint32_t count;
+    const uint64_t *vals = warp_meet(tl_exec, tag, mask, value, &count);
     if (all != NULL) {
-        memcpy(all, &ex->warp_slots[base], count * sizeof(*all));
+        memcpy(all, vals, count * sizeof(*all));
     }
-    warp_wait(ex); /* every lane has read: records may be reused */
     return count;
 }
 
 void ocu_cpu_warp_sync(void)
 {
-    (void)warp_meet(tl_exec, OCU_SYNC_TAG, 0, 0, NULL);
+    (void)warp_gather(OCU_SYNC_TAG, 0, 0, NULL);
 }
 
 void ocu_cpu_warp_sync_masked(uint32_t mask)
 {
-    (void)warp_meet(tl_exec, OCU_SYNC_TAG ^ mask, mask, 0, NULL);
+    (void)warp_gather(OCU_SYNC_TAG ^ mask, mask, 0, NULL);
 }
 
 uint32_t ocu_cpu_warp_gather(uint64_t value, uint64_t *all)
 {
-    return ocu_cpu_warp_gather_tagged(value, 0, all);
+    return warp_gather(0, 0, value, all);
 }
 
 uint32_t ocu_cpu_warp_gather_tagged(uint64_t value, uint64_t tag, uint64_t *all)
 {
-    return warp_meet(tl_exec, tag, 0, value, all);
+    return warp_gather(tag, 0, value, all);
 }
 
 uint32_t ocu_cpu_warp_gather_masked(uint64_t value, uint64_t tag, uint32_t mask,
                                     uint64_t *all)
 {
-    return warp_meet(tl_exec, tag, mask, value, all);
+    return warp_gather(tag, mask, value, all);
+}
+
+uint64_t ocu_cpu_warp_shuffle_masked(uint64_t value, uint64_t tag, uint32_t mask,
+                                     uint32_t src)
+{
+    block_exec *ex = tl_exec;
+    uint32_t count;
+    const uint64_t *vals = warp_meet(ex, tag, mask, value, &count);
+    if (src >= count) {
+        src = ex->current & (ex->warp_size - 1); /* our own value */
+    }
+    return vals[src];
+}
+
+uint64_t ocu_cpu_warp_vote_masked(int pred, uint64_t tag, uint32_t mask)
+{
+    uint32_t count;
+    const uint64_t *vals = warp_meet(tl_exec, tag, mask, pred != 0, &count);
+    uint64_t bits = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        bits |= (uint64_t)(vals[i] != 0) << i;
+    }
+    return bits;
 }
