@@ -46,9 +46,11 @@ if(OCU_BACKEND_CPU)
   set_tests_properties(cpu_pool_random_4workers PROPERTIES
     ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_THREADS=4")
 
-  add_executable(test_cpu_fork backend/test_cpu_fork.c)
-  target_link_libraries(test_cpu_fork PRIVATE ocu_backend_cpu)
-  add_test(NAME cpu_fork COMMAND test_cpu_fork)
+  if(NOT WIN32) # no fork() on Windows
+    add_executable(test_cpu_fork backend/test_cpu_fork.c)
+    target_link_libraries(test_cpu_fork PRIVATE ocu_backend_cpu)
+    add_test(NAME cpu_fork COMMAND test_cpu_fork)
+  endif()
 
   add_executable(test_cpu_regressions backend/test_cpu_regressions.c)
   target_link_libraries(test_cpu_regressions PRIVATE ocu_backend_cpu)
@@ -112,12 +114,18 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
     COMMAND ${Python3_EXECUTABLE} -m ocu_conf.blas_run $<TARGET_FILE:blas_driver>
             --out ${CMAKE_CURRENT_BINARY_DIR}/blas_cpu_result.json
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/conformance/harness)
-  set_tests_properties(conformance_blas_cpu PROPERTIES ENVIRONMENT "OCU_BACKEND=cpu")
+  # A cross-compiled driver runs through the emulator CMake knows (Wine).
+  set(_ocu_launch "")
+  if(CMAKE_CROSSCOMPILING_EMULATOR)
+    string(JOIN " " _ocu_emu ${CMAKE_CROSSCOMPILING_EMULATOR})
+    set(_ocu_launch ";OCU_DRIVER_LAUNCHER=${_ocu_emu}")
+  endif()
+  set_tests_properties(conformance_blas_cpu PROPERTIES ENVIRONMENT "OCU_BACKEND=cpu${_ocu_launch}")
   add_test(NAME conformance_blas_cpu_queue
     COMMAND ${Python3_EXECUTABLE} -m ocu_conf.blas_run $<TARGET_FILE:blas_driver>
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/conformance/harness)
   set_tests_properties(conformance_blas_cpu_queue PROPERTIES
-    ENVIRONMENT "OCU_BACKEND=cpu;OCU_DRIVER_QUEUE=1;OCU_CPU_ORDER=random")
+    ENVIRONMENT "OCU_BACKEND=cpu;OCU_DRIVER_QUEUE=1;OCU_CPU_ORDER=random${_ocu_launch}")
 endif()
 
 # ---- ocu_cc.py (probe driver): every target, and a CPU program end to end
@@ -173,12 +181,31 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
       -DIMG=${CMAKE_CURRENT_BINARY_DIR}/probe_kernel.metal.img
       -DRUN=$<TARGET_FILE:test_metal_cu2msl>
       -P ${CMAKE_CURRENT_SOURCE_DIR}/backend/metal_cu2msl_test.cmake)
+    # Translator features (address-space overloads, templates, module
+    # variables, struct arguments, dynamic shared memory) on the GPU.
+    add_executable(test_metal_features metal/test_metal_features.c)
+    target_link_libraries(test_metal_features PRIVATE ocu_backend_metal)
+    add_test(NAME metal_cu2msl_features COMMAND ${CMAKE_COMMAND}
+      -DPY=${Python3_EXECUTABLE} -DCLANG=${CMAKE_CXX_COMPILER}
+      -DTOOL=${PROJECT_SOURCE_DIR}/compiler/metal/cu2msl.py
+      -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/metal/cu2msl_features.cu
+      -DIMG=${CMAKE_CURRENT_BINARY_DIR}/cu2msl_features.metal.img
+      -DRUN=$<TARGET_FILE:test_metal_features>
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/backend/metal_cu2msl_test.cmake)
   endif()
 
   # Device math library, compiled for the host, against long double.
   add_executable(test_device_math runtime/test_device_math.cpp)
   target_include_directories(test_device_math PRIVATE ${PROJECT_SOURCE_DIR}/runtime/include)
   add_test(NAME device_math COMMAND test_device_math)
+  # The float functions against the host's double ones, on all cores; the
+  # one-argument ones on every 257th float (OCU_MATHF_EXHAUSTIVE=1: all).
+  find_package(Threads REQUIRED)
+  add_executable(test_device_mathf runtime/test_device_mathf.cpp)
+  target_include_directories(test_device_mathf PRIVATE ${PROJECT_SOURCE_DIR}/runtime/include)
+  target_compile_options(test_device_mathf PRIVATE -O2 -ffp-contract=off)
+  target_link_libraries(test_device_mathf PRIVATE Threads::Threads m)
+  add_test(NAME device_mathf COMMAND test_device_mathf)
 
   # The installed package works for a project outside this tree, built
   # with the same compilers and flags (sanitizers included). Not when
@@ -204,6 +231,42 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
     if(_ocu_targets MATCHES "nvptx64" AND _ocu_targets MATCHES "amdgcn")
       set(OCU_CLANG_GPU_TARGETS ON)
     endif()
+  endif()
+
+  # cu2msl.py on any host (no Metal device or compiler needed): what it
+  # refuses, the shape of what it emits, and the generated MSL compiled
+  # as C++ for OpenCL against tests/metal/msl_stub.h (address spaces are
+  # checked as MSL checks them). Needs a Clang with the CUDA and C++ for
+  # OpenCL front ends.
+  set(_ocu_msl_clang "")
+  foreach(_c ${OCU_CLANGXX} ${CMAKE_CXX_COMPILER})
+    if(NOT _ocu_msl_clang)
+      execute_process(COMMAND ${_c} -x clcpp -cl-std=clc++2021 -fsyntax-only -
+                      INPUT_FILE /dev/null RESULT_VARIABLE _ocu_rc OUTPUT_QUIET ERROR_QUIET)
+      if(_ocu_rc EQUAL 0)
+        set(_ocu_msl_clang ${_c})
+      endif()
+    endif()
+  endforeach()
+  if(_ocu_msl_clang)
+    add_test(NAME metal_cu2msl_host
+      COMMAND ${CMAKE_COMMAND} -E env OCU_CLANG=${_ocu_msl_clang}
+              ${Python3_EXECUTABLE} -m unittest test_cu2msl
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/metal)
+    set(_ocu_msl_srcs
+      ${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu
+      ${PROJECT_SOURCE_DIR}/compiler/probe/probe_warp.cu
+      ${PROJECT_SOURCE_DIR}/compiler/probe/probe_features.cu
+      ${CMAKE_CURRENT_SOURCE_DIR}/metal/cu2msl_features.cu)
+    string(REPLACE ";" "|" _ocu_msl_srcs "${_ocu_msl_srcs}")
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/msl_check)
+    add_test(NAME metal_msl_check COMMAND ${CMAKE_COMMAND}
+      -DPY=${Python3_EXECUTABLE} -DCLANG=${_ocu_msl_clang}
+      -DTOOL=${PROJECT_SOURCE_DIR}/compiler/metal/cu2msl.py
+      -DCHECK=${CMAKE_CURRENT_SOURCE_DIR}/metal/msl_check.py
+      -DSRCS=${_ocu_msl_srcs} -DEXPECT=19
+      -DWORK=${CMAKE_CURRENT_BINARY_DIR}/msl_check
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/metal/msl_check_test.cmake)
   endif()
   if(OCU_CLANG_GPU_TARGETS)
     foreach(t "nvidia;sm_80;ptx" "amd;gfx1100;co" "amd;gfx1201;co")
@@ -244,6 +307,11 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
       set_tests_properties(gpu_${t} PROPERTIES SKIP_RETURN_CODE 77
         ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
     endforeach()
+    # The float math functions on the GPU: same bits as on the host, and
+    # kernel times against the double-based versions.
+    ocu_add_nvidia_cu_executable(rt_mathf_gpu_nv runtime/rt_mathf_gpu.cu runtime/rt_mathf_ref.cpp)
+    add_test(NAME gpu_rt_mathf COMMAND run_if_nvidia $<TARGET_FILE:rt_mathf_gpu_nv>)
+    set_tests_properties(gpu_rt_mathf PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
     ocu_add_nvidia_cu_executable(ocu_cc_saxpy_nv probe/main_saxpy.cu
       ${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu)
     add_test(NAME gpu_saxpy COMMAND run_if_nvidia $<TARGET_FILE:ocu_cc_saxpy_nv>)
@@ -306,4 +374,77 @@ if(TARGET ocu_cublas_nvidia AND TARGET run_if_nvidia)
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/conformance/harness)
   set_tests_properties(gpu_conformance_cublas PROPERTIES SKIP_RETURN_CODE 77
     ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0;OCU_DRIVER_STREAM=1")
+endif()
+
+# ---- ocu-nvcc: the nvcc-compatible driver and the toolkit folder ----------
+if(OCU_BACKEND_CPU AND Python3_FOUND AND NOT WIN32 AND NOT CMAKE_CROSSCOMPILING)
+  set(OCU_NVCC ${OCU_TOOLKIT_DIR}/bin/ocu-nvcc)
+  set(_drv ${CMAKE_CURRENT_SOURCE_DIR}/driver)
+  # The command line: spellings, phases, dependencies, libraries, refusals.
+  add_test(NAME ocu_nvcc_options
+    COMMAND ${Python3_EXECUTABLE} -m unittest -v test_ocu_nvcc
+    WORKING_DIRECTORY ${_drv})
+  set_tests_properties(ocu_nvcc_options PROPERTIES ENVIRONMENT "OCU_NVCC=${OCU_NVCC};OCU_TARGET=cpu")
+
+  # The runtime test programs, compiled one file at a time and linked, as a
+  # Makefile drives nvcc.
+  set(_ocu_nvcc_programs
+    "rt_api|${CMAKE_CURRENT_SOURCE_DIR}/runtime/rt_api.cu"
+    "rt_lang|${CMAKE_CURRENT_SOURCE_DIR}/runtime/rt_lang.cu"
+    "rt_mem|${CMAKE_CURRENT_SOURCE_DIR}/runtime/rt_mem.cu"
+    "rt_misc|${CMAKE_CURRENT_SOURCE_DIR}/runtime/rt_misc.cu"
+    "rt_fp16|${CMAKE_CURRENT_SOURCE_DIR}/runtime/rt_fp16.cu"
+    "rt_launch_api|${CMAKE_CURRENT_SOURCE_DIR}/runtime/rt_launch_api.cu"
+    "rt_review|${CMAKE_CURRENT_SOURCE_DIR}/runtime/rt_review.cu"
+    "rt_review2|${CMAKE_CURRENT_SOURCE_DIR}/runtime/rt_review2.cu"
+    "saxpy|${CMAKE_CURRENT_SOURCE_DIR}/probe/main_saxpy.cu,${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu")
+  set(_ocu_nvcc_targets cpu)
+  if(OCU_CLANG_GPU_TARGETS AND OCU_BACKEND_NVIDIA)
+    list(APPEND _ocu_nvcc_targets nvidia)
+  endif()
+  foreach(target IN LISTS _ocu_nvcc_targets)
+    set(_wrap)
+    set(_env)
+    if(target STREQUAL "nvidia")
+      # Skipped (exit 77) without a usable NVIDIA device.
+      set(_wrap -DRUN_WRAPPER=$<TARGET_FILE:run_if_nvidia>)
+      set(_env "ASAN_OPTIONS=detect_leaks=0")
+    endif()
+    foreach(p IN LISTS _ocu_nvcc_programs)
+      string(REPLACE "|" ";" p "${p}")
+      list(GET p 0 name)
+      list(GET p 1 srcs)
+      add_test(NAME ocu_nvcc_${target}_${name}
+        COMMAND ${CMAKE_COMMAND} -DDRIVER=${OCU_NVCC} -DTARGET=${target}
+                -DWORK=${CMAKE_CURRENT_BINARY_DIR}/ocu_nvcc/${target}_${name}
+                "-DSOURCES=${srcs}" -DINCLUDES=${CMAKE_CURRENT_SOURCE_DIR}/runtime
+                "-DFLAGS=${CMAKE_CXX_FLAGS}" ${_wrap}
+                -P ${_drv}/run_driver.cmake)
+      set_tests_properties(ocu_nvcc_${target}_${name} PROPERTIES
+        SKIP_REGULAR_EXPRESSION "OCU_SKIP" ENVIRONMENT "${_env}")
+    endforeach()
+
+    # An ordinary CMake project with enable_language(CUDA) and
+    # find_package(CUDAToolkit), using the toolkit through OcuCUDA.cmake.
+    add_test(NAME ocu_nvcc_cmake_project_${target}
+      COMMAND ${CMAKE_COMMAND} -DSRC=${_drv}/cmake_project
+              -DWORK=${CMAKE_CURRENT_BINARY_DIR}/ocu_nvcc/cmake_${target}
+              -DTARGET=${target} -DTOOLKIT=${OCU_TOOLKIT_DIR}
+              -DCC=${CMAKE_C_COMPILER} -DCXX=${CMAKE_CXX_COMPILER}
+              "-DCFLAGS=${CMAKE_C_FLAGS}" "-DCXXFLAGS=${CMAKE_CXX_FLAGS}"
+              "-DLDFLAGS=${CMAKE_EXE_LINKER_FLAGS}" ${_wrap}
+              -P ${_drv}/cmake_project_test.cmake)
+    set_tests_properties(ocu_nvcc_cmake_project_${target} PROPERTIES
+      SKIP_REGULAR_EXPRESSION "OCU_SKIP" ENVIRONMENT "${_env}")
+  endforeach()
+
+  # The same project with the installed toolkit (<prefix>/<libdir>/ocu/toolkit).
+  add_test(NAME ocu_nvcc_cmake_project_installed
+    COMMAND ${CMAKE_COMMAND} -DSRC=${_drv}/cmake_project
+            -DWORK=${CMAKE_CURRENT_BINARY_DIR}/ocu_nvcc/cmake_installed
+            -DTARGET=cpu -DINSTALL_FROM=${PROJECT_BINARY_DIR} -DLIBDIR=${CMAKE_INSTALL_LIBDIR}
+            -DCC=${CMAKE_C_COMPILER} -DCXX=${CMAKE_CXX_COMPILER}
+            "-DCFLAGS=${CMAKE_C_FLAGS}" "-DCXXFLAGS=${CMAKE_CXX_FLAGS}"
+            "-DLDFLAGS=${CMAKE_EXE_LINKER_FLAGS}"
+            -P ${_drv}/cmake_project_test.cmake)
 endif()

@@ -20,6 +20,7 @@ import datetime
 import json
 import math
 import platform
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -133,7 +134,11 @@ def main(argv: list[str]) -> int:
     args = ap.parse_args(argv)
 
     cases = select(C.all_cases(), args.only)
-    proc = subprocess.run([args.driver], input=serialize(cases), capture_output=True,
+    # OCU_DRIVER_LAUNCHER runs the driver through another program, e.g. an
+    # emulator for a cross-compiled driver.
+    import shlex
+    launcher = shlex.split(os.environ.get("OCU_DRIVER_LAUNCHER", ""))
+    proc = subprocess.run([*launcher, args.driver], input=serialize(cases), capture_output=True,
                           text=True)
     if proc.returncode != 0:
         print(f"driver failed ({proc.returncode}): {proc.stderr.strip()[:500]}",

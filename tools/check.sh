@@ -98,6 +98,9 @@ fi
 # 4. Conformance harness unit tests.
 step harness sh -c "cd '$repo/conformance/harness' && python3 -m unittest discover -s tests"
 
+# 4b. Scoreboard generator tests.
+step scoreboard sh -c "cd '$repo' && python3 -m unittest discover -s tools/tests"
+
 # 5. Compiler probe: every target must compile (needs an LLVM clang with the
 #    NVPTX and AMDGPU back ends; skipped, and said so, when there is none).
 if command -v clang++ >/dev/null 2>&1 &&
@@ -117,7 +120,8 @@ guard() {
     found=0
     # Build trees inside the repository (they hold installed copies of our
     # own headers) are not sources: skip every folder with a CMakeCache.txt.
-    prune=""
+    # Hidden folders (local worktrees, tool state) are not sources: skip them.
+    prune=""; for d in "$repo"/.[!.]*; do [ -d "$d" ] && prune="$prune -path $d -prune -o"; done
     for c in $(find "$repo" -path "$repo/.git" -prune -o -name CMakeCache.txt -print 2>/dev/null); do
         prune="$prune -path $(dirname "$c") -prune -o"
     done

@@ -33,13 +33,13 @@ static double ulps(double got, long double want)
     return (double)(std::fabs((long double)got - want) / (long double)ulp_of(w));
 }
 
-struct stat {
+struct err_stat {
     const char *name;
     double worst = 0, at = 0;
     long n = 0;
 };
 
-static void report(stat &s, double bound)
+static void report(err_stat &s, double bound)
 {
     bool ok = s.worst <= bound;
     std::printf("%-8s max %6.3f ulp (bound %.1f) at %-24.17g over %ld points %s\n", s.name, s.worst,
@@ -51,7 +51,7 @@ template <typename F, typename G>
 static void sweep1(const char *name, F ours, G ref, double lo, double hi, bool logscale, double bound,
                    std::mt19937_64 &g, long n = 200000)
 {
-    stat s;
+    err_stat s;
     s.name = name;
     std::uniform_real_distribution<double> u(0.0, 1.0);
     for (long i = 0; i < n; ++i) {
@@ -75,6 +75,25 @@ int main()
     if (LDBL_MANT_DIG <= DBL_MANT_DIG) {
         std::printf("test_device_math: SKIP (long double is no more precise than double here)\n");
         return 0;
+    }
+#if defined(_WIN32)
+    // The MinGW long double functions use x87 instructions whose argument
+    // reduction near multiples of pi is not accurate enough to serve as the
+    // reference (sinl near pi is off by several double ulps). The library is
+    // measured on Linux and macOS hosts.
+    std::printf("test_device_math: SKIP (no accurate long double reference on this host)\n");
+    return 0;
+#endif
+    {
+        // The library needs an exact (single-rounding) fma, as device targets
+        // have. Some host C libraries emulate fma inexactly (seen with
+        // MinGW-w64 without hardware FMA): measuring the library there would
+        // measure that emulation.
+        volatile double a = 1.0 + 0x1p-30, b = 1.0 - 0x1p-30, c = -1.0;
+        if (__builtin_fma(a, b, c) != -0x1p-60) {
+            std::printf("test_device_math: SKIP (the host fma is not exact here)\n");
+            return 0;
+        }
     }
     std::mt19937_64 g(2026);
     using namespace ocu_dm;
@@ -106,7 +125,7 @@ int main()
 
     // pow over mixed ranges, including negative bases with integer exponents
     {
-        stat s;
+        err_stat s;
         s.name = "pow";
         std::uniform_real_distribution<double> u(0.0, 1.0);
         for (long i = 0; i < 300000; ++i) {
@@ -120,7 +139,7 @@ int main()
         report(s, 1.0);
     }
     {
-        stat s;
+        err_stat s;
         s.name = "atan2";
         std::uniform_real_distribution<double> u(-1.0, 1.0);
         for (long i = 0; i < 200000; ++i) {
@@ -132,7 +151,7 @@ int main()
         report(s, 2.0);
     }
     {
-        stat s;
+        err_stat s;
         s.name = "fmod";
         std::uniform_real_distribution<double> u(0.0, 1.0);
         for (long i = 0; i < 200000; ++i) {
@@ -145,7 +164,7 @@ int main()
         report(s, 0.0);
     }
     {
-        stat s;
+        err_stat s;
         s.name = "hypot";
         std::uniform_real_distribution<double> u(0.0, 1.0);
         for (long i = 0; i < 200000; ++i) {

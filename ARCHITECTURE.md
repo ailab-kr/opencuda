@@ -46,7 +46,7 @@ compiler/         runtime/         libs/
 | `runtime/include/` | 사용자 프로그램이 보는 헤더: `cuda_runtime_api.h`·`cuda_runtime.h`·`cuda.h`·`cuda_fp16.h`, 벡터 형, CPU 경로 언어 지원 `ocu_cuda_lang_cpu.h` | 함수 80여 개 |
 | `runtime/cudart/` | 실행 API 구현(`ocu_cudart`): 장치·오류·메모리·스트림·사건·실행. 백엔드 규격만 부른다 | 있음 |
 | `libs/` | 라이브러리별 호환 층 | `libs/blas`: 20개 함수(내부 이름), CPU에서 기준 사례 526건 통과 |
-| `compiler/` | 명령 호환, 빌드 도구 연동, 장치용 수학 함수 | 실험 단계 드라이버 `compiler/probe/ocu_cc.py`(CPU 경로는 실제 프로그램 빌드에 씀), CMake 함수 `ocu_add_cpu_cu_executable` |
+| `compiler/` | 명령 호환, 빌드 도구 연동, 장치용 수학 함수 | 실험 단계 드라이버 `compiler/probe/ocu_cc.py`(CPU 경로는 실제 프로그램 빌드에 씀), CMake 함수 `ocu_add_cpu_cu_executable`, nvcc 명령 호환 드라이버 `compiler/driver/ocu-nvcc`와 툴킷 폴더(CMake 도구 사슬 파일 `OcuCUDA.cmake`, `docs/compiler-driver.md`) |
 | `conformance/` | 적합성 시험, 채점기, 결과 형식 | BLAS 20개 함수의 기준 답 526건, 오차 한계, 자체 검증 |
 | `tuning/` | 속도 측정, 자동 튜닝, 칩별 설정 표 | 측정 규칙(PLAN 6.4)을 지키는 측정기 `ocu_bench`와 BLAS 측정 `bench_blas` |
 | `cards/` | 기능 카드 | 양식, 부품 카드 2장, BLAS 카드 20장 |

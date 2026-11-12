@@ -5,8 +5,22 @@
 #define _GNU_SOURCE
 #include "nv_driver.h"
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#define NV_LIB_DEFAULT "nvcuda.dll"
+static void *lib_open(const char *p) { return (void *)LoadLibraryA(p); }
+static void *lib_sym(void *lib, const char *n) { return (void *)(uintptr_t)GetProcAddress((HMODULE)lib, n); }
+static void lib_close(void *lib) { FreeLibrary((HMODULE)lib); }
+#else
 #include <dlfcn.h>
+#define NV_LIB_DEFAULT "libcuda.so.1"
+static void *lib_open(const char *p) { return dlopen(p, RTLD_NOW | RTLD_LOCAL); }
+static void *lib_sym(void *lib, const char *n) { return dlsym(lib, n); }
+static void lib_close(void *lib) { dlclose(lib); }
+#endif
 #include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -16,7 +30,7 @@ static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 
 static int resolve(void *lib, void **slot, const char *name)
 {
-    *slot = dlsym(lib, name);
+    *slot = lib_sym(lib, name);
     return *slot != NULL;
 }
 
@@ -24,8 +38,7 @@ static void load_once(void)
 {
     /* OCU_NV_DRIVER names another library file (tests, unusual installs). */
     const char *path = getenv("OCU_NV_DRIVER");
-    void *lib = dlopen(path != NULL && path[0] != '\0' ? path : "libcuda.so.1",
-                       RTLD_NOW | RTLD_LOCAL);
+    void *lib = lib_open(path != NULL && path[0] != '\0' ? path : NV_LIB_DEFAULT);
     if (lib == NULL) {
         return;
     }
@@ -75,7 +88,7 @@ static void load_once(void)
     NV_SYM(MemHostGetDevicePointer, "cuMemHostGetDevicePointer_v2");
 #undef NV_SYM
     if (!ok || a.Init(0) != NV_SUCCESS) {
-        dlclose(lib);
+        lib_close(lib);
         return;
     }
     g_api = a;

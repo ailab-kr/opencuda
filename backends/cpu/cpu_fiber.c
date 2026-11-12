@@ -1,7 +1,7 @@
 /*
  * Fiber contexts for the CPU backend. See cpu_fiber.h.
  */
-#if !defined(OCU_CPU_FAST_SWITCH)
+#if !defined(OCU_CPU_FAST_SWITCH) && !defined(_WIN32)
 #define _XOPEN_SOURCE 700
 #define _DEFAULT_SOURCE
 #if defined(__APPLE__)
@@ -15,7 +15,73 @@
 #include <stdint.h>
 #include <string.h>
 
-#if defined(OCU_CPU_FAST_SWITCH)
+#if defined(_WIN32)
+
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+const char *cpu_ctx_kind(void) { return "windows-fiber"; }
+
+/* Runs the entry each time the fiber is (re)started; a finished entry
+   parks in cpu_ctx_finish and comes back here for the next run. */
+static VOID CALLBACK fiber_main(LPVOID param)
+{
+    cpu_ctx *ctx = (cpu_ctx *)param;
+    for (;;) {
+        ctx->entry();
+    }
+}
+
+int cpu_ctx_make(cpu_ctx *ctx, void *stack, size_t bytes, void (*entry)(void))
+{
+    (void)stack; /* the system allocates fiber stacks */
+    if (ctx->fiber != NULL && ctx->reusable && ctx->entry == entry) {
+        ctx->reusable = 0;
+        return 0;
+    }
+    if (ctx->fiber != NULL) { /* abandoned mid-run (a failed block): start over */
+        DeleteFiber(ctx->fiber);
+        ctx->fiber = NULL;
+    }
+    ctx->entry = entry;
+    ctx->reusable = 0;
+    SIZE_T reserve = bytes < 65536 ? 65536 : bytes;
+    ctx->fiber = CreateFiberEx(0, reserve, 0, fiber_main, ctx);
+    return ctx->fiber != NULL ? 0 : -1;
+}
+
+static void make_current(cpu_ctx *from)
+{
+    if (from->fiber == NULL) { /* the scheduler: the thread itself */
+        from->fiber = IsThreadAFiber() ? GetCurrentFiber() : ConvertThreadToFiber(NULL);
+    }
+}
+
+void cpu_ctx_switch(cpu_ctx *from, cpu_ctx *to)
+{
+    make_current(from);
+    SwitchToFiber(to->fiber);
+}
+
+void cpu_ctx_finish(cpu_ctx *from, cpu_ctx *to)
+{
+    from->reusable = 1;
+    SwitchToFiber(to->fiber);
+    /* Restarted by cpu_ctx_make: return so fiber_main runs the entry again. */
+}
+
+void cpu_ctx_destroy(cpu_ctx *ctx)
+{
+    /* Only contexts made by cpu_ctx_make own their fiber; a converted thread
+       (the scheduler) is left alone. */
+    if (ctx->fiber != NULL && ctx->entry != NULL) DeleteFiber(ctx->fiber);
+    ctx->fiber = NULL;
+}
+
+#elif defined(OCU_CPU_FAST_SWITCH)
 
 void ocu_cpu_ctx_switch(void **save_sp, void *load_sp);
 
@@ -25,6 +91,13 @@ void cpu_ctx_switch(cpu_ctx *from, cpu_ctx *to)
 {
     ocu_cpu_ctx_switch(&from->sp, to->sp);
 }
+
+/* The same switch, not a call to cpu_ctx_switch: see cpu_fiber.h. */
+void cpu_ctx_finish(cpu_ctx *from, cpu_ctx *to)
+{
+    ocu_cpu_ctx_switch(&from->sp, to->sp);
+}
+void cpu_ctx_destroy(cpu_ctx *ctx) { (void)ctx; }
 
 #if defined(__x86_64__)
 
@@ -105,5 +178,12 @@ void cpu_ctx_switch(cpu_ctx *from, cpu_ctx *to)
 {
     swapcontext(&from->uc, &to->uc);
 }
+
+/* The same switch, not a call to cpu_ctx_switch: see cpu_fiber.h. */
+void cpu_ctx_finish(cpu_ctx *from, cpu_ctx *to)
+{
+    swapcontext(&from->uc, &to->uc);
+}
+void cpu_ctx_destroy(cpu_ctx *ctx) { (void)ctx; }
 
 #endif

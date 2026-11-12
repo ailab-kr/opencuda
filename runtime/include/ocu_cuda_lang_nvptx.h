@@ -19,9 +19,13 @@
  * functions (libstdc++'s float overloads and integer templates call the
  * compiler's __builtin_<name>) are pointed at it, so std::exp(1.0f) or
  * pow(x, 2) in device code use this library instead of a missing vendor
- * function.
+ * function. Float functions are computed in float (no double operations);
+ * their log table lives in global memory (a const or constexpr table goes
+ * to constant memory, which serialises different per-thread indices: powf
+ * ran at less than half the speed).
  */
 #define OCU_DM_FN static inline __attribute__((device))
+#define OCU_DMF_TABLE static __attribute__((device))
 #include "ocu_device_math.h"
 #if defined(__CUDA_ARCH__)
 #define __builtin_acos(x) ::ocu_dm::acos(x)
@@ -50,6 +54,8 @@
 #define __builtin_tanhf(x) ::ocu_dm::tanhf(x)
 #define __builtin_cbrt(x) ::ocu_dm::cbrt(x)
 #define __builtin_cbrtf(x) ::ocu_dm::cbrtf(x)
+#define __builtin_erff(x) ::ocu_dm::erff(x)
+#define __builtin_erfcf(x) ::ocu_dm::erfcf(x)
 #define __builtin_exp2(x) ::ocu_dm::exp2(x)
 #define __builtin_exp2f(x) ::ocu_dm::exp2f(x)
 #define __builtin_expm1(x) ::ocu_dm::expm1(x)
@@ -104,6 +110,9 @@
 #define OCU_D  static __device__ inline __attribute__((always_inline))
 #define OCU_HD static __host__ __device__ inline
 
+#define OCU_LANG_FN static __device__ inline __attribute__((always_inline))
+#include "ocu_cuda_lang_common.h"
+
 /* ---- launch ABI the compiler calls (see runtime/cudart/fatbin.c) ---------- */
 
 extern "C" unsigned __cudaPushCallConfiguration(dim3 grid, dim3 block, size_t shared = 0,
@@ -147,7 +156,7 @@ OCU_D int __syncthreads_count(int p) { return __nvvm_bar0_popc(p); }
 OCU_D int __syncthreads_and(int p) { return __nvvm_bar0_and(p); }
 OCU_D int __syncthreads_or(int p) { return __nvvm_bar0_or(p); }
 OCU_D void __threadfence() { __nvvm_membar_gl(); }
-OCU_D void __trap() { __builtin_trap(); }
+[[noreturn]] OCU_D void __trap() { __builtin_trap(); }
 OCU_D void __threadfence_block() { __nvvm_membar_cta(); }
 OCU_D void __threadfence_system() { __nvvm_membar_sys(); }
 
@@ -380,7 +389,10 @@ OCU_D float hypotf(float x, float y) { return ocu_dm::hypotf(x, y); }
 OCU_D double fmod(double x, double y) { return ocu_dm::fmod(x, y); }
 OCU_D float fmodf(float x, float y) { return ocu_dm::fmodf(x, y); }
 OCU_D void sincos(double x, double *s, double *c) { *s = ocu_dm::sin(x); *c = ocu_dm::cos(x); }
-OCU_D void sincosf(float x, float *s, float *c) { *s = ocu_dm::sinf(x); *c = ocu_dm::cosf(x); }
+OCU_D void sincosf(float x, float *s, float *c) { ocu_dm::sincosf(x, s, c); }
+/* Float only (no double counterpart yet). */
+OCU_D float erff(float x) { return ocu_dm::erff(x); }
+OCU_D float erfcf(float x) { return ocu_dm::erfcf(x); }
 
 /* Fast approximate intrinsics (documented as approximate). */
 OCU_D float __expf(float x) { return __nvvm_ex2_approx_f(x * 1.44269504088896341f); }

@@ -16,6 +16,7 @@
 #include <stddef.h>
 
 #include "ocu_vector_types.h"
+#include "library_types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -200,7 +201,13 @@ enum cudaDeviceAttr {
     cudaDevAttrMaxSharedMemoryPerMultiprocessor = 81,
     cudaDevAttrManagedMemory = 83,
     cudaDevAttrConcurrentManagedAccess = 89,
-    cudaDevAttrMaxSharedMemoryPerBlockOptin = 97
+    cudaDevAttrMaxSharedMemoryPerBlockOptin = 97,
+    /* Values as documented; the pci ones are synthetic (see cudart.c). */
+    cudaDevAttrPciBusId = 33,
+    cudaDevAttrPciDeviceId = 34,
+    cudaDevAttrPciDomainId = 50,
+    cudaDevAttrCooperativeLaunch = 95,            /* always 0: no co-residency guarantee */
+    cudaDevAttrCooperativeMultiDeviceLaunch = 96  /* always 0 */
 };
 
 /* cudaHostRegister flags. */
@@ -317,6 +324,13 @@ cudaError_t cudaGetDeviceProperties(struct cudaDeviceProp *prop, int device);
 cudaError_t cudaDeviceGetAttribute(int *value, enum cudaDeviceAttr attr, int device);
 cudaError_t cudaSetDeviceFlags(unsigned int flags);
 cudaError_t cudaDeviceCanAccessPeer(int *can_access, int device, int peer_device);
+cudaError_t cudaDeviceEnablePeerAccess(int peer_device, unsigned int flags);
+cudaError_t cudaDeviceDisablePeerAccess(int peer_device);
+/* Synthetic, stable "dddd:bb:dd.f" identifier; see cudart.c. Needs len >= 13. */
+cudaError_t cudaDeviceGetPCIBusId(char *pci_bus_id, int len, int device);
+/* Always cudaErrorNotSupported: no backend guarantees that all blocks are resident. */
+cudaError_t cudaLaunchCooperativeKernel(const void *func, dim3 grid, dim3 block, void **args,
+                                        size_t shared_mem, cudaStream_t stream);
 cudaError_t cudaDeviceGetStreamPriorityRange(int *least, int *greatest);
 cudaError_t cudaFuncSetAttribute(const void *func, enum cudaFuncAttribute attr, int value);
 cudaError_t cudaFuncGetAttributes(struct cudaFuncAttributes *attr, const void *func);
@@ -521,6 +535,16 @@ static inline cudaError_t cudaEventRecord(cudaEvent_t event)
 static inline cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t event)
 {
     return cudaStreamWaitEvent(stream, event, 0);
+}
+
+/* Kernel function pointers, as in the C++ overloads of the documented API. */
+template <typename T>
+static inline cudaError_t cudaLaunchCooperativeKernel(const T *func, dim3 grid, dim3 block,
+                                                      void **args, size_t shared_mem = 0,
+                                                      cudaStream_t stream = nullptr)
+{
+    return cudaLaunchCooperativeKernel(reinterpret_cast<const void *>(func), grid, block, args,
+                                       shared_mem, stream);
 }
 #endif /* __cplusplus */
 

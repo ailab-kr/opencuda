@@ -304,6 +304,19 @@ inline T atomic_update_fp(T *addr, Op op)
 #endif
 static_assert(sizeof(dim3) == sizeof(ocu_cpu_dim3) && sizeof(uint3) == sizeof(ocu_cpu_dim3),
               "built-in variable layout");
+#if defined(_WIN32)
+/* Windows (MinGW): thread-local storage is emulated, and assembler names
+   cannot be given to emulated variables. Per-thread references to the
+   backend's variables keep the CUDA names as real names. */
+#define OCU_CPU_BUILTIN_REF(T, name, var)                                              \
+    static thread_local const T &name = *reinterpret_cast<const T *>(&var);
+OCU_CPU_BUILTIN_REF(uint3, threadIdx, ocu_cpu_tls_thread_idx)
+OCU_CPU_BUILTIN_REF(uint3, blockIdx, ocu_cpu_tls_block_idx)
+OCU_CPU_BUILTIN_REF(dim3, blockDim, ocu_cpu_tls_block_dim)
+OCU_CPU_BUILTIN_REF(dim3, gridDim, ocu_cpu_tls_grid_dim)
+OCU_CPU_BUILTIN_REF(int, warpSize, ocu_cpu_tls_warp_size)
+#undef OCU_CPU_BUILTIN_REF
+#else
 extern "C" {
 OCU_CPU_CONSTINIT extern thread_local const uint3 threadIdx OCU_CPU_TLS_(ocu_cpu_tls_thread_idx);
 OCU_CPU_CONSTINIT extern thread_local const uint3 blockIdx OCU_CPU_TLS_(ocu_cpu_tls_block_idx);
@@ -311,6 +324,7 @@ OCU_CPU_CONSTINIT extern thread_local const dim3 blockDim OCU_CPU_TLS_(ocu_cpu_t
 OCU_CPU_CONSTINIT extern thread_local const dim3 gridDim OCU_CPU_TLS_(ocu_cpu_tls_grid_dim);
 OCU_CPU_CONSTINIT extern thread_local const int warpSize OCU_CPU_TLS_(ocu_cpu_tls_warp_size);
 }
+#endif
 #undef OCU_CPU_TLS_
 
 /* ---- synchronisation and fences ------------------------------------------- */
@@ -455,6 +469,104 @@ inline unsigned __brev(unsigned v)
 }
 inline int __mul24(int a, int b) { return a * b; }
 inline unsigned __umul24(unsigned a, unsigned b) { return a * b; }
+
+/* ---- device intrinsics shared with the NVPTX path ---------------------------- */
+
+#define OCU_LANG_FN inline
+#include "ocu_cuda_lang_common.h"
+#undef OCU_LANG_FN
+
+/*
+ * __trap: the kernel hit something it must never do (for example a
+ * NO_DEVICE_CODE body for an architecture that was not compiled). On a GPU
+ * it aborts the kernel and every later call fails; here it stops the process
+ * with a message naming the thread, so a wrongly selected kernel is never
+ * silent. (A program that gets __CUDA_ARCH__ defined for the CPU path, for
+ * example with -D__CUDA_ARCH__=500, reaches its own NO_DEVICE_CODE handler.)
+ */
+[[noreturn]] inline void __trap()
+{
+    std::fprintf(stderr,
+                 "ocu: __trap() in kernel, block (%u,%u,%u) thread (%u,%u,%u): "
+                 "aborting (a kernel with no device code for this device was probably launched)\n",
+                 blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y, threadIdx.z);
+    std::fflush(stdout); /* the kernel's own printf output comes first */
+    std::fflush(stderr);
+    std::abort();
+}
+
+/* ---- block-wide votes ---------------------------------------------------------
+ * Every thread of the block that has not returned calls it; each gets the
+ * same answer. Threads of a block run as fibers of one OS thread, so a
+ * thread-local counter is the block's counter; three barriers keep the
+ * reset, the additions and the reads apart.
+ */
+inline int __syncthreads_count(int pred)
+{
+    static thread_local int acc;
+    ocu_cpu_barrier();
+    if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) acc = 0;
+    ocu_cpu_barrier();
+    if (pred != 0) ++acc;
+    ocu_cpu_barrier();
+    return acc;
+}
+inline int __syncthreads_or(int pred) { return __syncthreads_count(pred) != 0; }
+inline int __syncthreads_and(int pred)
+{
+    int n = static_cast<int>(blockDim.x * blockDim.y * blockDim.z);
+    return __syncthreads_count(pred) == n;
+}
+
+/* ---- integer and conversion intrinsics ---------------------------------------- */
+
+inline unsigned __umulhi(unsigned a, unsigned b)
+{
+    return static_cast<unsigned>((static_cast<unsigned long long>(a) * b) >> 32);
+}
+inline int __mulhi(int a, int b)
+{
+    return static_cast<int>((static_cast<long long>(a) * b) >> 32);
+}
+
+/*
+ * __byte_perm(x, y, s): the eight bytes {y,x} (x = bytes 0..3, y = 4..7);
+ * result byte i is the byte named by the low 3 bits of selector nibble i.
+ * When nibble i's top bit is set, that byte's sign bit is replicated instead.
+ */
+inline unsigned __byte_perm(unsigned x, unsigned y, unsigned s)
+{
+    unsigned long long v = (static_cast<unsigned long long>(y) << 32) | x;
+    unsigned r = 0;
+    for (int i = 0; i < 4; ++i) {
+        unsigned sel = (s >> (4 * i)) & 0xfu;
+        unsigned b = static_cast<unsigned>((v >> (8 * (sel & 7u))) & 0xffu);
+        if (sel & 8u) b = (b & 0x80u) ? 0xffu : 0u;
+        r |= b << (8 * i);
+    }
+    return r;
+}
+
+namespace ocu_cpu {
+/* float or double to int: NaN gives 0, out-of-range values saturate. */
+template <typename F>
+inline int to_int_sat(F r)
+{
+    if (r != r) return 0;
+    if (r >= static_cast<F>(2147483648.0)) return 2147483647;
+    if (r <= static_cast<F>(-2147483648.0)) return -2147483647 - 1;
+    return static_cast<int>(r);
+}
+} // namespace ocu_cpu
+/* Rounding: _rn nearest even, _rz toward zero, _rd down, _ru up. */
+inline int __float2int_rn(float x) { return ::ocu_cpu::to_int_sat(__builtin_rintf(x)); }
+inline int __float2int_rz(float x) { return ::ocu_cpu::to_int_sat(__builtin_truncf(x)); }
+inline int __float2int_rd(float x) { return ::ocu_cpu::to_int_sat(__builtin_floorf(x)); }
+inline int __float2int_ru(float x) { return ::ocu_cpu::to_int_sat(__builtin_ceilf(x)); }
+inline int __double2int_rn(double x) { return ::ocu_cpu::to_int_sat(__builtin_rint(x)); }
+inline int __double2int_rz(double x) { return ::ocu_cpu::to_int_sat(__builtin_trunc(x)); }
+inline int __double2int_rd(double x) { return ::ocu_cpu::to_int_sat(__builtin_floor(x)); }
+inline int __double2int_ru(double x) { return ::ocu_cpu::to_int_sat(__builtin_ceil(x)); }
 
 /* ---- warp-level functions ---------------------------------------------------
  * Built on the backend's masked warp gather: a lane waits only for the
