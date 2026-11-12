@@ -274,6 +274,8 @@ def parse(argv: list[str]) -> SimpleNamespace:
                 o.host += [a, take(a)]
             elif a.startswith("-Wl,"):
                 o.linker.append(a)
+            elif a == "-framework":   # macOS: "-framework Metal" is one link item
+                o.linker += [a, take(a)]
             elif a.startswith(("-f", "-W", "-m", "--target=", "--sysroot=", "-pthread",
                                "-march", "-mtune", "-pipe", "-nostdinc", "-stdlib=",
                                "-rtlib=", "-fuse-ld=", "-static", "-rdynamic", "-pie",
@@ -369,7 +371,11 @@ def parse(argv: list[str]) -> SimpleNamespace:
             o.host += split_list(value)
         elif key == "Xlinker":
             for v in value.split(","):
-                o.linker += ["-Xlinker", v]
+                if sys.platform == "darwin" and v.startswith("-rpath="):
+                    # Apple's linker takes "-rpath DIR", not "-rpath=DIR".
+                    o.linker += ["-Xlinker", "-rpath", "-Xlinker", v[len("-rpath="):]]
+                else:
+                    o.linker += ["-Xlinker", v]
         elif key == "Xignored":
             o.ignored.append(f"{a} {value}")
         elif key == "fast_math":
