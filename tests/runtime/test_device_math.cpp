@@ -33,13 +33,13 @@ static double ulps(double got, long double want)
     return (double)(std::fabs((long double)got - want) / (long double)ulp_of(w));
 }
 
-struct stat {
+struct err_stat {
     const char *name;
     double worst = 0, at = 0;
     long n = 0;
 };
 
-static void report(stat &s, double bound)
+static void report(err_stat &s, double bound)
 {
     bool ok = s.worst <= bound;
     std::printf("%-8s max %6.3f ulp (bound %.1f) at %-24.17g over %ld points %s\n", s.name, s.worst,
@@ -51,7 +51,7 @@ template <typename F, typename G>
 static void sweep1(const char *name, F ours, G ref, double lo, double hi, bool logscale, double bound,
                    std::mt19937_64 &g, long n = 200000)
 {
-    stat s;
+    err_stat s;
     s.name = name;
     std::uniform_real_distribution<double> u(0.0, 1.0);
     for (long i = 0; i < n; ++i) {
@@ -106,7 +106,7 @@ int main()
 
     // pow over mixed ranges, including negative bases with integer exponents
     {
-        stat s;
+        err_stat s;
         s.name = "pow";
         std::uniform_real_distribution<double> u(0.0, 1.0);
         for (long i = 0; i < 300000; ++i) {
@@ -120,7 +120,7 @@ int main()
         report(s, 1.0);
     }
     {
-        stat s;
+        err_stat s;
         s.name = "atan2";
         std::uniform_real_distribution<double> u(-1.0, 1.0);
         for (long i = 0; i < 200000; ++i) {
@@ -132,7 +132,7 @@ int main()
         report(s, 2.0);
     }
     {
-        stat s;
+        err_stat s;
         s.name = "fmod";
         std::uniform_real_distribution<double> u(0.0, 1.0);
         for (long i = 0; i < 200000; ++i) {
@@ -145,7 +145,7 @@ int main()
         report(s, 0.0);
     }
     {
-        stat s;
+        err_stat s;
         s.name = "hypot";
         std::uniform_real_distribution<double> u(0.0, 1.0);
         for (long i = 0; i < 200000; ++i) {

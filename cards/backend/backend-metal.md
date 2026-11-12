@@ -8,7 +8,7 @@ spec_sources:
   - backends/metal/README.md (design)
 backend_map:
   metal: backends/metal/, compiler/metal/
-state: backend gpu-pass on Apple M3 (macOS 15.5); translation first cut
+state: gpu-pass on Apple M3 (macOS 15.5) and M1 Pro (macOS 15.0.1); translation first cut
 owner_spec: AI Lab 2026-11-13
 owner_tests: AI Lab 2026-11-13 (same author as impl: see note)
 owner_impl: AI Lab 2026-11-13
@@ -29,8 +29,9 @@ cost: { hours: 1.5, ai_usage: 0 }
 ## 시험 목록
 
 - [x] `tests/backend/test_metal_backend.c`(손으로 쓴 MSL): Apple M3에서 53/53. 장치 Apple M3, 작업 집합 10.7GiB, 공유 메모리 32768바이트, 100만 값 saxpy 정답(2.3ms), 공유 메모리 블록 합 정답
-- [ ] `tests/backend/test_metal_cu2msl.c`: `probe_kernel.cu`를 cu2msl로 바꿔 실행, 호스트 계산과 대조(Mac 재시험 대기)
-- [ ] M1 Pro
+- [x] `tests/backend/test_metal_cu2msl.c`: `probe_kernel.cu`를 cu2msl로 바꿔 실행, 호스트 계산과 대조: M3·M1 Pro 모두 23/23
+- [x] M1 Pro: 백엔드 53/53(saxpy 100만 값 1.4ms), 변환 23/23
+- [x] 두 Mac 모두 전체 시험 42/42, check.sh ALL PASS(빌드 경고 0, Release)
 
 ## 메모
 
