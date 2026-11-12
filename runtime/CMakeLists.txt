@@ -18,6 +18,10 @@ if(OCU_BACKEND_NVIDIA)
   target_compile_definitions(ocu_core PRIVATE OCU_HAVE_BACKEND_NVIDIA)
   target_link_libraries(ocu_core PRIVATE ocu_backend_nvidia)
 endif()
+if(OCU_BACKEND_OPENCL)
+  target_compile_definitions(ocu_core PRIVATE OCU_HAVE_BACKEND_OPENCL)
+  target_link_libraries(ocu_core PRIVATE ocu_backend_opencl)
+endif()
 
 # ocu_cudart: the runtime API (cuda_runtime_api.h) on the backend interface.
 add_library(ocu_cudart STATIC cudart/cudart.c cudart/fatbin.c)
@@ -32,6 +36,9 @@ if(OCU_BACKEND_CPU)
 endif()
 if(OCU_BACKEND_NVIDIA)
   target_link_libraries(ocu_cudart PUBLIC ocu_backend_nvidia)
+endif()
+if(OCU_BACKEND_OPENCL)
+  target_link_libraries(ocu_cudart PUBLIC ocu_backend_opencl)
 endif()
 
 # CUDA's fma/fmaf round once (IEEE 754 fusedMultiplyAdd). Some C libraries'

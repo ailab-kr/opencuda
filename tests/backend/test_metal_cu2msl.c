@@ -6,7 +6,15 @@
  * Prints SKIP and exits 0 when no Metal device is usable.
  */
 #include "ocu_backend.h"
+#ifndef TEST_BACKEND
+/* tests/opencl/test_opencl_cu2ocl.c runs these checks on another backend */
 #include "ocu_backend_metal.h"
+#define TEST_BACKEND ocu_backend_metal
+#define TEST_NAME "test_metal_cu2msl"
+#define TEST_SKIP_CODE 0
+#define TEST_SKIP_WHY "no Metal 3 device"
+#define TEST_BUILD_HINT "the translated MSL did not compile; rerun with OCU_METAL_VERBOSE=1"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,12 +26,12 @@ static int g_fail, g_checks;
 int main(int argc, char **argv)
 {
     if (argc != 2) return 2;
-    const ocu_backend *b = ocu_backend_metal();
+    const ocu_backend *b = TEST_BACKEND();
     uint32_t n = 0;
     OK(b->dev_count(&n));
     if (n == 0) {
-        printf("test_metal_cu2msl: SKIP (no Metal 3 device)\n");
-        return 0;
+        printf(TEST_NAME ": SKIP (" TEST_SKIP_WHY ")\n");
+        return TEST_SKIP_CODE;
     }
     FILE *f = fopen(argv[1], "rb");
     if (f == NULL) return 1;
@@ -37,9 +45,14 @@ int main(int argc, char **argv)
     ocu_device *d = NULL;
     OK(b->dev_open(0, &d));
     ocu_module *m = NULL;
-    OK(b->module_load(d, img, (size_t)len, &m));
+    ocu_status lst = b->module_load(d, img, (size_t)len, &m);
+    if (lst == OCU_ERR_NOT_SUPPORTED && TEST_SKIP_CODE != 0) {
+        printf(TEST_NAME ": SKIP (the device takes no form of code this image has)\n");
+        return TEST_SKIP_CODE;
+    }
+    CHECK(lst == OCU_OK);
     if (m == NULL) {
-        printf("test_metal_cu2msl: FAIL (the translated MSL did not compile; rerun with OCU_METAL_VERBOSE=1)\n");
+        printf(TEST_NAME ": FAIL (" TEST_BUILD_HINT ")\n");
         return 1;
     }
     ocu_kernel *saxpy = NULL, *bsum = NULL;
@@ -95,6 +108,6 @@ int main(int argc, char **argv)
     OK(b->mem_free(d, dout));
     OK(b->module_unload(m));
     OK(b->dev_close(d));
-    printf("test_metal_cu2msl: %s (%d checks, %d failed)\n", g_fail ? "FAIL" : "ok", g_checks, g_fail);
+    printf(TEST_NAME ": %s (%d checks, %d failed)\n", g_fail ? "FAIL" : "ok", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

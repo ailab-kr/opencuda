@@ -37,6 +37,7 @@ file(GLOB _ocu_tk_headers
   ${PROJECT_SOURCE_DIR}/backends/cpu/ocu_backend_cpu.h
   ${PROJECT_SOURCE_DIR}/backends/cpu/ocu_cpu_kernel.h
   ${PROJECT_SOURCE_DIR}/backends/nvidia/ocu_backend_nvidia.h
+  ${PROJECT_SOURCE_DIR}/backends/opencl/ocu_backend_opencl.h
   ${PROJECT_SOURCE_DIR}/libs/blas/ocu_blas.h
   ${PROJECT_SOURCE_DIR}/libs/cublas/include/*.h)
 foreach(h IN LISTS _ocu_tk_headers)
@@ -51,7 +52,7 @@ configure_file(${PROJECT_SOURCE_DIR}/cmake/cuda-modules/FindCUDAToolkit.cmake
 
 # Libraries: links to the built archives, refreshed after every build.
 set(_ocu_tk_libs ocu_cudart ocu_core ocu_blas)
-foreach(t ocu_backend_cpu ocu_backend_nvidia ocu_backend_metal ocu_cublas_cpu ocu_cublas_nvidia)
+foreach(t ocu_backend_cpu ocu_backend_nvidia ocu_backend_opencl ocu_backend_metal ocu_cublas_cpu ocu_cublas_nvidia)
   if(TARGET ${t})
     list(APPEND _ocu_tk_libs ${t})
   endif()
