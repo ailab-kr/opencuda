@@ -52,7 +52,8 @@ family). No version 1 operator accepts a block-quantised tensor; the values
 are reserved so that descriptors and support tables can name them. For a
 block type, `shape` still counts values, the innermost dimension must be a
 multiple of the block length, and strides of the outer dimensions count
-values (multiples of the block length). The layout of the bytes inside a
+values (multiples of the block length); a block tensor breaking either rule
+is malformed (`OCU_ERR_INVALID_VALUE`). The layout of the bytes inside a
 block is fixed in the version that first gives an operator using it.
 
 Conversions to binary16 and bfloat16 round to nearest, ties to even.
@@ -135,7 +136,7 @@ Parameters `p.gemm`: `uint32_t trans_a, trans_b` (0 or 1), `float alpha, beta`.
   (or `[N,K]` when `trans_b`), C `[M,N]`. `op(X)` is X or its transpose.
 - Rank 3: a leading batch dimension. C is `[Bt,M,N]`; A and B have batch
   `Bt` or 1 (1 means the same matrix for every batch entry). All three
-  tensors have the same rank.
+  tensors have the same rank. Other ranks: `OCU_ERR_INVALID_VALUE`.
 - Types: A and B have the same dtype, one of f32, f16, bf16. C is f32, or
   the same dtype as A and B. (f16 or bf16 inputs with an f32 C is "mixed".)
   int8 inputs are reserved for a later version (`NOT_SUPPORTED`).
@@ -183,7 +184,11 @@ rows are unaffected.
 - Slots whose dtypes break the operator's matching rule (for example A f32
   and B f16): `OCU_ERR_INVALID_VALUE`.
 - A dtype the operator is not defined for in this version (int8 GEMM, ADD
-  on i32, any block-quantised tensor): `OCU_ERR_NOT_SUPPORTED`. The reserved
+  on i32, any block-quantised tensor): `OCU_ERR_NOT_SUPPORTED`. When any
+  slot has such a dtype, the dtype matching rules are not applied (GEMM
+  with f32 A and B and an i32 C is `NOT_SUPPORTED`). This also holds for
+  ROPE: a block-quantised tensor there is `NOT_SUPPORTED` even on a
+  backend that does not implement ROPE. The reserved
   operator `OCU_OP_QMATMUL`: `OCU_ERR_NOT_SUPPORTED`.
 - Order of checks: a malformed tensor or descriptor (`INVALID_VALUE`) is
   reported before `NOT_SUPPORTED` / `NOT_IMPLEMENTED`.
@@ -318,7 +323,10 @@ with `OCU_OP_FLAG_VAR_ROWS` the row count may be smaller, 4.7) and
 `num_tensors` must match, else `OCU_ERR_INVALID_VALUE`: **shapes are fixed
 at plan time**. The overlap rules apply to the tensors as passed. A data pointer that is not device memory of this backend,
 whose tensor span leaves its allocation, or that breaks `align_bytes`,
-gives `OCU_ERR_INVALID_VALUE`. A `NULL` or destroyed plan gives
+gives `OCU_ERR_INVALID_VALUE`. (A pointer one past the end of an
+allocation can be the first byte of another allocation; a backend can only
+reject it when its allocations are not adjacent. npusim keeps gaps, 7.)
+A `NULL` or destroyed plan gives
 `OCU_ERR_INVALID_HANDLE`. These checks happen before `execute` returns;
 nothing is queued when they fail.
 
@@ -357,7 +365,9 @@ binary64 from the same (already rounded) input values. Notation:
 `2^-126` (f32, bf16), `2^-14` (f16).
 
 If `r` is NaN, `y` must be NaN. If `r` is ±Inf, `y` must be the same
-infinity. Otherwise `y` must be finite and satisfy the class bound.
+infinity. For `OCU_TOL_EXACT`, "rounded to the output dtype" includes
+overflow: a finite exact result beyond the dtype's range is the infinity
+of its sign, and `y` must be that infinity. Otherwise `y` must be finite and satisfy the class bound.
 
 ### 6.1 Classes
 
@@ -373,7 +383,9 @@ Row operators (`N` = row length):
 - RMS_NORM: `rtol = (N + 8) · u_acc + 2 · u_out`.
 - SOFTMAX: `rtol = (2N + 2·T_i + 16) · u_acc + 2 · u_out`, where
   `T_i = |scale · x_i| + max_j |scale · x_j|` (the error of the exponent
-  argument grows with its size).
+  argument grows with its size); the maximum is over finite `x_j`, and
+  an element with `scale · x_i = -Inf` has `r = 0` and must give
+  `|y| <= tiny_out`.
 
 For row operators `accum_dtype` is the dtype the row sum is kept in.
 
@@ -431,12 +443,15 @@ limits without the hardware. The rules it enforces:
    default all three) limits the input dtypes; others are `NOT_SUPPORTED`
    in `support`, `query` and `plan`.
 8. **Plan latency.** `OCU_NPUSIM_PLAN_MS` (default 0) sleeps in every
-   successful `plan`, standing in for compilation.
+   successful `plan`, standing in for compilation; `support` reports the
+   same value in `needs_plan_ms`.
 9. **Counters.** `stats` counts op calls, plans, refused kernel launches
    and DMA bytes by direction. `OCU_NPUSIM_REPORT=1` prints them to
    standard error when the device is closed.
 10. **Memory size.** `OCU_NPUSIM_MEM_MB` (default 256) is the size of the
-    device memory space.
+    device memory space. Allocations are 256-byte aligned and separated by
+    a gap of at least 256 bytes, so a pointer just past one allocation is
+    never inside another.
 11. Accumulation is f32 for every operator (`accum_dtype = OCU_DT_F32`).
 12. Variable row count (4.7) is accepted (`var_rows = 1`); scratchpad and
     tile numbers are those of the planned (largest) shape.
