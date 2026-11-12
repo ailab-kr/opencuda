@@ -54,6 +54,14 @@ if(OCU_BACKEND_CPU)
 
   add_executable(test_cpu_regressions backend/test_cpu_regressions.c)
   target_link_libraries(test_cpu_regressions PRIVATE ocu_backend_cpu)
+  add_executable(test_cpu_tsan_fibers backend/test_cpu_tsan_fibers.c)
+  target_link_libraries(test_cpu_tsan_fibers PRIVATE ocu_backend_cpu)
+  add_test(NAME cpu_tsan_fibers COMMAND test_cpu_tsan_fibers)
+  add_test(NAME cpu_tsan_fibers_1worker COMMAND test_cpu_tsan_fibers)
+  # One worker thread runs every block: the defect showed there first. A
+  # sanitizer slowed by stale shadow frames fails by timeout.
+  set_tests_properties(cpu_tsan_fibers PROPERTIES TIMEOUT 120)
+  set_tests_properties(cpu_tsan_fibers_1worker PROPERTIES TIMEOUT 120 ENVIRONMENT "OCU_CPU_THREADS=1")
   add_test(NAME cpu_regressions COMMAND test_cpu_regressions)
   add_test(NAME cpu_regressions_small_stack COMMAND test_cpu_regressions)
   set_tests_properties(cpu_regressions_small_stack PROPERTIES
