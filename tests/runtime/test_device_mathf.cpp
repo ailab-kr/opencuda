@@ -228,6 +228,12 @@ int main()
     ONE(log2, 1);
     ONE(log10, 2);
     ONE(log1p, 1);
+#if defined(_WIN32)
+    // MinGW's sin/cos/tan use the x87 instructions, whose argument reduction
+    // is wrong for large |x| (sin(0x1.afda28p+127) comes out ~1.5e-7 instead
+    // of -0.58), so there is no reference here. Checked on Linux and macOS.
+    std::printf("sinf/cosf/tanf/sincosf: not checked (no accurate reference on this host)\n");
+#else
     ONE(sin, 2);
     ONE(cos, 2);
     ONE(tan, 4);
@@ -235,6 +241,7 @@ int main()
            [](double x) { return ::sin(x); }, [](long double x) { return ::sinl(x); }, 2);
     sweep1("sincosf.c", [](float x) { float s, c; ocu_dm::sincosf(x, &s, &c); return c; },
            [](double x) { return ::cos(x); }, [](long double x) { return ::cosl(x); }, 2);
+#endif
     ONE(asin, 2);
     ONE(acos, 2);
     ONE(atan, 2);
