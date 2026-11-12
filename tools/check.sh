@@ -86,6 +86,7 @@ if command -v aarch64-linux-gnu-g++ >/dev/null 2>&1 && command -v qemu-aarch64 >
         -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
         -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
         -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+        -DOCU_BACKEND_NVIDIA=OFF \
         -DCMAKE_ASM_COMPILER=aarch64-linux-gnu-gcc \
         -DCMAKE_EXE_LINKER_FLAGS=-static \
         -DCMAKE_CROSSCOMPILING_EMULATOR=qemu-aarch64
