@@ -525,6 +525,13 @@ static ocu_status run_block(block_exec *ex, uint64_t linear_block)
 
 /* ---- grid --------------------------------------------------------------- */
 
+/*
+ * A launch is a grid_job. The calling thread always works on its own job;
+ * up to `workers - 1` threads of a persistent pool join it. Pool threads
+ * are started once and serve whichever jobs are open, so a launch costs a
+ * wake-up instead of thread creation. Each thread keeps its fiber stacks
+ * between launches of the same block shape.
+ */
 typedef struct grid_job {
     ocu_cpu_kernel_fn fn;
     void            **args;
@@ -533,8 +540,19 @@ typedef struct grid_job {
     size_t            shared_bytes;
     uint64_t          nblocks;
     _Atomic uint64_t  next;
-    _Atomic int       status;  /* first error, OCU_OK when none */
+    _Atomic int       status;     /* first error, OCU_OK when none */
+    /* guarded by g_pool_lock */
+    uint32_t          helpers_wanted;
+    uint32_t          attached;   /* pool threads working on it now */
+    pthread_cond_t    detached_cv;
+    struct grid_job  *next_open;
 } grid_job;
+
+static pthread_mutex_t g_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_pool_cv = PTHREAD_COND_INITIALIZER;
+static grid_job       *g_open_jobs;
+static uint32_t        g_pool_threads;  /* started so far */
+static uint32_t        g_pool_idle;     /* waiting for work */
 
 static void record_error(grid_job *job, ocu_status st)
 {
@@ -542,34 +560,82 @@ static void record_error(grid_job *job, ocu_status st)
     atomic_compare_exchange_strong(&job->status, &expected, (int)st);
 }
 
-typedef struct worker_arg {
-    grid_job *job;
-    bool      primary; /* the calling thread: its failure fails the launch */
-} worker_arg;
-
-static void *grid_worker(void *arg)
-{
-    worker_arg *wa = arg;
-    grid_job *job = wa->job;
-    uint32_t nthreads = job->block[0] * job->block[1] * job->block[2];
+/*
+ * Per-thread fiber stacks, reused while the block shape stays the same.
+ * The cache lives on the heap and a thread-exit destructor releases it, so
+ * threads that end (queue workers, user threads) do not leak it.
+ */
+typedef struct exec_cache {
     block_exec ex;
-    ocu_status st = block_exec_init(&ex, nthreads, job->shared_bytes);
+    uint32_t   threads;
+    size_t     shared;
+} exec_cache;
+
+static pthread_key_t  g_cache_key;
+static pthread_once_t g_cache_key_once = PTHREAD_ONCE_INIT;
+
+static void cache_destroy(void *p)
+{
+    exec_cache *c = p;
+    block_exec_release(&c->ex);
+    free(c);
+}
+
+static void cache_key_init(void)
+{
+    (void)pthread_key_create(&g_cache_key, cache_destroy);
+}
+
+static ocu_status cached_exec(uint32_t nthreads, size_t shared, block_exec **out)
+{
+    pthread_once(&g_cache_key_once, cache_key_init);
+    exec_cache *c = pthread_getspecific(g_cache_key);
+    if (c != NULL && (c->threads != nthreads || c->shared != shared)) {
+        pthread_setspecific(g_cache_key, NULL);
+        cache_destroy(c);
+        c = NULL;
+    }
+    if (c == NULL) {
+        c = calloc(1, sizeof(*c));
+        if (c == NULL) {
+            return OCU_ERR_OUT_OF_MEMORY;
+        }
+        ocu_status st = block_exec_init(&c->ex, nthreads, shared);
+        if (st != OCU_OK) {
+            cache_destroy(c);
+            return st;
+        }
+        c->threads = nthreads;
+        c->shared = shared;
+        if (pthread_setspecific(g_cache_key, c) != 0) {
+            cache_destroy(c);
+            return OCU_ERR_OUT_OF_MEMORY;
+        }
+    }
+    *out = &c->ex;
+    return OCU_OK;
+}
+
+/* Run blocks of `job` until none is left or one fails. */
+static void work_on(grid_job *job, bool primary)
+{
+    uint32_t nthreads = job->block[0] * job->block[1] * job->block[2];
+    block_exec *ex = NULL;
+    ocu_status st = cached_exec(nthreads, job->shared_bytes, &ex);
     if (st != OCU_OK) {
-        /* An extra worker that cannot start leaves its blocks to the
-           others; only the calling thread's failure fails the launch. */
-        if (wa->primary) {
+        /* A helper that cannot start leaves its blocks to the others; only
+           the calling thread's failure fails the launch. */
+        if (primary) {
             record_error(job, st);
         }
-        block_exec_release(&ex);
-        return NULL;
+        return;
     }
-    ex.fn = job->fn;
-    ex.args = job->args;
-    ex.dyn_shared_bytes = job->shared_bytes;
-    ex.block_dim = (ocu_cpu_dim3){job->block[0], job->block[1], job->block[2]};
-    ex.grid_dim = (ocu_cpu_dim3){job->grid[0], job->grid[1], job->grid[2]};
-    block_exec *saved = tl_exec;
-    tl_exec = &ex;
+    ex->fn = job->fn;
+    ex->args = job->args;
+    ex->dyn_shared_bytes = job->shared_bytes;
+    ex->block_dim = (ocu_cpu_dim3){job->block[0], job->block[1], job->block[2]};
+    ex->grid_dim = (ocu_cpu_dim3){job->grid[0], job->grid[1], job->grid[2]};
+    tl_exec = ex;
     for (;;) {
         if (atomic_load(&job->status) != OCU_OK) {
             break;
@@ -579,18 +645,67 @@ static void *grid_worker(void *arg)
             break;
         }
         uint64_t gx = job->grid[0], gy = job->grid[1];
-        ex.block_idx.x = (uint32_t)(b % gx);
-        ex.block_idx.y = (uint32_t)((b / gx) % gy);
-        ex.block_idx.z = (uint32_t)(b / (gx * gy));
-        st = run_block(&ex, b);
+        ex->block_idx.x = (uint32_t)(b % gx);
+        ex->block_idx.y = (uint32_t)((b / gx) % gy);
+        ex->block_idx.z = (uint32_t)(b / (gx * gy));
+        st = run_block(ex, b);
         if (st != OCU_OK) {
             record_error(job, st);
             break;
         }
     }
-    tl_exec = saved;
-    block_exec_release(&ex);
+    tl_exec = NULL;
+}
+
+/* Caller holds g_pool_lock. An open job that still wants a helper. */
+static grid_job *job_wanting_help(void)
+{
+    for (grid_job *j = g_open_jobs; j != NULL; j = j->next_open) {
+        if (j->attached < j->helpers_wanted && atomic_load(&j->next) < j->nblocks &&
+            atomic_load(&j->status) == OCU_OK) {
+            return j;
+        }
+    }
     return NULL;
+}
+
+static void *pool_thread(void *unused)
+{
+    (void)unused;
+    pthread_mutex_lock(&g_pool_lock);
+    for (;;) {
+        grid_job *job;
+        while ((job = job_wanting_help()) == NULL) {
+            g_pool_idle++;
+            pthread_cond_wait(&g_pool_cv, &g_pool_lock);
+            g_pool_idle--;
+        }
+        job->attached++;
+        pthread_mutex_unlock(&g_pool_lock);
+        work_on(job, false);
+        pthread_mutex_lock(&g_pool_lock);
+        if (--job->attached == 0) {
+            pthread_cond_broadcast(&job->detached_cv);
+        }
+    }
+    return NULL; /* not reached: pool threads live as long as the process */
+}
+
+/* Caller holds g_pool_lock. Start pool threads up to `want` in total. */
+static void grow_pool(uint32_t want)
+{
+    while (g_pool_threads < want) {
+        pthread_t t;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        int rc = pthread_create(&t, &attr, pool_thread, NULL);
+        pthread_attr_destroy(&attr);
+        if (rc != 0) {
+            break; /* run with the threads we have */
+        }
+        g_pool_threads++;
+    }
 }
 
 ocu_status cpu_run_grid(ocu_cpu_kernel_fn fn, const uint32_t grid[3],
@@ -611,30 +726,37 @@ ocu_status cpu_run_grid(ocu_cpu_kernel_fn fn, const uint32_t grid[3],
     atomic_init(&job.next, 0);
     atomic_init(&job.status, OCU_OK);
 
-    uint64_t want = cpu_get_config()->workers;
-    if (want > job.nblocks) {
-        want = job.nblocks;
+    uint64_t workers = cpu_get_config()->workers;
+    uint64_t helpers = (workers < job.nblocks ? workers : job.nblocks);
+    helpers = helpers > 0 ? helpers - 1 : 0;
+    job.helpers_wanted = (uint32_t)helpers;
+
+    if (helpers > 0) {
+        pthread_cond_init(&job.detached_cv, NULL);
+        pthread_mutex_lock(&g_pool_lock);
+        grow_pool(cpu_get_config()->workers - 1);
+        job.next_open = g_open_jobs;
+        g_open_jobs = &job;
+        pthread_cond_broadcast(&g_pool_cv);
+        pthread_mutex_unlock(&g_pool_lock);
     }
-    uint32_t extra = (uint32_t)(want > 0 ? want - 1 : 0);
-    pthread_t *threads = NULL;
-    uint32_t started = 0;
-    worker_arg helper = {&job, false};
-    worker_arg primary = {&job, true};
-    if (extra > 0) {
-        threads = calloc(extra, sizeof(*threads));
-        if (threads != NULL) {
-            for (; started < extra; ++started) {
-                if (pthread_create(&threads[started], NULL, grid_worker, &helper) != 0) {
-                    break; /* run with the threads we got */
-                }
+
+    work_on(&job, true);
+
+    if (helpers > 0) {
+        pthread_mutex_lock(&g_pool_lock);
+        for (grid_job **pp = &g_open_jobs; *pp != NULL; pp = &(*pp)->next_open) {
+            if (*pp == &job) {
+                *pp = job.next_open; /* no new helpers can attach */
+                break;
             }
         }
+        while (job.attached > 0) {
+            pthread_cond_wait(&job.detached_cv, &g_pool_lock);
+        }
+        pthread_mutex_unlock(&g_pool_lock);
+        pthread_cond_destroy(&job.detached_cv);
     }
-    grid_worker(&primary);
-    for (uint32_t i = 0; i < started; ++i) {
-        pthread_join(threads[i], NULL);
-    }
-    free(threads);
     return (ocu_status)atomic_load(&job.status);
 }
 
