@@ -153,6 +153,56 @@ enum cudaComputeMode {
     cudaComputeModeExclusiveProcess = 3
 };
 
+/* Kinds of memory a pointer can refer to (cudaPointerGetAttributes). */
+enum cudaMemoryType {
+    cudaMemoryTypeUnregistered = 0,
+    cudaMemoryTypeHost = 1,
+    cudaMemoryTypeDevice = 2,
+    cudaMemoryTypeManaged = 3
+};
+
+struct cudaPointerAttributes {
+    enum cudaMemoryType type;
+    int                 device;
+    void               *devicePointer;
+    void               *hostPointer;
+};
+
+/* cudaMallocManaged flags. */
+#define cudaMemAttachGlobal 0x01u
+#define cudaMemAttachHost   0x02u
+
+/* Device attributes (cudaDeviceGetAttribute): the commonly queried subset. */
+enum cudaDeviceAttr {
+    cudaDevAttrMaxThreadsPerBlock = 1,
+    cudaDevAttrMaxBlockDimX = 2,
+    cudaDevAttrMaxBlockDimY = 3,
+    cudaDevAttrMaxBlockDimZ = 4,
+    cudaDevAttrMaxGridDimX = 5,
+    cudaDevAttrMaxGridDimY = 6,
+    cudaDevAttrMaxGridDimZ = 7,
+    cudaDevAttrMaxSharedMemoryPerBlock = 8,
+    cudaDevAttrTotalConstantMemory = 9,
+    cudaDevAttrWarpSize = 10,
+    cudaDevAttrMaxRegistersPerBlock = 12,
+    cudaDevAttrClockRate = 13,
+    cudaDevAttrMultiProcessorCount = 16,
+    cudaDevAttrIntegrated = 18,
+    cudaDevAttrConcurrentKernels = 31,
+    cudaDevAttrMemoryClockRate = 36,
+    cudaDevAttrGlobalMemoryBusWidth = 37,
+    cudaDevAttrL2CacheSize = 38,
+    cudaDevAttrMaxThreadsPerMultiProcessor = 39,
+    cudaDevAttrAsyncEngineCount = 40,
+    cudaDevAttrUnifiedAddressing = 41,
+    cudaDevAttrComputeCapabilityMajor = 75,
+    cudaDevAttrComputeCapabilityMinor = 76,
+    cudaDevAttrMaxSharedMemoryPerMultiprocessor = 81,
+    cudaDevAttrManagedMemory = 83,
+    cudaDevAttrConcurrentManagedAccess = 89,
+    cudaDevAttrMaxSharedMemoryPerBlockOptin = 97
+};
+
 /* The legacy default stream. */
 #define cudaStreamLegacy ((cudaStream_t)0x1)
 #define cudaStreamPerThread ((cudaStream_t)0x2)
@@ -215,6 +265,7 @@ cudaError_t cudaGetDeviceCount(int *count);
 cudaError_t cudaGetDevice(int *device);
 cudaError_t cudaSetDevice(int device);
 cudaError_t cudaGetDeviceProperties(struct cudaDeviceProp *prop, int device);
+cudaError_t cudaDeviceGetAttribute(int *value, enum cudaDeviceAttr attr, int device);
 cudaError_t cudaDeviceSynchronize(void);
 cudaError_t cudaDeviceReset(void);
 cudaError_t cudaRuntimeGetVersion(int *version);
@@ -231,6 +282,8 @@ cudaError_t cudaFuncSetCacheConfig(const void *func, enum cudaFuncCache config);
 
 cudaError_t cudaMalloc(void **ptr, size_t size);
 cudaError_t cudaFree(void *ptr);
+cudaError_t cudaMallocManaged(void **ptr, size_t size, unsigned int flags);
+cudaError_t cudaPointerGetAttributes(struct cudaPointerAttributes *attr, const void *ptr);
 cudaError_t cudaMallocHost(void **ptr, size_t size);
 cudaError_t cudaFreeHost(void *ptr);
 cudaError_t cudaHostAlloc(void **ptr, size_t size, unsigned int flags);
@@ -307,6 +360,13 @@ template <class T>
 static inline cudaError_t cudaMallocHost(T **ptr, size_t size)
 {
     return cudaMallocHost(reinterpret_cast<void **>(ptr), size);
+}
+
+template <class T>
+static inline cudaError_t cudaMallocManaged(T **ptr, size_t size,
+                                            unsigned int flags = cudaMemAttachGlobal)
+{
+    return cudaMallocManaged(reinterpret_cast<void **>(ptr), size, flags);
 }
 
 template <class T>

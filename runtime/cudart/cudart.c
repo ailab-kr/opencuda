@@ -45,10 +45,13 @@ struct ocu_rt_event {
     int         device;
 };
 
-typedef struct pinned_range {
-    char  *base;
-    size_t size;
-} pinned_range;
+/* What the runtime allocated, so pointer kinds can be told apart
+   (cudaPointerGetAttributes, cudaMemcpyDefault, pageable-copy rule). */
+typedef struct mem_range {
+    char                *base;
+    size_t               size;
+    enum cudaMemoryType  type; /* Host (page-locked), Device or Managed */
+} mem_range;
 
 typedef struct rt_device {
     pthread_mutex_t       lock;
@@ -63,11 +66,11 @@ typedef struct rt_device {
     /* A kernel failure stays visible to every later synchronising call
        until cudaDeviceReset, as the API describes. 0 = none. */
     _Atomic int           sticky;
-    /* Page-locked host allocations (cudaMallocHost/cudaHostAlloc), guarded
-       by `lock`: asynchronous copies may read these later; any other host
-       memory is copied before the call returns. */
-    pinned_range         *pinned;
-    size_t                pinned_count, pinned_cap;
+    /* Allocations made through the runtime, guarded by `lock`. Only
+       page-locked host memory may be read by an asynchronous copy after
+       the call returns; any other host memory is copied before. */
+    mem_range            *ranges;
+    size_t                range_count, range_cap;
 } rt_device;
 
 static const ocu_backend *g_backend;
@@ -321,7 +324,50 @@ cudaError_t cudaGetDeviceProperties(struct cudaDeviceProp *prop, int device)
     prop->concurrentKernels = 1;
     prop->unifiedAddressing = info.supports_unified_memory ? 1 : 0;
     prop->integrated = info.supports_unified_memory ? 1 : 0;
+    prop->managedMemory = info.supports_unified_memory ? 1 : 0;
+    prop->concurrentManagedAccess = info.supports_unified_memory ? 1 : 0;
+    prop->canMapHostMemory = 1;
     prop->l2CacheSize = 4 * 1024 * 1024;
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceGetAttribute(int *value, enum cudaDeviceAttr attr, int device)
+{
+    if (value == NULL) return set_error(cudaErrorInvalidValue);
+    struct cudaDeviceProp p;
+    cudaError_t e = cudaGetDeviceProperties(&p, device);
+    if (e != cudaSuccess) return e;
+    switch (attr) {
+    case cudaDevAttrMaxThreadsPerBlock:          *value = p.maxThreadsPerBlock; break;
+    case cudaDevAttrMaxBlockDimX:                *value = p.maxThreadsDim[0]; break;
+    case cudaDevAttrMaxBlockDimY:                *value = p.maxThreadsDim[1]; break;
+    case cudaDevAttrMaxBlockDimZ:                *value = p.maxThreadsDim[2]; break;
+    case cudaDevAttrMaxGridDimX:                 *value = p.maxGridSize[0]; break;
+    case cudaDevAttrMaxGridDimY:                 *value = p.maxGridSize[1]; break;
+    case cudaDevAttrMaxGridDimZ:                 *value = p.maxGridSize[2]; break;
+    case cudaDevAttrMaxSharedMemoryPerBlock:     *value = (int)p.sharedMemPerBlock; break;
+    case cudaDevAttrTotalConstantMemory:         *value = (int)p.totalConstMem; break;
+    case cudaDevAttrWarpSize:                    *value = p.warpSize; break;
+    case cudaDevAttrMaxRegistersPerBlock:        *value = p.regsPerBlock; break;
+    case cudaDevAttrClockRate:                   *value = p.clockRate; break;
+    case cudaDevAttrMultiProcessorCount:         *value = p.multiProcessorCount; break;
+    case cudaDevAttrIntegrated:                  *value = p.integrated; break;
+    case cudaDevAttrConcurrentKernels:           *value = p.concurrentKernels; break;
+    case cudaDevAttrMemoryClockRate:             *value = p.memoryClockRate; break;
+    case cudaDevAttrGlobalMemoryBusWidth:        *value = p.memoryBusWidth; break;
+    case cudaDevAttrL2CacheSize:                 *value = p.l2CacheSize; break;
+    case cudaDevAttrMaxThreadsPerMultiProcessor: *value = p.maxThreadsPerMultiProcessor; break;
+    case cudaDevAttrAsyncEngineCount:            *value = p.asyncEngineCount; break;
+    case cudaDevAttrUnifiedAddressing:           *value = p.unifiedAddressing; break;
+    case cudaDevAttrComputeCapabilityMajor:      *value = p.major; break;
+    case cudaDevAttrComputeCapabilityMinor:      *value = p.minor; break;
+    case cudaDevAttrMaxSharedMemoryPerMultiprocessor: *value = (int)p.sharedMemPerMultiprocessor; break;
+    case cudaDevAttrManagedMemory:               *value = p.managedMemory; break;
+    case cudaDevAttrConcurrentManagedAccess:     *value = p.concurrentManagedAccess; break;
+    case cudaDevAttrMaxSharedMemoryPerBlockOptin: *value = (int)p.sharedMemPerBlockOptin; break;
+    default:
+        return set_error(cudaErrorInvalidValue);
+    }
     return cudaSuccess;
 }
 
@@ -504,13 +550,46 @@ static ocu_queue *queue_of(rt_device *d, cudaStream_t stream)
 
 /* ---- memory -------------------------------------------------------------- */
 
-cudaError_t cudaMalloc(void **ptr, size_t size)
+static bool range_add(rt_device *d, void *p, size_t size, enum cudaMemoryType type);
+static void range_remove(rt_device *d, void *p);
+static bool range_find(rt_device *d, const void *p, size_t n, mem_range *out);
+
+static cudaError_t device_alloc(void **ptr, size_t size, enum cudaMemoryType type)
 {
     rt_device *d;
     cudaError_t e = current(&d);
     if (e != cudaSuccess) return set_error(e);
     if (ptr == NULL) return set_error(cudaErrorInvalidValue);
-    return from(g_backend->mem_alloc(d->dev, size, ptr));
+    ocu_status st = g_backend->mem_alloc(d->dev, size, ptr);
+    if (st != OCU_OK) return from(st);
+    if (!range_add(d, *ptr, size, type)) {
+        (void)g_backend->mem_free(d->dev, *ptr);
+        *ptr = NULL;
+        return set_error(cudaErrorMemoryAllocation);
+    }
+    return cudaSuccess;
+}
+
+cudaError_t cudaMalloc(void **ptr, size_t size)
+{
+    return device_alloc(ptr, size, cudaMemoryTypeDevice);
+}
+
+/* Memory both the host and the device use directly: only where the device
+   shares the host's memory (the CPU backend); elsewhere not supported. */
+cudaError_t cudaMallocManaged(void **ptr, size_t size, unsigned int flags)
+{
+    if (flags != cudaMemAttachGlobal && flags != cudaMemAttachHost) {
+        return set_error(cudaErrorInvalidValue);
+    }
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    ocu_dev_info info;
+    ocu_status st = g_backend->dev_info((uint32_t)tl_device, &info);
+    if (st != OCU_OK) return from(st);
+    if (!info.supports_unified_memory) return set_error(cudaErrorNotSupported);
+    return device_alloc(ptr, size, cudaMemoryTypeManaged);
 }
 
 cudaError_t cudaFree(void *ptr)
@@ -518,56 +597,96 @@ cudaError_t cudaFree(void *ptr)
     rt_device *d;
     cudaError_t e = current(&d);
     if (e != cudaSuccess) return set_error(e);
-    return from(g_backend->mem_free(d->dev, ptr)); /* waits for queued work */
+    ocu_status st = g_backend->mem_free(d->dev, ptr); /* waits for queued work */
+    if (st == OCU_OK && ptr != NULL) range_remove(d, ptr);
+    return from(st);
 }
 
-static bool pinned_add(rt_device *d, void *p, size_t size)
+cudaError_t cudaPointerGetAttributes(struct cudaPointerAttributes *attr, const void *ptr)
+{
+    if (attr == NULL) return set_error(cudaErrorInvalidValue);
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    memset(attr, 0, sizeof(*attr));
+    mem_range r;
+    if (ptr == NULL || !range_find(d, ptr, 0, &r)) {
+        /* Memory the runtime did not allocate: ordinary host memory. */
+        attr->type = cudaMemoryTypeUnregistered;
+        attr->device = -2;
+        attr->hostPointer = (void *)(uintptr_t)ptr;
+        return cudaSuccess;
+    }
+    attr->type = r.type;
+    attr->device = tl_device;
+    ocu_dev_info info;
+    bool unified = g_backend->dev_info((uint32_t)tl_device, &info) == OCU_OK &&
+                   info.supports_unified_memory;
+    if (r.type == cudaMemoryTypeHost || r.type == cudaMemoryTypeManaged || unified) {
+        attr->hostPointer = (void *)(uintptr_t)ptr;
+    }
+    attr->devicePointer = (void *)(uintptr_t)ptr;
+    return cudaSuccess;
+}
+
+static bool range_add(rt_device *d, void *p, size_t size, enum cudaMemoryType type)
 {
     pthread_mutex_lock(&d->lock);
     bool ok = true;
-    if (d->pinned_count == d->pinned_cap) {
-        size_t cap = d->pinned_cap ? d->pinned_cap * 2 : 16;
-        pinned_range *n = realloc(d->pinned, cap * sizeof(*n));
+    if (d->range_count == d->range_cap) {
+        size_t cap = d->range_cap ? d->range_cap * 2 : 16;
+        mem_range *n = realloc(d->ranges, cap * sizeof(*n));
         if (n == NULL) {
             ok = false;
         } else {
-            d->pinned = n;
-            d->pinned_cap = cap;
+            d->ranges = n;
+            d->range_cap = cap;
         }
     }
     if (ok) {
-        d->pinned[d->pinned_count].base = p;
-        d->pinned[d->pinned_count].size = size;
-        d->pinned_count++;
+        d->ranges[d->range_count].base = p;
+        d->ranges[d->range_count].size = size;
+        d->ranges[d->range_count].type = type;
+        d->range_count++;
     }
     pthread_mutex_unlock(&d->lock);
     return ok;
 }
 
-static void pinned_remove(rt_device *d, void *p)
+static void range_remove(rt_device *d, void *p)
 {
     pthread_mutex_lock(&d->lock);
-    for (size_t i = 0; i < d->pinned_count; ++i) {
-        if (d->pinned[i].base == (char *)p) {
-            d->pinned[i] = d->pinned[--d->pinned_count];
+    for (size_t i = 0; i < d->range_count; ++i) {
+        if (d->ranges[i].base == (char *)p) {
+            d->ranges[i] = d->ranges[--d->range_count];
             break;
         }
     }
     pthread_mutex_unlock(&d->lock);
 }
 
-/* True when [p, p + n) lies inside one page-locked allocation. */
-static bool pinned_contains(rt_device *d, const void *p, size_t n)
+/* The allocation holding [p, p + n), or false. *out gets a copy. */
+static bool range_find(rt_device *d, const void *p, size_t n, mem_range *out)
 {
     const char *c = p;
     bool found = false;
     pthread_mutex_lock(&d->lock);
-    for (size_t i = 0; i < d->pinned_count && !found; ++i) {
-        const pinned_range *r = &d->pinned[i];
-        found = c >= r->base && (size_t)(c - r->base) <= r->size && n <= r->size - (size_t)(c - r->base);
+    for (size_t i = 0; i < d->range_count && !found; ++i) {
+        const mem_range *r = &d->ranges[i];
+        if (c >= r->base && (size_t)(c - r->base) <= r->size &&
+            n <= r->size - (size_t)(c - r->base) && (n > 0 || c < r->base + r->size || r->size == 0)) {
+            *out = *r;
+            found = true;
+        }
     }
     pthread_mutex_unlock(&d->lock);
     return found;
+}
+
+static bool pinned_contains(rt_device *d, const void *p, size_t n)
+{
+    mem_range r;
+    return range_find(d, p, n, &r) && r.type == cudaMemoryTypeHost;
 }
 
 cudaError_t cudaMallocHost(void **ptr, size_t size)
@@ -578,7 +697,7 @@ cudaError_t cudaMallocHost(void **ptr, size_t size)
     if (ptr == NULL) return set_error(cudaErrorInvalidValue);
     ocu_status st = g_backend->host_alloc_pinned(d->dev, size, ptr);
     if (st != OCU_OK) return from(st);
-    if (!pinned_add(d, *ptr, size)) {
+    if (!range_add(d, *ptr, size, cudaMemoryTypeHost)) {
         (void)g_backend->host_free_pinned(d->dev, *ptr);
         *ptr = NULL;
         return set_error(cudaErrorMemoryAllocation);
@@ -592,7 +711,7 @@ cudaError_t cudaFreeHost(void *ptr)
     cudaError_t e = current(&d);
     if (e != cudaSuccess) return set_error(e);
     ocu_status st = g_backend->host_free_pinned(d->dev, ptr);
-    if (st == OCU_OK) pinned_remove(d, ptr);
+    if (st == OCU_OK) range_remove(d, ptr);
     return from(st);
 }
 
@@ -639,9 +758,23 @@ static cudaError_t copy_dir(enum cudaMemcpyKind kind, ocu_copy_dir *dir)
     case cudaMemcpyDeviceToHost:   *dir = OCU_COPY_DEVICE_TO_HOST; return cudaSuccess;
     case cudaMemcpyDeviceToDevice: *dir = OCU_COPY_DEVICE_TO_DEVICE; return cudaSuccess;
     case cudaMemcpyHostToHost:     return cudaErrorNotReady; /* sentinel: plain copy */
-    case cudaMemcpyDefault:        return cudaErrorNotSupported; /* needs pointer kinds */
+    case cudaMemcpyDefault:        return cudaErrorNotSupported; /* resolved by copy() */
     }
     return cudaErrorInvalidMemcpyDirection;
+}
+
+/* The direction cudaMemcpyDefault stands for: pointers the runtime
+   allocated on the device (or as managed memory) are device side. */
+static enum cudaMemcpyKind infer_kind(rt_device *d, void *dst, const void *src, size_t count)
+{
+    /* By the start address only: a copy running past the allocation must
+       reach the backend's range check, not become a host copy. */
+    (void)count;
+    mem_range r;
+    bool sd = range_find(d, src, 1, &r) && r.type != cudaMemoryTypeHost;
+    bool dd = range_find(d, dst, 1, &r) && r.type != cudaMemoryTypeHost;
+    return sd ? (dd ? cudaMemcpyDeviceToDevice : cudaMemcpyDeviceToHost)
+              : (dd ? cudaMemcpyHostToDevice : cudaMemcpyHostToHost);
 }
 
 static cudaError_t copy(void *dst, const void *src, size_t count, enum cudaMemcpyKind kind,
@@ -651,6 +784,7 @@ static cudaError_t copy(void *dst, const void *src, size_t count, enum cudaMemcp
     cudaError_t e = current(&d);
     if (e != cudaSuccess) return set_error(e);
     if (count == 0) return cudaSuccess;
+    if (kind == cudaMemcpyDefault) kind = infer_kind(d, dst, src, count);
     ocu_copy_dir dir;
     e = copy_dir(kind, &dir);
     submission sub;
