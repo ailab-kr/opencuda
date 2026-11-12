@@ -7,7 +7,7 @@
 # and the system libraries they use.
 get_filename_component(_ocu_lib "${CMAKE_CURRENT_LIST_DIR}/../lib" ABSOLUTE)
 set(_ocu_runtime)
-foreach(_ocu_name ocu_cudart ocu_core ocu_backend_cpu ocu_backend_nvidia ocu_backend_opencl ocu_backend_metal)
+foreach(_ocu_name ocu_cudart ocu_core ocu_backend_cpu ocu_backend_nvidia ocu_backend_opencl ocu_backend_metal ocu_backend_npusim ocu_ops_ref)
   if(EXISTS "${_ocu_lib}/lib${_ocu_name}.a")
     list(APPEND _ocu_runtime "${_ocu_lib}/lib${_ocu_name}.a")
   endif()

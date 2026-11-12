@@ -510,7 +510,8 @@ def runtime_link(libdir: Path, blas: bool, target: str = "cpu") -> list[str]:
     # -lcublas: the cublas_v2.h library built for the same target as the
     # CUDA code (libs/cublas), then the internal BLAS layer.
     names = ([f"ocu_cublas_{target}", "ocu_blas"] if blas else []) + \
-        ["ocu_cudart", "ocu_core", "ocu_backend_cpu", "ocu_backend_nvidia", "ocu_backend_opencl", "ocu_backend_metal"]
+        ["ocu_cudart", "ocu_core", "ocu_backend_cpu", "ocu_backend_nvidia", "ocu_backend_opencl", "ocu_backend_metal",
+         "ocu_backend_npusim", "ocu_ops_ref"]  # ops_ref after the backends that use it
     files = [str(libdir / f"lib{n}.a") for n in names if (libdir / f"lib{n}.a").is_file()]
     if sys.platform == "darwin":
         out = files

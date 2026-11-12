@@ -52,7 +52,7 @@ configure_file(${PROJECT_SOURCE_DIR}/cmake/cuda-modules/FindCUDAToolkit.cmake
 
 # Libraries: links to the built archives, refreshed after every build.
 set(_ocu_tk_libs ocu_cudart ocu_core ocu_blas)
-foreach(t ocu_backend_cpu ocu_backend_nvidia ocu_backend_opencl ocu_backend_metal ocu_cublas_cpu ocu_cublas_nvidia)
+foreach(t ocu_backend_cpu ocu_backend_nvidia ocu_backend_opencl ocu_backend_metal ocu_backend_npusim ocu_ops_ref ocu_cublas_cpu ocu_cublas_nvidia)
   if(TARGET ${t})
     list(APPEND _ocu_tk_libs ${t})
   endif()
