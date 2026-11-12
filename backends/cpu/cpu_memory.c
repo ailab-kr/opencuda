@@ -7,6 +7,9 @@
  * are reported instead of corrupting memory silently.
  */
 #define _POSIX_C_SOURCE 200809L
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE /* _SC_PHYS_PAGES is outside POSIX */
+#endif
 
 #include "cpu_internal.h"
 
