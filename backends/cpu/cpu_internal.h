@@ -133,8 +133,12 @@ ocu_status cpu_marker_elapsed_ms(ocu_marker *start, ocu_marker *end,
 
 double cpu_now_ms(void);
 
-/* Library providers (cpu_blas.c): "blas". NULL for anything else. */
+/* Library providers (cpu_blas.c): "blas", "ops". NULL for anything else. */
 const void *cpu_get_provider(const char *library);
+
+/* Operator table (cpu_ops.c). */
+struct ocu_op_table;
+const struct ocu_op_table *cpu_op_table(void);
 
 /* Wait until every live queue is empty and idle (errors stay sticky). */
 void cpu_queues_drain(void);
