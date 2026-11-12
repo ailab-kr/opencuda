@@ -36,5 +36,7 @@ endif()
 
 install(TARGETS ocu_core ocu_cudart EXPORT OcuTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(FILES core/ocu_core.h DESTINATION ${OCU_INSTALL_INCLUDEDIR})
-file(GLOB _ocu_rt_headers ${CMAKE_CURRENT_SOURCE_DIR}/include/*.h)
-install(FILES ${_ocu_rt_headers} DESTINATION ${OCU_INSTALL_INCLUDEDIR})
+# The whole tree, so headers in subfolders (cooperative_groups/) and headers
+# added after configuring are installed too.
+install(DIRECTORY include/ DESTINATION ${OCU_INSTALL_INCLUDEDIR}
+        FILES_MATCHING PATTERN "*.h")
