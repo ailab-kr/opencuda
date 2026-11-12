@@ -278,13 +278,18 @@ def parse(argv: list[str]) -> SimpleNamespace:
                 o.host += [a, take(a)]
             elif a.startswith("-Wl,"):
                 o.linker.append(a)
-            elif a in ("-framework", "-install_name", "-compatibility_version",
-                       "-current_version"):
-                # macOS link items with a value ("-framework Metal",
-                # CMake's shared-library "-install_name <name>").
+            elif a in ("-framework", "-compatibility_version", "-current_version"):
+                # macOS link items with a value ("-framework Metal").
                 o.linker += [a, take(a)]
-            elif a.startswith("-install_name") and len(a) > len("-install_name"):
-                o.linker += ["-install_name", a[len("-install_name"):]]
+            elif a.startswith("-install_name"):
+                # CMake's shared-library "-install_name <name>", also attached.
+                name = a[len("-install_name"):] or take(a)
+                if "/" not in name and not name.startswith("@"):
+                    # CMake's Clang-CUDA rule drops <TARGET_INSTALLNAME_DIR>;
+                    # a bare name would only load from the current folder.
+                    # @rpath/ is what CMake gives other languages by default.
+                    name = "@rpath/" + name
+                o.linker += ["-install_name", name]
             elif a == "-headerpad_max_install_names":
                 o.linker.append(a)
             elif a.startswith(("-f", "-W", "-m", "--target=", "--sysroot=", "-pthread",
