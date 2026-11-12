@@ -14,7 +14,8 @@ set(_ocu_cpu_sources
   cpu_queue.c
   cpu_exec.c
   cpu_fiber.c
-  cpu_blas.c)
+  cpu_blas.c
+  cpu_ops.c)
 if(_ocu_fast_switch)
   enable_language(ASM)
   list(APPEND _ocu_cpu_sources cpu_fiber_switch.S)
@@ -29,6 +30,7 @@ install(TARGETS ocu_backend_cpu EXPORT OcuTargets ARCHIVE DESTINATION ${CMAKE_IN
 # Public headers only: the device-side API and the backend entry point.
 install(FILES ocu_backend_cpu.h ocu_cpu_kernel.h DESTINATION ${OCU_INSTALL_INCLUDEDIR})
 target_link_libraries(ocu_backend_cpu PUBLIC ocu_backend_interface Threads::Threads)
+target_link_libraries(ocu_backend_cpu PRIVATE ocu_ops_ref)
 if(NOT APPLE)
   target_link_libraries(ocu_backend_cpu PUBLIC m)
 endif()

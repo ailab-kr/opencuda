@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(ocu VERSION 0.0.1 LANGUAGES C CXX)
 
 option(OCU_BACKEND_CPU "Build the CPU reference backend" ON)
+option(OCU_BACKEND_NPUSIM "Build the NPU constraint simulator backend (operator table only)" ON)
 option(OCU_BACKEND_NVIDIA "Build the NVIDIA GPU backend (uses the installed driver at run time)" ${UNIX})
 option(OCU_BACKEND_METAL "Build the Apple GPU (Metal) backend" ${APPLE})
 set(_ocu_opencl_default OFF)

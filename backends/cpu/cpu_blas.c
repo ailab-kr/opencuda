@@ -554,5 +554,8 @@ const void *cpu_get_provider(const char *library)
     if (library != NULL && strcmp(library, "blas") == 0) {
         return &cpu_blas;
     }
+    if (library != NULL && strcmp(library, "ops") == 0) {
+        return cpu_op_table();
+    }
     return NULL;
 }
