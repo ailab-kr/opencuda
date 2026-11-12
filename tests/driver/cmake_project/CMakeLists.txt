@@ -3,6 +3,8 @@
 # Nothing in it names ocu.
 cmake_minimum_required(VERSION 3.20)
 project(ocu_driver_consumer LANGUAGES C CXX)
+# The host program uses C++11 (nullptr); Apple clang++ defaults to C++98.
+set(CMAKE_CXX_STANDARD 17)
 
 find_package(CUDAToolkit REQUIRED)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
