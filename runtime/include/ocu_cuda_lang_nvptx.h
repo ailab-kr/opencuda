@@ -408,10 +408,16 @@ OCU_D float __fsqrt_rn(float x) { return __nvvm_sqrt_rn_f(x); }
 OCU_D float __fadd_rn(float a, float b) { return __nvvm_add_rn_f(a, b); }
 OCU_D float __fmul_rn(float a, float b) { return __nvvm_mul_rn_f(a, b); }
 OCU_D float __fmaf_rn(float a, float b, float c) { return __nvvm_fma_rn_f(a, b, c); }
+OCU_D float __fmaf_rz(float a, float b, float c) { return __nvvm_fma_rz_f(a, b, c); }
+OCU_D float __fmaf_ru(float a, float b, float c) { return __nvvm_fma_rp_f(a, b, c); }
+OCU_D float __fmaf_rd(float a, float b, float c) { return __nvvm_fma_rm_f(a, b, c); }
 OCU_D float __fdiv_rn(float a, float b) { return __nvvm_div_rn_f(a, b); }
 OCU_D double __dadd_rn(double a, double b) { return __nvvm_add_rn_d(a, b); }
 OCU_D double __dmul_rn(double a, double b) { return __nvvm_mul_rn_d(a, b); }
 OCU_D double __fma_rn(double a, double b, double c) { return __nvvm_fma_rn_d(a, b, c); }
+OCU_D double __fma_rz(double a, double b, double c) { return __nvvm_fma_rz_d(a, b, c); }
+OCU_D double __fma_ru(double a, double b, double c) { return __nvvm_fma_rp_d(a, b, c); }
+OCU_D double __fma_rd(double a, double b, double c) { return __nvvm_fma_rm_d(a, b, c); }
 OCU_D double __drcp_rn(double x) { return __nvvm_rcp_rn_d(x); }
 OCU_D double __dsqrt_rn(double x) { return __nvvm_sqrt_rn_d(x); }
 
