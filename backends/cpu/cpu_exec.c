@@ -217,6 +217,7 @@ typedef struct block_exec {
     size_t            dyn_shared_bytes;
     uint64_t         *warp_slots;    /* one value per thread, for gathers */
     uint64_t         *warp_tags;     /* the call each lane's gather came from */
+    uint64_t         *warp_seq;      /* how many warp operations each lane did */
     uint32_t          warp_size;
     bool              warp_mismatch; /* lanes of a warp met at different calls */
     char             *stack_region;  /* one mmap for all fiber stacks */
@@ -318,9 +319,10 @@ static ocu_status block_exec_init(block_exec *ex, uint32_t nthreads,
     ex->order = calloc(nthreads, sizeof(*ex->order));
     ex->warp_slots = calloc(nthreads, sizeof(*ex->warp_slots));
     ex->warp_tags = calloc(nthreads, sizeof(*ex->warp_tags));
+    ex->warp_seq = calloc(nthreads, sizeof(*ex->warp_seq));
     ex->warp_size = cfg->warp_size;
     if (ex->fibers == NULL || ex->order == NULL || ex->warp_slots == NULL ||
-        ex->warp_tags == NULL) {
+        ex->warp_tags == NULL || ex->warp_seq == NULL) {
         return OCU_ERR_OUT_OF_MEMORY;
     }
     for (uint32_t i = 0; i < nthreads; ++i) {
@@ -349,6 +351,7 @@ static void block_exec_release(block_exec *ex)
     free(ex->order);
     free(ex->warp_slots);
     free(ex->warp_tags);
+    free(ex->warp_seq);
     free(ex->dyn_shared);
     memset(ex, 0, sizeof(*ex));
 }
@@ -444,6 +447,8 @@ static ocu_status run_block(block_exec *ex, uint64_t linear_block)
         memset(ex->dyn_shared, 0xA5, ex->dyn_shared_bytes);
     }
     memset(ex->warp_slots, 0, ex->nthreads * sizeof(*ex->warp_slots));
+    memset(ex->warp_tags, 0, ex->nthreads * sizeof(*ex->warp_tags));
+    memset(ex->warp_seq, 0, ex->nthreads * sizeof(*ex->warp_seq));
     ex->warp_mismatch = false;
     for (uint32_t i = 0; i < ex->nthreads; ++i) {
         fiber *f = &ex->fibers[i];
@@ -573,6 +578,7 @@ typedef struct exec_cache {
 
 static pthread_key_t  g_cache_key;
 static pthread_once_t g_cache_key_once = PTHREAD_ONCE_INIT;
+static bool           g_cache_key_ok; /* false: no caching, a fresh exec per call */
 
 static void cache_destroy(void *p)
 {
@@ -583,12 +589,32 @@ static void cache_destroy(void *p)
 
 static void cache_key_init(void)
 {
-    (void)pthread_key_create(&g_cache_key, cache_destroy);
+    g_cache_key_ok = pthread_key_create(&g_cache_key, cache_destroy) == 0;
 }
 
-static ocu_status cached_exec(uint32_t nthreads, size_t shared, block_exec **out)
+/*
+ * The exec to run blocks on. `*owned` is set when it is not cached and the
+ * caller must cache_destroy it (only when no thread key could be made).
+ */
+static ocu_status cached_exec(uint32_t nthreads, size_t shared, block_exec **out,
+                              exec_cache **owned)
 {
     pthread_once(&g_cache_key_once, cache_key_init);
+    *owned = NULL;
+    if (!g_cache_key_ok) {
+        exec_cache *c = calloc(1, sizeof(*c));
+        if (c == NULL) {
+            return OCU_ERR_OUT_OF_MEMORY;
+        }
+        ocu_status st = block_exec_init(&c->ex, nthreads, shared);
+        if (st != OCU_OK) {
+            cache_destroy(c);
+            return st;
+        }
+        *owned = c;
+        *out = &c->ex;
+        return OCU_OK;
+    }
     exec_cache *c = pthread_getspecific(g_cache_key);
     if (c != NULL && (c->threads != nthreads || c->shared != shared)) {
         pthread_setspecific(g_cache_key, NULL);
@@ -616,19 +642,23 @@ static ocu_status cached_exec(uint32_t nthreads, size_t shared, block_exec **out
     return OCU_OK;
 }
 
-/* Run blocks of `job` until none is left or one fails. */
-static void work_on(grid_job *job, bool primary)
+/*
+ * Run blocks of `job` until none is left or one fails. Returns false when
+ * this thread could not even start (no memory for its stacks).
+ */
+static bool work_on(grid_job *job, bool primary)
 {
     uint32_t nthreads = job->block[0] * job->block[1] * job->block[2];
     block_exec *ex = NULL;
-    ocu_status st = cached_exec(nthreads, job->shared_bytes, &ex);
+    exec_cache *owned = NULL;
+    ocu_status st = cached_exec(nthreads, job->shared_bytes, &ex, &owned);
     if (st != OCU_OK) {
         /* A helper that cannot start leaves its blocks to the others; only
            the calling thread's failure fails the launch. */
         if (primary) {
             record_error(job, st);
         }
-        return;
+        return false;
     }
     ex->fn = job->fn;
     ex->args = job->args;
@@ -655,6 +685,10 @@ static void work_on(grid_job *job, bool primary)
         }
     }
     tl_exec = NULL;
+    if (owned != NULL) {
+        cache_destroy(owned);
+    }
+    return true;
 }
 
 /* Caller holds g_pool_lock. An open job that still wants a helper. */
@@ -682,13 +716,41 @@ static void *pool_thread(void *unused)
         }
         job->attached++;
         pthread_mutex_unlock(&g_pool_lock);
-        work_on(job, false);
+        bool started = work_on(job, false);
         pthread_mutex_lock(&g_pool_lock);
+        if (!started) {
+            /* No more helpers for this job: retrying would only spin. */
+            job->helpers_wanted = 0;
+        }
         if (--job->attached == 0) {
             pthread_cond_broadcast(&job->detached_cv);
         }
     }
     return NULL; /* not reached: pool threads live as long as the process */
+}
+
+/*
+ * fork(): the child has none of the pool threads, and the lock may have
+ * been held by a thread that does not exist there. Take the lock around
+ * fork and give the child an empty pool, which it grows again on its next
+ * launch. (Queues do not survive fork either: their worker threads are
+ * gone, as with GPU runtimes.)
+ */
+static void pool_prepare(void) { pthread_mutex_lock(&g_pool_lock); }
+static void pool_parent(void) { pthread_mutex_unlock(&g_pool_lock); }
+static void pool_child(void)
+{
+    pthread_mutex_init(&g_pool_lock, NULL);
+    pthread_cond_init(&g_pool_cv, NULL);
+    g_open_jobs = NULL;
+    g_pool_threads = 0;
+    g_pool_idle = 0;
+}
+
+static pthread_once_t g_atfork_once = PTHREAD_ONCE_INIT;
+static void install_atfork(void)
+{
+    (void)pthread_atfork(pool_prepare, pool_parent, pool_child);
 }
 
 /* Caller holds g_pool_lock. Start pool threads up to `want` in total. */
@@ -732,6 +794,7 @@ ocu_status cpu_run_grid(ocu_cpu_kernel_fn fn, const uint32_t grid[3],
     job.helpers_wanted = (uint32_t)helpers;
 
     if (helpers > 0) {
+        pthread_once(&g_atfork_once, install_atfork);
         pthread_cond_init(&job.detached_cv, NULL);
         pthread_mutex_lock(&g_pool_lock);
         grow_pool(cpu_get_config()->workers - 1);
@@ -741,7 +804,7 @@ ocu_status cpu_run_grid(ocu_cpu_kernel_fn fn, const uint32_t grid[3],
         pthread_mutex_unlock(&g_pool_lock);
     }
 
-    work_on(&job, true);
+    (void)work_on(&job, true);
 
     if (helpers > 0) {
         pthread_mutex_lock(&g_pool_lock);
@@ -803,11 +866,63 @@ uint32_t ocu_cpu_lane_id(void)
     return tl_exec->current % tl_exec->warp_size;
 }
 
-void ocu_cpu_warp_sync(void)
+static void warp_wait(block_exec *ex)
 {
-    block_exec *ex = tl_exec;
     ex->fibers[ex->current].state = FIBER_WAITING_WARP;
     yield_to_scheduler(ex, false);
+}
+
+/*
+ * Every lane of a warp operation records (tag, sequence number) and waits;
+ * after the release each lane checks that all live lanes of its warp are at
+ * the same operation and the same occurrence of it (a lane that skipped an
+ * iteration has a different sequence number). A second wait keeps the
+ * records stable until every lane has checked them.
+ */
+#define OCU_SYNC_TAG 0x53594e43ULL
+
+static uint32_t warp_meet(block_exec *ex, uint64_t tag, uint32_t mask, uint64_t value,
+                          uint64_t *all)
+{
+    uint32_t me = ex->current;
+    uint32_t w = ex->warp_size;
+    uint32_t base = me - me % w;
+    uint32_t count = ex->nthreads - base < w ? ex->nthreads - base : w;
+    ex->warp_slots[me] = value;
+    ex->warp_tags[me] = tag;
+    uint64_t seq = ++ex->warp_seq[me];
+    warp_wait(ex); /* every live lane has written */
+    for (uint32_t i = base; i < base + count; ++i) {
+        if (ex->fibers[i].state != FIBER_DONE &&
+            (ex->warp_tags[i] != tag || ex->warp_seq[i] != seq)) {
+            ex->warp_mismatch = true;
+        }
+    }
+    if (mask != 0 && cpu_get_config()->strict_barrier) {
+        /* A lane named in the mask must still be running. */
+        uint32_t group = base + ((me - base) & ~31u);
+        for (uint32_t b = 0; b < 32; ++b) {
+            uint32_t i = group + b;
+            if ((mask >> b & 1u) && i < base + count && ex->fibers[i].state == FIBER_DONE) {
+                ex->warp_mismatch = true;
+            }
+        }
+    }
+    if (all != NULL) {
+        memcpy(all, &ex->warp_slots[base], count * sizeof(*all));
+    }
+    warp_wait(ex); /* every lane has read: records may be reused */
+    return count;
+}
+
+void ocu_cpu_warp_sync(void)
+{
+    (void)warp_meet(tl_exec, OCU_SYNC_TAG, 0, 0, NULL);
+}
+
+void ocu_cpu_warp_sync_masked(uint32_t mask)
+{
+    (void)warp_meet(tl_exec, OCU_SYNC_TAG ^ mask, mask, 0, NULL);
 }
 
 uint32_t ocu_cpu_warp_gather(uint64_t value, uint64_t *all)
@@ -817,20 +932,11 @@ uint32_t ocu_cpu_warp_gather(uint64_t value, uint64_t *all)
 
 uint32_t ocu_cpu_warp_gather_tagged(uint64_t value, uint64_t tag, uint64_t *all)
 {
-    block_exec *ex = tl_exec;
-    uint32_t me = ex->current;
-    uint32_t w = ex->warp_size;
-    uint32_t base = me - me % w;
-    uint32_t count = ex->nthreads - base < w ? ex->nthreads - base : w;
-    ex->warp_slots[me] = value;
-    ex->warp_tags[me] = tag;
-    ocu_cpu_warp_sync(); /* every lane has written */
-    for (uint32_t i = base; i < base + count; ++i) {
-        if (ex->fibers[i].state != FIBER_DONE && ex->warp_tags[i] != tag) {
-            ex->warp_mismatch = true;
-        }
-    }
-    memcpy(all, &ex->warp_slots[base], count * sizeof(*all));
-    ocu_cpu_warp_sync(); /* every lane has read: slots may be reused */
-    return count;
+    return warp_meet(tl_exec, tag, 0, value, all);
+}
+
+uint32_t ocu_cpu_warp_gather_masked(uint64_t value, uint64_t tag, uint32_t mask,
+                                    uint64_t *all)
+{
+    return warp_meet(tl_exec, tag, mask, value, all);
 }
