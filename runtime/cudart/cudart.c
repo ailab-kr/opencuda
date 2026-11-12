@@ -81,6 +81,8 @@ static pthread_once_t     g_init_once = PTHREAD_ONCE_INIT;
 static cudaError_t        g_init_error = cudaSuccess;
 
 static _Thread_local int         tl_device;
+/* Set while a cudaLaunchHostFunc callback runs on this thread. */
+static _Thread_local bool        tl_in_host_fn;
 static _Thread_local cudaError_t tl_last_error = cudaSuccess;
 
 /* ---- errors -------------------------------------------------------------- */
@@ -412,7 +414,9 @@ cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int *blocks, const voi
         *blocks = 0;
         return cudaSuccess;
     }
-    int by_threads = p.maxThreadsPerMultiProcessor / block_size;
+    /* Resources are given out in whole warps. */
+    int warps = (block_size + p.warpSize - 1) / p.warpSize;
+    int by_threads = p.maxThreadsPerMultiProcessor / (warps * p.warpSize);
     int by_smem = dynamic_smem ? (int)(p.sharedMemPerMultiprocessor / dynamic_smem) : by_threads;
     int n = by_threads < by_smem ? by_threads : by_smem;
     if (n > p.maxBlocksPerMultiProcessor) n = p.maxBlocksPerMultiProcessor;
@@ -580,6 +584,11 @@ static cudaError_t submit_begin(rt_device *d, cudaStream_t stream, submission *s
     sub->d = d;
     sub->q = NULL;
     sub->held = false;
+    if (tl_in_host_fn) {
+        /* The API forbids runtime calls from a host function; submitting
+           here would wait on itself. */
+        return set_error(cudaErrorNotPermitted);
+    }
     int sticky = atomic_load(&d->sticky);
     if (sticky != 0) {
         return set_error((cudaError_t)sticky);
@@ -642,6 +651,7 @@ static ocu_queue *queue_of(rt_device *d, cudaStream_t stream)
 static bool range_add(rt_device *d, void *p, size_t size, enum cudaMemoryType type);
 static void range_remove(rt_device *d, void *p);
 static bool range_find(rt_device *d, const void *p, size_t n, mem_range *out);
+static bool range_overlaps(rt_device *d, const void *p, size_t n);
 
 static cudaError_t device_alloc(void **ptr, size_t size, enum cudaMemoryType type)
 {
@@ -651,7 +661,7 @@ static cudaError_t device_alloc(void **ptr, size_t size, enum cudaMemoryType typ
     if (ptr == NULL) return set_error(cudaErrorInvalidValue);
     ocu_status st = g_backend->mem_alloc(d->dev, size, ptr);
     if (st != OCU_OK) return from(st);
-    if (!range_add(d, *ptr, size, type)) {
+    if (*ptr != NULL && !range_add(d, *ptr, size, type)) {
         (void)g_backend->mem_free(d->dev, *ptr);
         *ptr = NULL;
         return set_error(cudaErrorMemoryAllocation);
@@ -686,8 +696,14 @@ cudaError_t cudaFree(void *ptr)
     rt_device *d;
     cudaError_t e = current(&d);
     if (e != cudaSuccess) return set_error(e);
+    /* Forget the range first: once freed, another thread may get the same
+       address. Put it back if the backend refuses the free. */
+    mem_range r;
+    bool known = ptr != NULL && range_find(d, ptr, 1, &r) && r.base == (char *)ptr &&
+                 r.type != cudaMemoryTypeHost;
+    if (known) range_remove(d, ptr);
     ocu_status st = g_backend->mem_free(d->dev, ptr); /* waits for queued work */
-    if (st == OCU_OK && ptr != NULL) range_remove(d, ptr);
+    if (st != OCU_OK && known) (void)range_add(d, r.base, r.size, r.type);
     return from(st);
 }
 
@@ -710,8 +726,8 @@ cudaError_t cudaHostRegister(void *ptr, size_t size, unsigned int flags)
     if (!info.supports_unified_memory || (flags & cudaHostRegisterIoMemory)) {
         return set_error(cudaErrorNotSupported);
     }
-    mem_range r;
-    if (range_find(d, ptr, 1, &r) || range_find(d, (char *)ptr + size - 1, 1, &r)) {
+    if (size > UINTPTR_MAX - (uintptr_t)ptr) return set_error(cudaErrorInvalidValue);
+    if (range_overlaps(d, ptr, size)) {
         return set_error(cudaErrorHostMemoryAlreadyRegistered);
     }
     if (!range_add(d, ptr, size, cudaMemoryTypeHost)) return set_error(cudaErrorMemoryAllocation);
@@ -835,6 +851,20 @@ static bool range_find(rt_device *d, const void *p, size_t n, mem_range *out)
     return found;
 }
 
+/* True when [p, p + n) shares a byte with any recorded range. */
+static bool range_overlaps(rt_device *d, const void *p, size_t n)
+{
+    uintptr_t a = (uintptr_t)p, b = a + n;
+    bool hit = false;
+    pthread_mutex_lock(&d->lock);
+    for (size_t i = 0; i < d->range_count && !hit; ++i) {
+        uintptr_t ra = (uintptr_t)d->ranges[i].base, rb = ra + d->ranges[i].size;
+        hit = a < rb && ra < b;
+    }
+    pthread_mutex_unlock(&d->lock);
+    return hit;
+}
+
 static bool pinned_contains(rt_device *d, const void *p, size_t n)
 {
     mem_range r;
@@ -849,7 +879,7 @@ cudaError_t cudaMallocHost(void **ptr, size_t size)
     if (ptr == NULL) return set_error(cudaErrorInvalidValue);
     ocu_status st = g_backend->host_alloc_pinned(d->dev, size, ptr);
     if (st != OCU_OK) return from(st);
-    if (!range_add(d, *ptr, size, cudaMemoryTypeHost)) {
+    if (*ptr != NULL && !range_add(d, *ptr, size, cudaMemoryTypeHost)) {
         (void)g_backend->host_free_pinned(d->dev, *ptr);
         *ptr = NULL;
         return set_error(cudaErrorMemoryAllocation);
@@ -1216,7 +1246,11 @@ cudaError_t cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void *user_
     e = submit_begin(d, stream, &sub);
     if (e != cudaSuccess) return e;
     ocu_status st = g_backend->queue_sync(sub.q);
-    if (st == OCU_OK) fn(user_data);
+    if (st == OCU_OK) {
+        tl_in_host_fn = true;
+        fn(user_data);
+        tl_in_host_fn = false;
+    }
     submit_end(&sub);
     return dev_result(d, st);
 }

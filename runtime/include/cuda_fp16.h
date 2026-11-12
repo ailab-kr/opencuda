@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <type_traits>
 
 #ifndef __host__
 #define __host__
@@ -116,13 +117,15 @@ struct __half {
     constexpr __half(__half_raw r) : __x(r.x) {}
     __half(float f) : __x(ocu_fp16::from_double(f, ocu_fp16::round::nearest_even)) {}
     __half(double d) : __x(ocu_fp16::from_double(d, ocu_fp16::round::nearest_even)) {}
-    __half(int i) : __x(ocu_fp16::from_double(i, ocu_fp16::round::nearest_even)) {}
-    __half(unsigned i) : __x(ocu_fp16::from_double(i, ocu_fp16::round::nearest_even)) {}
-    __half(long long i) : __x(ocu_fp16::from_double(double(i), ocu_fp16::round::nearest_even)) {}
+    /* Any integer type (h = 0; __half g = n;), rounded to nearest even. */
+    template <typename I, typename = std::enable_if_t<std::is_integral_v<I>>>
+    __half(I i) : __x(ocu_fp16::from_double(static_cast<double>(i), ocu_fp16::round::nearest_even)) {}
     operator float() const { return ocu_fp16::to_float(__x); }
     operator __half_raw() const { return __half_raw{__x}; }
     __half &operator=(float f) { return *this = __half(f); }
     __half &operator=(double d) { return *this = __half(d); }
+    template <typename I, typename = std::enable_if_t<std::is_integral_v<I>>>
+    __half &operator=(I i) { return *this = __half(i); }
 };
 
 struct __half2 {
