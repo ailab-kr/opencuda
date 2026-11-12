@@ -9,7 +9,7 @@ CPU and NVIDIA backends work; an Apple GPU backend with a CUDA-to-MSL
 translator works in a first cut; the Runtime API subset runs unmodified
 Rodinia programs; the BLAS layer passes 537 of 537 reference cases on the CPU
 backend; the conformance harness, result format and scoreboard exist. See
-README.md for measured numbers.
+[README.md](../../README.md) for measured numbers.
 
 ## Next
 
