@@ -24,6 +24,8 @@ Headers: `compiler/probe/probe_defs.h` (GPU targets) and `compiler/probe/probe_c
 | 7 | `probe_features.cu` for NVIDIA, gfx1100, gfx1201 | OK: 5 kernels on each target |
 | 8 | CPU path: rewrite, compile as C++17, run on the CPU backend | OK: all three files give correct results in fixed and random thread order (test `probe_cpu`) |
 | 9 | `probe_review.cu` (patterns from the independent review) for sm_80 and gfx1201 | OK: 4 kernels on each |
+| 10 | `probe_warp.cu` (shuffle up/down/xor/idx, ballot, any, all, `__syncwarp`) for sm_80, gfx1100, gfx1201, and on the CPU path with warp size 32 and 64 | OK: 3 kernels on each GPU target, correct results on the CPU |
+| 11 | CUDA version pinned with our own one-line version marker | OK: clang reports CUDA 12.3, emits PTX 8.3, and the launch uses `__cudaPushCallConfiguration`, `__cudaPopCallConfiguration`, `cudaLaunchKernel` |
 
 Launch symbols the compiler emits calls to:
 
@@ -74,13 +76,13 @@ Features those files use that the CPU path does not support yet (number of files
 ## CPU path limits found so far
 
 - Kernels launched from inside a kernel (dynamic parallelism) are refused with "not supported".
-- Warp-level operations (shuffles, votes) are not in the probe yet. They need lock-step emulation across the fibers of one warp.
+- Warp-level operations work through a warp barrier and a gather primitive in the backend (`ocu_cpu_warp_gather`). The `mask` argument is not used: every live lane takes part, as code written with a full mask expects. Ballot returns the low 32 lanes, so code that assumes 32-lane ballots sees AMD-style 64-lane warps as they are (the warp-64 test shows it).
 - A literal `0` passed for a pointer parameter does not convert after being copied (an int is passed); `NULL` is rewritten to `nullptr` and works.
 - The stream argument of a launch is accepted and ignored: the probe runs every launch synchronously.
 
 ## Open questions
 
-- Which version file and contents make clang 18 use the newer launch ABI (`__cudaPushCallConfiguration` / `cudaLaunchKernel`) with a `--cuda-path` we own?
+- Answered: clang 18 reads `CUDA_VERSION` from `<cuda-path>/include/cuda.h` (`version.txt` and `version.json` are ignored). A folder we own with a one-line marker (`#define CUDA_VERSION 12030`) pins the newer launch ABI and PTX 8.3; nothing else in it is read under `-nocudainc -nocudalib`. `run_probe.sh` generates it at run time. Whether the file name may be used this way is an open question.
 - Does clang 18 accept everything the five Rodinia programs use (P0-W1-07)? The probe covered only indexing, shared memory and a barrier.
 - Newer LLVM (19, 20) changes: worth testing before fixing the toolchain version.
 - How much of `__clang_cuda_*` (Apache-2.0 with LLVM exception) can we reuse for the NVIDIA target versus writing our own? Licence allows it; add it to `docs/third-party.md` if used.
