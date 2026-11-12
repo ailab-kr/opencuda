@@ -139,8 +139,18 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   target_link_libraries(ocu_cc_saxpy PRIVATE ocu_core ocu_backend_cpu)
   add_test(NAME ocu_cc_cpu_saxpy COMMAND ocu_cc_saxpy)
 
+  # GPU-target compiles need an LLVM clang with the NVPTX and AMDGPU
+  # back ends (Apple's clang has neither).
   find_program(OCU_CLANGXX NAMES clang++-18 clang++ PATHS /usr/lib/llvm-18/bin)
+  set(OCU_CLANG_GPU_TARGETS OFF)
   if(OCU_CLANGXX)
+    execute_process(COMMAND ${OCU_CLANGXX} --print-targets
+                    OUTPUT_VARIABLE _ocu_targets ERROR_QUIET)
+    if(_ocu_targets MATCHES "nvptx64" AND _ocu_targets MATCHES "amdgcn")
+      set(OCU_CLANG_GPU_TARGETS ON)
+    endif()
+  endif()
+  if(OCU_CLANG_GPU_TARGETS)
     foreach(t "nvidia;sm_80;ptx" "amd;gfx1100;co" "amd;gfx1201;co")
       list(GET t 0 target)
       list(GET t 1 arch)

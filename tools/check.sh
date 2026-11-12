@@ -94,12 +94,17 @@ fi
 # 4. Conformance harness unit tests.
 step harness sh -c "cd '$repo/conformance/harness' && python3 -m unittest discover -s tests"
 
-# 5. Compiler probe: every target must compile.
-if command -v clang++ >/dev/null 2>&1; then
+# 5. Compiler probe: every target must compile (needs an LLVM clang with the
+#    NVPTX and AMDGPU back ends; skipped, and said so, when there is none).
+if command -v clang++ >/dev/null 2>&1 &&
+   clang++ --print-targets 2>/dev/null | grep -q nvptx64 &&
+   clang++ --print-targets 2>/dev/null | grep -q amdgcn; then
     step compiler_probe sh -c "
         sh '$repo/compiler/probe/run_probe.sh' '$root/probe' > '$root/probe.txt' 2>&1
         cat '$root/probe.txt'
         ! grep -q 'result: FAILED' '$root/probe.txt'"
+else
+    echo "SKIP  compiler_probe  (no clang with NVPTX and AMDGPU targets)"
 fi
 
 # 6. Clean-room guard: no vendor SDK paths in any compile command or
