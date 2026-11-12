@@ -1,0 +1,7 @@
+# ThreadSanitizer suppressions for CUDA idioms in the test programs that the
+# nvcc-compatible driver builds in sanitizer builds (tests/CMakeLists.txt).
+#
+# rt_api.cu: a kernel spins on a volatile flag in pinned host memory that
+# the host sets later (host-to-kernel signal, as CUDA programs write it).
+# volatile is not synchronisation in C++, so ThreadSanitizer reports it.
+race:test_streams_and_events

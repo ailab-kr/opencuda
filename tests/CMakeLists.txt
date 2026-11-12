@@ -544,7 +544,21 @@ if(OCU_BACKEND_CPU AND Python3_FOUND AND NOT WIN32 AND NOT CMAKE_CROSSCOMPILING)
   add_test(NAME ocu_nvcc_options
     COMMAND ${Python3_EXECUTABLE} -m unittest -v test_ocu_nvcc
     WORKING_DIRECTORY ${_drv})
-  set_tests_properties(ocu_nvcc_options PROPERTIES ENVIRONMENT "OCU_NVCC=${OCU_NVCC};OCU_TARGET=cpu")
+  # Sanitizer builds: the toolkit's libraries are instrumented, so programs
+  # the driver builds must be too (Clang reads CCC_OVERRIDE_OPTIONS; "#"
+  # keeps it quiet). The test programs' volatile host-flag waits (the CUDA
+  # idiom for host-to-kernel signals) are races in C++ terms: suppressed.
+  set(_ocu_san_env)
+  string(REGEX MATCH "-fsanitize=[a-z,]+" _ocu_san "${CMAKE_CXX_FLAGS}")
+  if(_ocu_san)
+    list(APPEND _ocu_san_env "CCC_OVERRIDE_OPTIONS=#+${_ocu_san}")
+    if(_ocu_san MATCHES "thread")
+      list(APPEND _ocu_san_env
+        "TSAN_OPTIONS=halt_on_error=1 suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tsan_cuda_idioms.supp")
+    endif()
+  endif()
+  set_tests_properties(ocu_nvcc_options PROPERTIES ENVIRONMENT
+    "OCU_NVCC=${OCU_NVCC};OCU_TARGET=cpu;${_ocu_san_env}")
 
   # The runtime test programs, compiled one file at a time and linked, as a
   # Makefile drives nvcc.
@@ -564,11 +578,11 @@ if(OCU_BACKEND_CPU AND Python3_FOUND AND NOT WIN32 AND NOT CMAKE_CROSSCOMPILING)
   endif()
   foreach(target IN LISTS _ocu_nvcc_targets)
     set(_wrap)
-    set(_env)
+    set(_env ${_ocu_san_env})
     if(target STREQUAL "nvidia")
       # Skipped (exit 77) without a usable NVIDIA device.
       set(_wrap -DRUN_WRAPPER=$<TARGET_FILE:run_if_nvidia>)
-      set(_env "ASAN_OPTIONS=detect_leaks=0")
+      list(APPEND _env "ASAN_OPTIONS=detect_leaks=0")
     endif()
     foreach(p IN LISTS _ocu_nvcc_programs)
       string(REPLACE "|" ";" p "${p}")
@@ -607,8 +621,9 @@ if(OCU_BACKEND_CPU AND Python3_FOUND AND NOT WIN32 AND NOT CMAKE_CROSSCOMPILING)
             "-DCFLAGS=${CMAKE_C_FLAGS}" "-DCXXFLAGS=${CMAKE_CXX_FLAGS}"
             "-DLDFLAGS=${CMAKE_EXE_LINKER_FLAGS}"
             -P ${_drv}/cmake_project_test.cmake)
+endif()
 
-# ---- operator table (docs/spec/op-table.md) ------------------------------
+# ---- operator table (docs/spec/op-table.md)------------------------------
 # test_ops <backend>: conformance of one backend's operator table.
 # test_npusim <mode>: the npusim profile (spec section 7), one entry per
 # environment. op_support_table: writes the support table as markdown.
