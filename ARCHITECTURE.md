@@ -42,6 +42,7 @@ compiler/         runtime/         libs/
 | `backends/interface/` | 장치 연결 층 규격 `ocu_backend.h` | 초안 있음 |
 | `backends/cpu/` | CPU 기준 구현 | 규격 함수 26개 전부 |
 | `backends/amd/`, `backends/intel/` | 칩별 구현 | 없음 |
+| `backends/opencl/` | OpenCL 2.0 이상 장치(공유 가상 메모리, SPIR-V 또는 C++ for OpenCL). 장치 코드는 `compiler/opencl/cu2ocl.py` | 1차 구현, CPU용 OpenCL(PoCL)에서 시험 통과 |
 | `runtime/core/` | 백엔드 등록과 선택 | 있음 |
 | `runtime/include/` | 사용자 프로그램이 보는 헤더: `cuda_runtime_api.h`·`cuda_runtime.h`·`cuda.h`·`cuda_fp16.h`, 벡터 형, CPU 경로 언어 지원 `ocu_cuda_lang_cpu.h` | 함수 80여 개 |
 | `runtime/cudart/` | 실행 API 구현(`ocu_cudart`): 장치·오류·메모리·스트림·사건·실행. 백엔드 규격만 부른다 | 있음 |
@@ -192,6 +193,8 @@ GPU 코드를 CPU에서 그대로 실행한다. 속도가 아니라 정확성 �
 | `OCU_CPU_THREADS` | 정수 | 실행 한 번에 쓰는 OS 스레드 수. 기본 코어 수 | 동작 |
 | `OCU_CPU_STACK_KB` | 정수 | 파이버 스택 크기. 기본 128 | 동작 |
 | `OCU_CPU_STRICT` | `1` | 동기화 전에 끝난 스레드를 오류로 | 동작 |
+| `OCU_OPENCL_LIBRARY` | 파일 경로 | OpenCL 백엔드가 여는 라이브러리. 없으면 `libOpenCL.so.1` | 동작 |
+| `OCU_OPENCL_VERBOSE` | `1` | 빠진 장치의 이유, 빌드 실패 기록 | 동작 |
 | `OCU_LOG` | `0`~`3` | 기록 수준 | 예정 |
 
 ## 9. 빌드 대상
@@ -214,7 +217,7 @@ GPU 코드를 CPU에서 그대로 실행한다. 속도가 아니라 정확성 �
 
 설치: `cmake --install <빌드 폴더> --prefix <위치>`가 라이브러리, 공개 헤더(한 폴더에 모아 `<cuda_runtime.h>`가 우리 것을 찾게 함), CPU 경로 드라이버, CMake 패키지를 놓는다. 다른 프로젝트는 `find_package(Ocu)` 뒤 `ocu::cudart`와 `ocu_add_cpu_cu_executable()`를 쓴다.
 
-빌드 옵션: `OCU_BACKEND_CPU`(기본 켬), `OCU_BACKEND_AMD`, `OCU_BACKEND_INTEL`(아직 없음, 켜면 오류), `OCU_BUILD_TESTS`(기본 켬), `OCU_CPU_UCONTEXT`(기본 끔).
+빌드 옵션: `OCU_BACKEND_CPU`(기본 켬), `OCU_BACKEND_AMD`, `OCU_BACKEND_INTEL`(아직 없음, 켜면 오류), `OCU_BACKEND_OPENCL`(리눅스에서 기본 켬), `OCU_BUILD_TESTS`(기본 켬), `OCU_CPU_UCONTEXT`(기본 끔).
 
 전체 검증은 `tools/check.sh` 하나로 한다. gcc·clang 빌드(경고는 실패), 주소·정의되지 않은 동작·스레드 검사, ARM64 교차 빌드와 에뮬레이터(qemu-user) 실행(도구가 있을 때), 채점기 시험, 컴파일러 실험, 클린룸 점검을 돈다.
 
