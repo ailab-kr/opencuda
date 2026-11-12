@@ -58,10 +58,13 @@ if command -v clang >/dev/null 2>&1; then
 fi
 
 # 3. Sanitizers (clang): address + undefined, then thread.
+# Leak detection is not available in Apple's address sanitizer.
+leaks=1
+[ "$(uname -s)" = "Darwin" ] && leaks=0
 if [ "$quick" -eq 0 ] && command -v clang >/dev/null 2>&1; then
     for san in address,undefined thread; do
         tag=$(echo "$san" | tr ',' '_')
-        step "sanitize_$tag" env ASAN_OPTIONS=detect_leaks=1 \
+        step "sanitize_$tag" env ASAN_OPTIONS=detect_leaks=$leaks \
             TSAN_OPTIONS=halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
             sh -c "$(cat <<EOF
 set -e
