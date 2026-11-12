@@ -1,11 +1,14 @@
 # Security policy
 
+**English** · [한국어](SECURITY.ko.md)
+
 > DRAFT for review.
 
 ## Reporting a vulnerability
 
 Please do not open a public issue for a security problem. Use the repository's
-private vulnerability reporting (the "Security" tab, "Report a vulnerability"). Include the affected version or commit, the
+private vulnerability reporting (the "Security" tab, "Report a vulnerability"). Include the
+affected version or commit, the
 platform and backend, what you observed, and a way to reproduce it.
 
 We aim to acknowledge a report within [3] working days, give an assessment

@@ -1,17 +1,19 @@
 # Governance
 
+**English** · [한국어](GOVERNANCE.ko.md)
+
 > DRAFT for review. Bracketed items (`[...]`) are decisions still to be made.
 
 ## 1. Purpose
 
-PROJECT_NAME exists to let CUDA C++ programs run on any chip whose maker
+OpenCuda exists to let CUDA C++ programs run on any chip whose maker
 provides a backend, and to measure how well each does so with a public,
-vendor-neutral test suite. The project is a shared piece of infrastructure.
+vendor-neutral test suite. OpenCuda is a shared piece of infrastructure.
 No single vendor, including any contributor's employer, controls it.
 
 ## 2. Steward
 
-The project is stewarded by a neutral non-profit organisation
+OpenCuda is stewarded by a neutral non-profit organisation
 [name of the steward, to be decided]. The steward:
 
 - holds the project name, domains and any trademarks, and the copyright

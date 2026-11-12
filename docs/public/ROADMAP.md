@@ -1,15 +1,28 @@
 # Roadmap
 
+**English** · [한국어](ROADMAP.ko.md)
+
 > DRAFT for review. No dates are promised; items are ordered by intent, and
 > each has an exit measure so progress can be checked.
 
 ## Where we are
 
-CPU and NVIDIA backends work; an Apple GPU backend with a CUDA-to-MSL
-translator works in a first cut; the Runtime API subset runs unmodified
-Rodinia programs; the BLAS layer passes 537 of 537 reference cases on the CPU
-backend; the conformance harness, result format and scoreboard exist. See
-[README.md](../../README.md) for measured numbers.
+Measured so far (details in [README.md](../../README.md)):
+
+- llama.cpp (about 150 CUDA source files) builds unmodified; its operator test
+  passes 15,894 / 15,894 on the CPU path and on the NVIDIA GPU path.
+- The BLAS-compatible library passes 1,395 / 1,395 cases on CPU and GPU, and
+  the CUB subset passes 5,500 independent checks.
+- Backends: CPU (reference) and NVIDIA GPU work; the Apple GPU (Metal)
+  backend is a first cut (backend tests 53 / 53; the CUDA to Metal Shading
+  Language translator handles 35 of 79 Rodinia kernels); the OpenCL backend
+  works on PoCL (103 / 103 tests); the NPU simulator is a design target. AMD
+  and Intel GPUs have device code that compiles but no runtime backend yet.
+- Rodinia (18 CUDA programs, unmodified): 17 build and 14 match an
+  independent reference.
+- Check suites: Linux 204 / 204, macOS 116 / 116, Windows 10 37 / 38
+  (1 skipped).
+- The conformance harness, result format and scoreboard exist.
 
 ## Next
 
