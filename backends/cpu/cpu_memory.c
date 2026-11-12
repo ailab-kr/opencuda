@@ -117,10 +117,14 @@ static ocu_status tracked_alloc(alloc_table *t, size_t bytes, void **ptr)
         return OCU_OK;
     }
     /* Round up so the size is a multiple of the alignment. */
-    if (bytes > SIZE_MAX - CPU_ALLOC_ALIGN) {
+    if (bytes > SIZE_MAX - 2u * CPU_ALLOC_ALIGN) {
         return OCU_ERR_OUT_OF_MEMORY;
     }
-    size_t rounded = (bytes + CPU_ALLOC_ALIGN - 1) & ~(size_t)(CPU_ALLOC_ALIGN - 1);
+    /* Plus one untracked alignment unit at the end: no other allocation can
+     * start right after this one, so a pointer just past it is never a
+     * valid device pointer (range checks reject it). */
+    size_t rounded = ((bytes + CPU_ALLOC_ALIGN - 1) & ~(size_t)(CPU_ALLOC_ALIGN - 1)) +
+                     CPU_ALLOC_ALIGN;
     void *mem = NULL;
     if ((mem = cpu_os_aligned_alloc(CPU_ALLOC_ALIGN, rounded)) == NULL) {
         return OCU_ERR_OUT_OF_MEMORY;
