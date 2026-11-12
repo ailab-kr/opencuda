@@ -22,6 +22,7 @@ empty="$out/empty-cuda-path"
 rm -rf "$out"
 mkdir -p "$out" "$empty"
 src="$here/probe_kernel.cu"
+features="$here/probe_features.cu"
 clean="-nocudainc -nocudalib --cuda-path=$empty -Wno-unknown-cuda-version"
 hipclean="-nogpuinc -nogpulib"
 
@@ -65,6 +66,21 @@ if run amd_host clang++ -x hip $hipclean --offload-arch=gfx1201 \
         --cuda-host-only -c -o "$out/h_amd.o" "$src"; then
     nm -u "$out/h_amd.o" | sed 's/^/  /'
 fi
+
+step "7. probe_features.cu (templates, 2-D, extern shared, atomics) for every target"
+if run feat_nv clang++ -x cuda $clean --cuda-gpu-arch=sm_80 \
+        --cuda-device-only -S -o "$out/f_nv.ptx" "$features"; then
+    echo "  NVIDIA kernels: $(grep -cE '\.entry' "$out/f_nv.ptx")"
+fi
+for arch in gfx1100 gfx1201; do
+    if run "feat_$arch" clang++ -x hip $hipclean --offload-arch="$arch" \
+            --cuda-device-only --no-gpu-bundle-output -c \
+            -o "$out/f_$arch.o" "$features"; then
+        echo "  $arch kernels: $(llvm-nm "$out/f_$arch.o" | grep -c ' T ')"
+    fi
+done
+run feat_host clang++ -x cuda $clean --cuda-gpu-arch=sm_80 \
+    --cuda-host-only -c -o "$out/f_host.o" "$features"
 
 step "5. Plain C++ for the CPU backend: is the launch syntax accepted?"
 clang++ -x c++ -std=c++17 -fdeclspec -fsyntax-only "$src" 2>&1 \

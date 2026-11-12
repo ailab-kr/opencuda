@@ -8,6 +8,12 @@
  * those names is outside the scope of this probe.
  */
 #pragma once
+
+#if defined(OCU_CPU_PATH)
+/* CPU path: the file was rewritten by cpu_rewrite.py and is plain C++. */
+#include "probe_cpu.h"
+#else
+
 #include <stddef.h>
 
 #define __global__   __attribute__((global))
@@ -15,6 +21,8 @@
 #define __host__     __attribute__((host))
 #define __shared__   __attribute__((shared))
 #define __constant__ __attribute__((constant))
+#define __forceinline__ __inline__ __attribute__((always_inline))
+#define __align__(n) __attribute__((aligned(n)))
 
 struct dim3 {
     unsigned x, y, z;
@@ -64,6 +72,14 @@ PROBE_INDEX_VAR(probe_bdim_t, blockDim, PROBE_BDIM)
 static inline __device__ void __syncthreads() { PROBE_BARRIER(); }
 #endif
 
+/* ---- atomics -------------------------------------------------------- */
+
+template <typename T>
+static inline __device__ T atomicAdd(T *addr, T v)
+{
+    return __atomic_fetch_add(addr, v, __ATOMIC_RELAXED);
+}
+
 /* ---- launch ABI the compiler calls into ---------------------------- */
 
 typedef struct probe_stream *probe_stream_t;
@@ -87,3 +103,5 @@ extern "C" int cudaLaunchKernel(const void *func, dim3 grid, dim3 block,
                                 void **args, size_t shm,
                                 probe_stream_t stream);
 #endif
+
+#endif /* OCU_CPU_PATH */
