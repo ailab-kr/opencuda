@@ -4,7 +4,12 @@ Date: 2026-11-12 · Toolchain: Ubuntu clang 18.1.3 (WSL2, Ubuntu 24.04) · Scrip
 
 Question: can the open-source compiler build an unmodified `.cu` file for NVIDIA, AMD and the CPU using only headers we write, with no vendor SDK headers or libraries?
 
-Input: `compiler/probe/probe_kernel.cu`. Two kernels (`saxpy`, and a block reduction using shared memory and `__syncthreads`) plus one host function that launches with `<<<...>>>`. Headers: `compiler/probe/probe_defs.h`, written for the probe.
+Inputs, compiled unchanged on every path:
+
+- `compiler/probe/probe_kernel.cu`: two kernels (`saxpy`, and a block reduction using a static `__shared__` array and `__syncthreads`) plus one host function that launches with `<<<...>>>`.
+- `compiler/probe/probe_features.cu`: a template kernel with two instantiations and a `__device__` helper, 2-D grid and block, `extern __shared__` with a barrier, `atomicAdd` across blocks, a struct argument by value, a globally qualified kernel name, a launch spread over several lines, and `<<<...>>>` inside a comment and a string.
+
+Headers: `compiler/probe/probe_defs.h` (GPU targets) and `compiler/probe/probe_cpu.h` (CPU path), written for the probe.
 
 ## Results
 
@@ -16,6 +21,8 @@ Input: `compiler/probe/probe_kernel.cu`. Two kernels (`saxpy`, and a block reduc
 | 4 | Host pass, HIP mode | OK; the launch needs 7 runtime symbols (below) |
 | 5 | Plain C++ (for a CPU backend) | Fails: `<<<...>>>` does not parse |
 | 6 | Kernel bodies in the host pass | Not emitted; only `__device_stub__*` |
+| 7 | `probe_features.cu` for NVIDIA, gfx1100, gfx1201 | OK: 5 kernels on each target |
+| 8 | CPU path: rewrite, compile as C++17, run on the CPU backend | OK: both files give correct results in fixed and random thread order (test `probe_cpu`) |
 
 Launch symbols the compiler emits calls to:
 
@@ -36,9 +43,16 @@ Launch symbols the compiler emits calls to:
    - b. Compile the device side for a CPU target through an offload toolchain (needs research, may not exist for this use).
    - c. Build a small clang plugin that emits host bodies for `__global__` functions.
 
-   Option a is the smallest and is the current lean. It needs a reliable tokenizer, not a regex, to avoid touching `<<<` inside strings, comments or templates.
+   Option a is implemented in the probe (`compiler/probe/cpu_rewrite.py`, 11 unit tests). It rewrites only the launch syntax and `extern __shared__` declarations, never inside comments, strings, raw strings or preprocessor lines, and keeps line numbers. The rewritten launch goes through the backend interface: one module per kernel signature holding a trampoline that unpacks the copied arguments. Static `__shared__` arrays become `static thread_local`, which is correct because one block's threads share one OS thread.
 6. **Clean-room guard is required.** This machine has a vendor CUDA installation at `/usr/local/cuda` (13.3), and clang finds it automatically. `-nocudainc` alone stops header inclusion, but our driver and build must always pass `--cuda-path=<a folder we own>` and `-nocudainc -nocudalib`. A CI check should fail if any vendor path appears in compiler command lines or dependency files.
 7. **Toolchain gap.** Ubuntu's clang-18 package does not ship `clang-offload-bundler`, so a multi-target fat binary did not build. We can embed per-target code objects ourselves (we own the registration format), or install a fuller LLVM. Decide in P0-W4.
+
+## CPU path limits found so far
+
+- Kernels launched from inside a kernel (dynamic parallelism) are refused with "not supported".
+- Warp-level operations (shuffles, votes) are not in the probe yet. They need lock-step emulation across the fibers of one warp.
+- Overloaded kernel names are ambiguous for the rewritten launch. Not seen yet in real code; Rodinia will tell.
+- The stream argument of a launch is accepted and ignored: the probe runs every launch synchronously.
 
 ## Open questions
 
