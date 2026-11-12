@@ -2,20 +2,28 @@
 """PTX shift semantics for device code (ocu_cc.py --ptx-shift).
 
 C++ leaves a shift by the operand's width or more undefined (and a shift
-by a negative amount). PTX defines it (PTX ISA 9.5, 9.7.9.8 "Logic and
-Shift Instructions: shl" and 9.7.9.9 "...: shr"; 9.4: the amount operand
-is always .u32): the shift amount is unsigned and
-amounts larger than the register width are clamped to the width, so `shl`
-gives 0, `shr.u` gives 0 and `shr.s` fills with the sign bit. Programs
-written for NVIDIA GPUs sometimes depend on that. With this option the
-integer shifts in device functions get those semantics on every path:
+by a negative amount). PTX defines it (PTX ISA 8.5, 9.7.7.8 "Logic and
+Shift Instructions: shl" and 9.7.7.9 "...: shr"; 9.7.9.8/9.7.9.9 in ISA
+9.5; 9.4: the amount operand is always .u32): the shift amount is
+unsigned and amounts larger than the register width are clamped to the
+width, so `shl` gives 0, `shr.u` gives 0 and `shr.s` fills with the sign
+bit. Programs written for NVIDIA GPUs sometimes depend on that. With this
+option the integer shifts in device functions get those semantics on every
+path. Only the left operand is wrapped; the operator stays:
 
-    a << b    ->  __ocu_shl(a , b)
-    a >> b    ->  __ocu_shr(a , b)
-    a <<= b   ->  __ocu_shl_assign(a , b)
-    a >>= b   ->  __ocu_shr_assign(a , b)
+    a << b    ->  __ocu_shift_lhs(a) << b
+    a >> b    ->  __ocu_shift_lhs(a) >> b
+    a <<= b   ->  __ocu_shift_ref(a) <<= b
+    a >>= b   ->  __ocu_shift_ref(a) >>= b
 
-(helpers in runtime/include/ocu_ptx_shift.h). What is rewritten:
+(runtime/include/ocu_ptx_shift.h). The wrapper's member operators do the
+PTX shift. Because the operator is still written as an operator, the
+operands keep the built-in order (ISO C++17 [over.match.oper]/2: operator
+notation is sequenced as the built-in operator; [expr.shift]/4: the left
+operand of << and >> first; [expr.ass]/1: the right operand of <<= and >>=
+first). A function call `f(a, b)` would leave that order unspecified.
+
+What is rewritten:
 
   - the built-in shift operators in the bodies of functions declared
     __global__ or __device__ (also __host__ __device__: one source text,
@@ -27,13 +35,17 @@ integer shifts in device functions get those semantics on every path:
     folder (or below): those are copied into the work folder, rewritten
     there, with a #line marker naming the original. Line numbers are kept.
 
-A shift whose operands are spelled in a macro body is rewritten in that
-body when the whole expression is (then every use of the macro gets the
-helpers, host uses included). A shift split between a macro and the file
-(an operand passed into a macro, or an operand that is a macro) is left as
-written and reported, like shifts in device code in files outside the
-source's folder, and compound shifts of bit-fields (no reference binds to
-them). Host functions are never changed.
+Macros: a shift whose operands begin and end, and whose operator is, in one
+macro body (`#define SHL(a, b) ((a) << (b))`: the parentheses are the
+body's; `#define W (v << n)`) is rewritten in that body. Only tokens of the
+body change, so the rewrite is right for every expansion; every use of the
+macro then gets the PTX semantics, host uses included. Not rewritten, and
+reported: a shift whose operand begins or ends at a macro argument or
+anywhere other than the operator's place (`#define SH(x) x << k`, an operand
+that is itself a macro: `x << AMOUNT`), a macro body used in an #if or #elif
+line (the preprocessor cannot call the wrapper), shifts in device code in
+files outside the source's folder, and compound shifts of bit-fields (no
+reference binds to them). Host functions are never changed.
 
 The device functions and shifts are found in Clang's typed syntax tree
 (JSON) of the translation unit, as compiler/metal/cu2msl.py does; the edits
@@ -50,8 +62,8 @@ import threading
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-HELPER = {"<<": "__ocu_shl", ">>": "__ocu_shr",
-          "<<=": "__ocu_shl_assign", ">>=": "__ocu_shr_assign"}
+HELPER = {"<<": "__ocu_shift_lhs", ">>": "__ocu_shift_lhs",
+          "<<=": "__ocu_shift_ref", ">>=": "__ocu_shift_ref"}
 HEADER = "ocu_ptx_shift.h"
 DEVICE_ATTRS = ("CUDAGlobalAttr", "CUDADeviceAttr")
 FUNCTIONS = ("FunctionDecl", "CXXMethodDecl", "CXXConstructorDecl", "CXXDestructorDecl",
@@ -207,11 +219,30 @@ def _is_bitfield(e, fields: set[str]) -> bool:
 
 
 class Shift:
-    __slots__ = ("file", "begin", "op_begin", "op_end", "end", "helper")
+    """One rewrite: the left operand [begin, lhs_end) is wrapped in helper()."""
+    __slots__ = ("file", "begin", "lhs_end", "helper")
 
-    def __init__(self, file, begin, op_begin, op_end, end, helper):
-        self.file, self.begin, self.end = file, begin, end
-        self.op_begin, self.op_end, self.helper = op_begin, op_end, helper
+    def __init__(self, file, begin, lhs_end, helper):
+        self.file, self.begin, self.lhs_end, self.helper = file, begin, lhs_end, helper
+
+
+_DEFINE = re.compile(r"[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)")
+
+
+def _macro_at(text: str, offset: int) -> str | None:
+    """Name of the macro whose #define (with its continuation lines) holds
+    `offset`, or None."""
+    start = text.rfind("\n", 0, offset) + 1
+    while start > 1 and text[:start - 1].rstrip("\r").endswith("\\"):  # a continuation
+        start = text.rfind("\n", 0, start - 1) + 1
+    m = _DEFINE.match(text, start)
+    return m.group(1) if m else None
+
+
+def _in_conditional(name: str, texts) -> bool:
+    """True when `name` appears on an #if or #elif line of one of `texts`."""
+    pat = re.compile(r"^[ \t]*#[ \t]*(?:el)?if\b[^\n]*\b" + re.escape(name) + r"\b", re.M)
+    return any(pat.search(t) for t in texts)
 
 
 def find_shifts(tu, copies: dict, ignored, fields: set[str] | None = None
@@ -277,6 +308,13 @@ def find_shifts(tu, copies: dict, ignored, fields: set[str] | None = None
                         and len({p[4] for p in pts}) == 1):
                     note(where, at, "partly in a macro")
                     continue
+                name = _macro_at(copies[real][1], pts[0][1])
+                if name is None:
+                    note(where, at, "partly in a macro")
+                    continue
+                if _in_conditional(name, (t for _, t in copies.values())):
+                    note(where, at, f"macro {name} is also used in #if")
+                    continue
             if k == "CompoundAssignOperator" and _is_bitfield(ops[0], fields):
                 note(where, at, "compound shift of a bit-field")
                 continue
@@ -289,20 +327,20 @@ def find_shifts(tu, copies: dict, ignored, fields: set[str] | None = None
                     _skip_blank(text, op_at + len(op), rhs_begin):
                 note(where, at, "operator not found between the operands")
                 continue
-            key = (real, begin, op_at, end)
-            found.setdefault(key, Shift(real, begin, op_at, op_at + len(op), end, HELPER[op]))
+            key = (real, begin, lhs_end)
+            found.setdefault(key, Shift(real, begin, lhs_end, HELPER[op]))
     messages = [f"{f}:{line}: shift in device code left as C++ ({what})"
                 for f, line, what in sorted(notes)]
     return list(found.values()), messages
 
 
 def apply_edits(text: str, shifts: list[Shift]) -> str:
-    """`a OP b` -> `HELPER(a , b)` for each shift (they may nest)."""
+    """`a OP b` -> `HELPER(a) OP b` for each shift (they may nest: the left
+    operand of one may hold another)."""
     edits = []  # (position, rank, tie, end, text)
     for s in shifts:
-        edits.append((s.end, 0, -s.begin, s.end, ")"))           # inner closes first
-        edits.append((s.begin, 1, -s.end, s.begin, s.helper + "("))  # outer opens first
-        edits.append((s.op_begin, 2, 0, s.op_end, ","))
+        edits.append((s.lhs_end, 0, -s.begin, s.lhs_end, ")"))         # inner closes first
+        edits.append((s.begin, 1, -s.lhs_end, s.begin, s.helper + "("))  # outer opens first
     edits.sort()
     out, cur = [], 0
     for pos, _, _, end, new in edits:
