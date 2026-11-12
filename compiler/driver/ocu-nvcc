@@ -268,7 +268,11 @@ def parse(argv: list[str]) -> SimpleNamespace:
                     key, value = OPTIONS[p][0], a[len(p):]
                     break
         if key is None:
-            if not a.startswith("-") or a == "-":
+            if a == "FLAGS" and not os.path.exists(a):
+                # CMake's Clang-CUDA shared-library rule (seen with CMake 3.31
+                # on macOS) leaves its <FLAGS> placeholder unexpanded.
+                o.notes.append("ignored the word FLAGS (an unexpanded CMake rule placeholder)")
+            elif not a.startswith("-") or a == "-":
                 o.inputs.append([a, lang_now])
             elif a in HOST_PAIR:
                 o.host += [a, take(a)]
