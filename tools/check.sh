@@ -112,6 +112,12 @@ fi
 #    dependency file of the builds above, no vendor headers in the tree.
 guard() {
     found=0
+    # Build trees inside the repository (they hold installed copies of our
+    # own headers) are not sources: skip every folder with a CMakeCache.txt.
+    prune=""
+    for c in $(find "$repo" -path "$repo/.git" -prune -o -name CMakeCache.txt -print 2>/dev/null); do
+        prune="$prune -path $(dirname "$c") -prune -o"
+    done
     for f in $(find "$root" -name 'flags.make' -o -name '*.d' -o -name 'compile_commands.json' 2>/dev/null); do
         if grep -lE '/usr/local/cuda|/opt/cuda|NVIDIA GPU Computing Toolkit' "$f"; then
             found=1
@@ -120,17 +126,17 @@ guard() {
     # Our own CUDA-named headers live only in runtime/include and are
     # written from public documentation; the same names anywhere else, or
     # vendor libraries anywhere, are refused.
-    if find "$repo" -path "$repo/.git" -prune -o -path "$repo/runtime/include" -prune \
+    if find "$repo" -path "$repo/.git" -prune -o $prune -path "$repo/runtime/include" -prune \
         -o -type f \( -name 'cuda_runtime*.h' -o -name 'cuda.h' -o -name 'cublas*.h' \
            -o -name 'cudnn*.h' \) -print | grep .; then
         found=1
     fi
-    if find "$repo" -path "$repo/.git" -prune -o -type f \
+    if find "$repo" -path "$repo/.git" -prune -o $prune -type f \
         \( -name 'libcuda*' -o -name 'libcudart*' -o -name 'libcublas*' \) -print | grep .; then
         found=1
     fi
     # Vendor header text: the licence and copyright lines vendor files carry.
-    if find "$repo" -path "$repo/.git" -prune -o -type f \
+    if find "$repo" -path "$repo/.git" -prune -o $prune -type f \
         \( -name '*.h' -o -name '*.hpp' -o -name '*.cuh' -o -name '*.inl' \) -print0 |
         xargs -0 grep -lE 'NVIDIA CORPORATION|NVIDIA Software License|Copyright \(c\) 1993-'; then
         found=1
