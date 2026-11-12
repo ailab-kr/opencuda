@@ -354,7 +354,11 @@ if(TARGET ocu_cublas_cpu)
             --only ${OCU_CUBLAS_CASES}
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/conformance/harness)
   set_tests_properties(conformance_cublas_cpu_stream PROPERTIES
-    ENVIRONMENT "OCU_DRIVER_STREAM=1;OCU_CPU_ORDER=random")
+    ENVIRONMENT "OCU_DRIVER_STREAM=1;OCU_CPU_ORDER=random${_ocu_launch}")
+  if(_ocu_launch) # cross builds: the driver runs through the emulator
+    string(REGEX REPLACE "^;" "" _ocu_launch_only "${_ocu_launch}")
+    set_tests_properties(conformance_cublas_cpu PROPERTIES ENVIRONMENT "${_ocu_launch_only}")
+  endif()
 endif()
 if(TARGET ocu_cublas_nvidia AND TARGET run_if_nvidia)
   ocu_add_nvidia_cu_executable(cublas_accuracy_nv libs/cublas_accuracy.cu LIBRARIES ocu_cublas_nvidia)
