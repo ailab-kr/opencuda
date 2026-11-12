@@ -35,6 +35,7 @@
 struct ocu_rt_stream {
     ocu_queue           *queue;
     unsigned             flags;
+    int                  priority; /* recorded; the CPU backend has one level */
     int                  device;
     struct ocu_rt_stream *next;   /* the device's list of streams */
 };
@@ -331,6 +332,94 @@ cudaError_t cudaGetDeviceProperties(struct cudaDeviceProp *prop, int device)
     return cudaSuccess;
 }
 
+cudaError_t cudaSetDeviceFlags(unsigned int flags)
+{
+    const unsigned known = cudaDeviceScheduleMask | cudaDeviceMapHost | cudaDeviceLmemResizeToMax;
+    if ((flags & ~known) != 0) return set_error(cudaErrorInvalidValue);
+    unsigned sched = flags & cudaDeviceScheduleMask;
+    if (sched != cudaDeviceScheduleAuto && sched != cudaDeviceScheduleSpin &&
+        sched != cudaDeviceScheduleYield && sched != cudaDeviceScheduleBlockingSync) {
+        return set_error(cudaErrorInvalidValue);
+    }
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    return cudaSuccess; /* how the host waits: a hint here */
+}
+
+cudaError_t cudaDeviceCanAccessPeer(int *can, int device, int peer)
+{
+    if (can == NULL) return set_error(cudaErrorInvalidValue);
+    int n = 0;
+    cudaError_t e = cudaGetDeviceCount(&n);
+    if (e != cudaSuccess) return e;
+    if (device < 0 || device >= n || peer < 0 || peer >= n) return set_error(cudaErrorInvalidDevice);
+    *can = 0; /* no peer access between devices yet; a device is not its own peer */
+    return cudaSuccess;
+}
+
+/* Shared memory a kernel may ask for at launch, raised per function up to
+   the device's opt-in limit. Kernel attributes come from the device limits:
+   the CPU path compiles kernels without static resource counts. */
+cudaError_t cudaFuncSetAttribute(const void *func, enum cudaFuncAttribute attr, int value)
+{
+    if (func == NULL) return set_error(cudaErrorInvalidDeviceFunction);
+    struct cudaDeviceProp p;
+    cudaError_t e = cudaGetDeviceProperties(&p, tl_device);
+    if (e != cudaSuccess) return e;
+    switch (attr) {
+    case cudaFuncAttributeMaxDynamicSharedMemorySize:
+        if (value < 0 || (size_t)value > p.sharedMemPerBlockOptin) {
+            return set_error(cudaErrorInvalidValue);
+        }
+        return cudaSuccess;
+    case cudaFuncAttributePreferredSharedMemoryCarveout:
+        if (value < -1 || value > 100) return set_error(cudaErrorInvalidValue);
+        return cudaSuccess;
+    default:
+        return set_error(cudaErrorInvalidValue);
+    }
+}
+
+cudaError_t cudaFuncGetAttributes(struct cudaFuncAttributes *attr, const void *func)
+{
+    if (attr == NULL) return set_error(cudaErrorInvalidValue);
+    if (func == NULL) return set_error(cudaErrorInvalidDeviceFunction);
+    struct cudaDeviceProp p;
+    cudaError_t e = cudaGetDeviceProperties(&p, tl_device);
+    if (e != cudaSuccess) return e;
+    memset(attr, 0, sizeof(*attr));
+    attr->maxThreadsPerBlock = p.maxThreadsPerBlock;
+    attr->maxDynamicSharedSizeBytes = (int)p.sharedMemPerBlock;
+    attr->ptxVersion = p.major * 10 + p.minor;
+    attr->binaryVersion = p.major * 10 + p.minor;
+    attr->preferredShmemCarveout = -1;
+    return cudaSuccess;
+}
+
+/* Resident blocks per multiprocessor, from the block size and dynamic
+   shared memory against the device limits (no register limit: none is
+   known for CPU-path kernels). */
+cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int *blocks, const void *func,
+                                                          int block_size, size_t dynamic_smem)
+{
+    if (blocks == NULL || block_size <= 0) return set_error(cudaErrorInvalidValue);
+    if (func == NULL) return set_error(cudaErrorInvalidDeviceFunction);
+    struct cudaDeviceProp p;
+    cudaError_t e = cudaGetDeviceProperties(&p, tl_device);
+    if (e != cudaSuccess) return e;
+    if (block_size > p.maxThreadsPerBlock || dynamic_smem > p.sharedMemPerBlock) {
+        *blocks = 0;
+        return cudaSuccess;
+    }
+    int by_threads = p.maxThreadsPerMultiProcessor / block_size;
+    int by_smem = dynamic_smem ? (int)(p.sharedMemPerMultiprocessor / dynamic_smem) : by_threads;
+    int n = by_threads < by_smem ? by_threads : by_smem;
+    if (n > p.maxBlocksPerMultiProcessor) n = p.maxBlocksPerMultiProcessor;
+    *blocks = n;
+    return cudaSuccess;
+}
+
 cudaError_t cudaDeviceGetAttribute(int *value, enum cudaDeviceAttr attr, int device)
 {
     if (value == NULL) return set_error(cudaErrorInvalidValue);
@@ -600,6 +689,69 @@ cudaError_t cudaFree(void *ptr)
     ocu_status st = g_backend->mem_free(d->dev, ptr); /* waits for queued work */
     if (st == OCU_OK && ptr != NULL) range_remove(d, ptr);
     return from(st);
+}
+
+/*
+ * Page-lock existing host memory. On a device that shares host memory the
+ * range only needs to be known as page-locked (asynchronous copies may then
+ * read it later); elsewhere not supported yet.
+ */
+cudaError_t cudaHostRegister(void *ptr, size_t size, unsigned int flags)
+{
+    const unsigned known = cudaHostRegisterPortable | cudaHostRegisterMapped |
+                           cudaHostRegisterIoMemory | cudaHostRegisterReadOnly;
+    if (ptr == NULL || size == 0 || (flags & ~known) != 0) return set_error(cudaErrorInvalidValue);
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    ocu_dev_info info;
+    ocu_status st = g_backend->dev_info((uint32_t)tl_device, &info);
+    if (st != OCU_OK) return from(st);
+    if (!info.supports_unified_memory || (flags & cudaHostRegisterIoMemory)) {
+        return set_error(cudaErrorNotSupported);
+    }
+    mem_range r;
+    if (range_find(d, ptr, 1, &r) || range_find(d, (char *)ptr + size - 1, 1, &r)) {
+        return set_error(cudaErrorHostMemoryAlreadyRegistered);
+    }
+    if (!range_add(d, ptr, size, cudaMemoryTypeHost)) return set_error(cudaErrorMemoryAllocation);
+    return cudaSuccess;
+}
+
+cudaError_t cudaHostUnregister(void *ptr)
+{
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    mem_range r;
+    if (ptr == NULL || !range_find(d, ptr, 1, &r) || r.base != (char *)ptr ||
+        r.type != cudaMemoryTypeHost) {
+        return set_error(cudaErrorHostMemoryNotRegistered);
+    }
+    /* Work that may still read it finishes first. */
+    cudaError_t s = sync_device(d);
+    range_remove(d, ptr);
+    return s;
+}
+
+/* The device address of page-locked host memory: the same address where
+   the device shares host memory. */
+cudaError_t cudaHostGetDevicePointer(void **dptr, void *hptr, unsigned int flags)
+{
+    if (dptr == NULL || flags != 0) return set_error(cudaErrorInvalidValue);
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    mem_range r;
+    if (hptr == NULL || !range_find(d, hptr, 1, &r) || r.type == cudaMemoryTypeDevice) {
+        return set_error(cudaErrorInvalidValue);
+    }
+    ocu_dev_info info;
+    ocu_status st = g_backend->dev_info((uint32_t)tl_device, &info);
+    if (st != OCU_OK) return from(st);
+    if (!info.supports_unified_memory) return set_error(cudaErrorNotSupported);
+    *dptr = hptr;
+    return cudaSuccess;
 }
 
 cudaError_t cudaPointerGetAttributes(struct cudaPointerAttributes *attr, const void *ptr)
@@ -996,6 +1148,77 @@ cudaError_t cudaStreamCreateWithFlags(cudaStream_t *stream, unsigned int flags)
 cudaError_t cudaStreamCreate(cudaStream_t *stream)
 {
     return cudaStreamCreateWithFlags(stream, cudaStreamDefault);
+}
+
+/* One priority level: every requested priority is clamped to it (the
+   documented behaviour for values outside the range). */
+cudaError_t cudaDeviceGetStreamPriorityRange(int *least, int *greatest)
+{
+    if (least != NULL) *least = 0;
+    if (greatest != NULL) *greatest = 0;
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamCreateWithPriority(cudaStream_t *stream, unsigned int flags, int priority)
+{
+    (void)priority;
+    cudaError_t e = cudaStreamCreateWithFlags(stream, flags);
+    if (e == cudaSuccess) (*stream)->priority = 0;
+    return e;
+}
+
+cudaError_t cudaStreamGetPriority(cudaStream_t stream, int *priority)
+{
+    if (priority == NULL) return set_error(cudaErrorInvalidValue);
+    *priority = 0;
+    (void)stream;
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamGetFlags(cudaStream_t stream, unsigned int *flags)
+{
+    if (flags == NULL) return set_error(cudaErrorInvalidValue);
+    *flags = (stream == NULL || stream == cudaStreamLegacy || stream == cudaStreamPerThread)
+                 ? cudaStreamDefault : stream->flags;
+    return cudaSuccess;
+}
+
+/* Stream capture (graphs) is not implemented: nothing is ever capturing,
+   and starting a capture reports not-supported. */
+cudaError_t cudaStreamIsCapturing(cudaStream_t stream, enum cudaStreamCaptureStatus *status)
+{
+    (void)stream;
+    if (status == NULL) return set_error(cudaErrorInvalidValue);
+    *status = cudaStreamCaptureStatusNone;
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamBeginCapture(cudaStream_t stream, enum cudaStreamCaptureMode mode)
+{
+    (void)stream;
+    (void)mode;
+    return set_error(cudaErrorNotSupported);
+}
+
+/*
+ * A host function ordered in `stream`: work submitted before it finishes
+ * first, and it finishes before this call returns, so it also runs before
+ * anything submitted later. The caller waits, which the API allows.
+ */
+cudaError_t cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void *user_data)
+{
+    if (fn == NULL) return set_error(cudaErrorInvalidValue);
+    rt_device *d;
+    cudaError_t e = (stream == NULL || stream == cudaStreamLegacy || stream == cudaStreamPerThread)
+                        ? current(&d) : device_at(stream->device, &d);
+    if (e != cudaSuccess) return set_error(e);
+    submission sub;
+    e = submit_begin(d, stream, &sub);
+    if (e != cudaSuccess) return e;
+    ocu_status st = g_backend->queue_sync(sub.q);
+    if (st == OCU_OK) fn(user_data);
+    submit_end(&sub);
+    return dev_result(d, st);
 }
 
 static bool is_default(cudaStream_t s)

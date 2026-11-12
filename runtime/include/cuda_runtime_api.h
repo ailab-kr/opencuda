@@ -203,6 +203,55 @@ enum cudaDeviceAttr {
     cudaDevAttrMaxSharedMemoryPerBlockOptin = 97
 };
 
+/* cudaHostRegister flags. */
+#define cudaHostRegisterDefault  0x00u
+#define cudaHostRegisterPortable 0x01u
+#define cudaHostRegisterMapped   0x02u
+#define cudaHostRegisterIoMemory 0x04u
+#define cudaHostRegisterReadOnly 0x08u
+
+/* cudaSetDeviceFlags flags. */
+#define cudaDeviceScheduleAuto         0x00u
+#define cudaDeviceScheduleSpin         0x01u
+#define cudaDeviceScheduleYield        0x02u
+#define cudaDeviceScheduleBlockingSync 0x04u
+#define cudaDeviceScheduleMask         0x07u
+#define cudaDeviceMapHost              0x08u
+#define cudaDeviceLmemResizeToMax      0x10u
+
+enum cudaStreamCaptureStatus {
+    cudaStreamCaptureStatusNone = 0,
+    cudaStreamCaptureStatusActive = 1,
+    cudaStreamCaptureStatusInvalidated = 2
+};
+
+enum cudaStreamCaptureMode {
+    cudaStreamCaptureModeGlobal = 0,
+    cudaStreamCaptureModeThreadLocal = 1,
+    cudaStreamCaptureModeRelaxed = 2
+};
+
+typedef void (*cudaHostFn_t)(void *user_data);
+
+enum cudaFuncAttribute {
+    cudaFuncAttributeMaxDynamicSharedMemorySize = 8,
+    cudaFuncAttributePreferredSharedMemoryCarveout = 9
+};
+
+/* What cudaFuncGetAttributes reports. */
+struct cudaFuncAttributes {
+    size_t sharedSizeBytes;
+    size_t constSizeBytes;
+    size_t localSizeBytes;
+    int    maxThreadsPerBlock;
+    int    numRegs;
+    int    ptxVersion;
+    int    binaryVersion;
+    int    cacheModeCA;
+    int    maxDynamicSharedSizeBytes;
+    int    preferredShmemCarveout;
+};
+
 /* The legacy default stream. */
 #define cudaStreamLegacy ((cudaStream_t)0x1)
 #define cudaStreamPerThread ((cudaStream_t)0x2)
@@ -266,6 +315,13 @@ cudaError_t cudaGetDevice(int *device);
 cudaError_t cudaSetDevice(int device);
 cudaError_t cudaGetDeviceProperties(struct cudaDeviceProp *prop, int device);
 cudaError_t cudaDeviceGetAttribute(int *value, enum cudaDeviceAttr attr, int device);
+cudaError_t cudaSetDeviceFlags(unsigned int flags);
+cudaError_t cudaDeviceCanAccessPeer(int *can_access, int device, int peer_device);
+cudaError_t cudaDeviceGetStreamPriorityRange(int *least, int *greatest);
+cudaError_t cudaFuncSetAttribute(const void *func, enum cudaFuncAttribute attr, int value);
+cudaError_t cudaFuncGetAttributes(struct cudaFuncAttributes *attr, const void *func);
+cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int *blocks, const void *func,
+                                                          int block_size, size_t dynamic_smem);
 cudaError_t cudaDeviceSynchronize(void);
 cudaError_t cudaDeviceReset(void);
 cudaError_t cudaRuntimeGetVersion(int *version);
@@ -284,6 +340,9 @@ cudaError_t cudaMalloc(void **ptr, size_t size);
 cudaError_t cudaFree(void *ptr);
 cudaError_t cudaMallocManaged(void **ptr, size_t size, unsigned int flags);
 cudaError_t cudaPointerGetAttributes(struct cudaPointerAttributes *attr, const void *ptr);
+cudaError_t cudaHostRegister(void *ptr, size_t size, unsigned int flags);
+cudaError_t cudaHostUnregister(void *ptr);
+cudaError_t cudaHostGetDevicePointer(void **dptr, void *hptr, unsigned int flags);
 cudaError_t cudaMallocHost(void **ptr, size_t size);
 cudaError_t cudaFreeHost(void *ptr);
 cudaError_t cudaHostAlloc(void **ptr, size_t size, unsigned int flags);
@@ -319,6 +378,12 @@ cudaError_t cudaStreamDestroy(cudaStream_t stream);
 cudaError_t cudaStreamSynchronize(cudaStream_t stream);
 cudaError_t cudaStreamQuery(cudaStream_t stream);
 cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t event, unsigned int flags);
+cudaError_t cudaStreamCreateWithPriority(cudaStream_t *stream, unsigned int flags, int priority);
+cudaError_t cudaStreamGetPriority(cudaStream_t stream, int *priority);
+cudaError_t cudaStreamGetFlags(cudaStream_t stream, unsigned int *flags);
+cudaError_t cudaStreamIsCapturing(cudaStream_t stream, enum cudaStreamCaptureStatus *status);
+cudaError_t cudaStreamBeginCapture(cudaStream_t stream, enum cudaStreamCaptureMode mode);
+cudaError_t cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void *user_data);
 
 /* ---- events ------------------------------------------------------------ */
 
@@ -360,6 +425,27 @@ template <class T>
 static inline cudaError_t cudaMallocHost(T **ptr, size_t size)
 {
     return cudaMallocHost(reinterpret_cast<void **>(ptr), size);
+}
+
+template <class T>
+static inline cudaError_t cudaFuncSetAttribute(T *func, cudaFuncAttribute attr, int value)
+{
+    return cudaFuncSetAttribute(reinterpret_cast<const void *>(func), attr, value);
+}
+
+template <class T>
+static inline cudaError_t cudaFuncGetAttributes(cudaFuncAttributes *attr, T *func)
+{
+    return cudaFuncGetAttributes(attr, reinterpret_cast<const void *>(func));
+}
+
+template <class T>
+static inline cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int *blocks, T func,
+                                                                        int block_size,
+                                                                        size_t dynamic_smem)
+{
+    return cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        blocks, reinterpret_cast<const void *>(func), block_size, dynamic_smem);
 }
 
 template <class T>
