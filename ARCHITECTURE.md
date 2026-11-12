@@ -45,7 +45,7 @@ compiler/         runtime/         libs/
 | `runtime/core/` | 백엔드 등록과 선택 | 있음 |
 | `runtime/include/` | 사용자 프로그램이 보는 헤더: `cuda_runtime_api.h`·`cuda_runtime.h`·`cuda.h`·`cuda_fp16.h`, 벡터 형, CPU 경로 언어 지원 `ocu_cuda_lang_cpu.h` | 함수 80여 개 |
 | `runtime/cudart/` | 실행 API 구현(`ocu_cudart`): 장치·오류·메모리·스트림·사건·실행. 백엔드 규격만 부른다 | 있음 |
-| `libs/` | 라이브러리별 호환 층 | `libs/blas`: 20개 함수(내부 이름), CPU에서 기준 사례 526건 통과 |
+| `libs/` | 라이브러리별 호환 층 | `libs/cublas`: `cublas_v2.h` 부분집합(핸들·스트림·GEMM 계열·1·2단계 일부·strsm 배치), CUDA C 소스 하나로 CPU·NVIDIA 모두 통과. `libs/blas`: 20개 함수(내부 이름), CPU에서 기준 사례 526건 통과 |
 | `compiler/` | 명령 호환, 빌드 도구 연동, 장치용 수학 함수 | 실험 단계 드라이버 `compiler/probe/ocu_cc.py`(CPU 경로는 실제 프로그램 빌드에 씀), CMake 함수 `ocu_add_cpu_cu_executable`, nvcc 명령 호환 드라이버 `compiler/driver/ocu-nvcc`와 툴킷 폴더(CMake 도구 사슬 파일 `OcuCUDA.cmake`, `docs/compiler-driver.md`) |
 | `conformance/` | 적합성 시험, 채점기, 결과 형식 | BLAS 20개 함수의 기준 답 526건, 오차 한계, 자체 검증 |
 | `tuning/` | 속도 측정, 자동 튜닝, 칩별 설정 표 | 측정 규칙(PLAN 6.4)을 지키는 측정기 `ocu_bench`와 BLAS 측정 `bench_blas` |
@@ -115,6 +115,20 @@ libs/blas  ──(get_provider("blas"))──▶  백엔드
 - 지금 있는 것: BLAS 제공자 표(14개 연산, f32·f64)와 CPU 백엔드의 구현(`backends/cpu/cpu_blas.c`). `libs/blas`가 그 위에서 20개 함수를 내놓는다.
 - `libs`는 인자 검사, 오류 코드, 색인 기준 같은 CUDA 쪽 동작을 맡고, 실제 계산만 제공자에게 넘긴다.
 - 제공자가 없는 칩에서도 공통 구현으로 동작한다. 느릴 뿐 틀리지 않는다.
+
+### CUDA 이름의 라이브러리 (`libs/cublas`)
+
+`cublas_v2.h`의 함수는 제공자 표를 거치지 않는다. 호스트 쪽은 실행 API만 부르는 칩 중립 C++이고, 계산은 같은 파일의 CUDA C 커널(공유 메모리 타일 GEMM, 1·2단계 커널)이 한다. 이 `.cu` 하나를 프로젝트의 컴파일러(`ocu_cc`)가 대상마다 따로 컴파일해 대상별 정적 라이브러리를 만든다.
+
+| 대상 | 라이브러리 | 만드는 법 |
+|---|---|---|
+| CPU 경로 | `ocu_cublas_cpu` | `ocu_add_cu_library(... cpu ...)`: CPU 경로 변환 뒤 C++ 컴파일 |
+| NVIDIA | `ocu_cublas_nvidia` | `ocu_add_cu_library(... nvidia ...)`: 장치 코드는 PTX로 컨테이너에 넣어 호스트 객체에 포함 |
+| Metal | (다음) | 같은 소스를 `cu2msl` 경로로. 배정밀도가 없으므로 `OCU_CUBLAS_NO_FP64`로 빌드해 64F는 "지원 안 함" |
+
+- 프로그램은 자기가 빌드된 대상의 변형을 링크한다: `ocu-nvcc -lcublas`(대상에 맞는 변형), CMake의 `CUDA::cublas`(툴킷의 FindCUDAToolkit, `OCU_TARGET`에 맞는 변형), 이 저장소 안에서는 `ocu_add_cpu_cu_executable(t a.cu LIBRARIES ocu_cublas_cpu)`·`ocu_add_nvidia_cu_executable(t a.cu LIBRARIES ocu_cublas_nvidia)`.
+- 엔비디아의 라이브러리는 NVIDIA 대상에서도 부르지 않는다. 같은 커널이 모든 대상을 맡는 것이 목적이다.
+- 칩 회사 라이브러리를 쓰는 빠른 길이 필요해지면 위의 제공자 방식으로 더한다(그때도 `libs` 안에서 칩 이름으로 가르지 않는다).
 
 ## 5. 한 번의 실행이 지나가는 길
 
@@ -194,6 +208,9 @@ GPU 코드를 CPU에서 그대로 실행한다. 속도가 아니라 정확성 �
 | `ocu_cudart` | 정적 라이브러리 | 실행 API |
 | `rt_api`, `rt_lang`, `rt_mem`, `rt_misc`, `rt_fp16`, `rt_review` | 시험 | 보통의 CUDA 프로그램으로 쓴 실행 API·언어·반정밀도 시험 |
 | `install_package` | 시험 | 설치한 패키지로 바깥 프로젝트를 빌드·실행 |
+| `ocu_cublas_cpu`, `ocu_cublas_nvidia` | 정적 라이브러리 | `cublas_v2.h` 구현, 대상별 변형(4장) |
+| `cublas_cpu*`, `gpu_cublas_*`, `conformance_cublas_cpu*`, `gpu_conformance_cublas` | 시험 | `cublas_v2.h`의 정확도(고정밀 기준)와 기준 사례, CPU와 NVIDIA GPU(장치가 없으면 건너뜀) |
+| `bench_cublas` | 측정 | NVIDIA GPU의 GEMM 처리량(중앙값·90% 구간) |
 
 설치: `cmake --install <빌드 폴더> --prefix <위치>`가 라이브러리, 공개 헤더(한 폴더에 모아 `<cuda_runtime.h>`가 우리 것을 찾게 함), CPU 경로 드라이버, CMake 패키지를 놓는다. 다른 프로젝트는 `find_package(Ocu)` 뒤 `ocu::cudart`와 `ocu_add_cpu_cu_executable()`를 쓴다.
 
