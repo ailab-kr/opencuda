@@ -185,7 +185,8 @@ ocu_status cpu_check_launch(const ocu_launch_params *p)
 
 typedef enum fiber_state {
     FIBER_READY = 0,
-    FIBER_WAITING,  /* at the barrier */
+    FIBER_WAITING,       /* at the block barrier */
+    FIBER_WAITING_WARP,  /* at a warp-level operation */
     FIBER_DONE
 } fiber_state;
 
@@ -214,6 +215,8 @@ typedef struct block_exec {
     void            **args;
     void             *dyn_shared;
     size_t            dyn_shared_bytes;
+    uint64_t         *warp_slots;    /* one value per thread, for gathers */
+    uint32_t          warp_size;
     char             *stack_region;  /* one mmap for all fiber stacks */
     size_t            stack_region_bytes;
     size_t            stack_bytes;   /* usable bytes per fiber */
@@ -311,7 +314,9 @@ static ocu_status block_exec_init(block_exec *ex, uint32_t nthreads,
     }
     ex->fibers = calloc(nthreads, sizeof(*ex->fibers));
     ex->order = calloc(nthreads, sizeof(*ex->order));
-    if (ex->fibers == NULL || ex->order == NULL) {
+    ex->warp_slots = calloc(nthreads, sizeof(*ex->warp_slots));
+    ex->warp_size = cfg->warp_size;
+    if (ex->fibers == NULL || ex->order == NULL || ex->warp_slots == NULL) {
         return OCU_ERR_OUT_OF_MEMORY;
     }
     for (uint32_t i = 0; i < nthreads; ++i) {
@@ -338,6 +343,7 @@ static void block_exec_release(block_exec *ex)
     }
     free(ex->fibers);
     free(ex->order);
+    free(ex->warp_slots);
     free(ex->dyn_shared);
     memset(ex, 0, sizeof(*ex));
 }
@@ -365,6 +371,44 @@ static bool canary_ok(const fiber *f)
     return true;
 }
 
+static void report_deadlock(void)
+{
+    static atomic_flag said = ATOMIC_FLAG_INIT;
+    if (!atomic_flag_test_and_set(&said)) {
+        fprintf(stderr, "ocu cpu backend: threads of a block wait on each "
+                        "other at different barriers (warp operation vs "
+                        "block barrier); the launch fails\n");
+    }
+}
+
+/*
+ * Release the warps whose live lanes all wait at a warp operation.
+ * Returns true when at least one warp was released.
+ */
+static bool release_warps(block_exec *ex)
+{
+    bool released = false;
+    uint32_t w = ex->warp_size;
+    for (uint32_t base = 0; base < ex->nthreads; base += w) {
+        uint32_t end = base + w < ex->nthreads ? base + w : ex->nthreads;
+        uint32_t live = 0, waiting = 0;
+        for (uint32_t i = base; i < end; ++i) {
+            fiber_state s = ex->fibers[i].state;
+            live += s != FIBER_DONE;
+            waiting += s == FIBER_WAITING_WARP;
+        }
+        if (live > 0 && waiting == live) {
+            for (uint32_t i = base; i < end; ++i) {
+                if (ex->fibers[i].state == FIBER_WAITING_WARP) {
+                    ex->fibers[i].state = FIBER_READY;
+                }
+            }
+            released = true;
+        }
+    }
+    return released;
+}
+
 static void report_stack_overflow(void)
 {
     static atomic_flag said = ATOMIC_FLAG_INIT;
@@ -384,6 +428,7 @@ static ocu_status run_block(block_exec *ex, uint64_t linear_block)
         /* Shared memory starts with garbage on a GPU; make it visible. */
         memset(ex->dyn_shared, 0xA5, ex->dyn_shared_bytes);
     }
+    memset(ex->warp_slots, 0, ex->nthreads * sizeof(*ex->warp_slots));
     for (uint32_t i = 0; i < ex->nthreads; ++i) {
         fiber *f = &ex->fibers[i];
         f->state = FIBER_READY;
@@ -416,13 +461,23 @@ static ocu_status run_block(block_exec *ex, uint64_t linear_block)
             switch_to_fiber(ex, ex->order[k]);
         }
 
-        uint32_t waiting = 0, done = 0;
+        /* After a round no fiber is ready: each waits or has returned. */
+        uint32_t waiting = 0, waiting_warp = 0, done = 0;
         for (uint32_t i = 0; i < ex->nthreads; ++i) {
             waiting += ex->fibers[i].state == FIBER_WAITING;
+            waiting_warp += ex->fibers[i].state == FIBER_WAITING_WARP;
             done += ex->fibers[i].state == FIBER_DONE;
         }
-        if (waiting == 0) {
+        if (waiting == 0 && waiting_warp == 0) {
             break; /* every fiber returned */
+        }
+        if (waiting_warp > 0 && release_warps(ex)) {
+            continue; /* warps first; block waiters stay waiting */
+        }
+        if (waiting_warp > 0) {
+            report_deadlock(); /* lanes split between warp op and barrier */
+            st = OCU_ERR_LAUNCH_FAILED;
+            break;
         }
         if (done > 0 && cfg->strict_barrier) {
             st = OCU_ERR_LAUNCH_FAILED; /* barrier not reached by all */
@@ -599,4 +654,30 @@ void ocu_cpu_barrier(void)
 void *ocu_cpu_dynamic_shared(void)
 {
     return tl_exec->dyn_shared;
+}
+
+uint32_t ocu_cpu_lane_id(void)
+{
+    return tl_exec->current % tl_exec->warp_size;
+}
+
+void ocu_cpu_warp_sync(void)
+{
+    block_exec *ex = tl_exec;
+    ex->fibers[ex->current].state = FIBER_WAITING_WARP;
+    yield_to_scheduler(ex, false);
+}
+
+uint32_t ocu_cpu_warp_gather(uint64_t value, uint64_t *all)
+{
+    block_exec *ex = tl_exec;
+    uint32_t me = ex->current;
+    uint32_t w = ex->warp_size;
+    uint32_t base = me - me % w;
+    uint32_t count = ex->nthreads - base < w ? ex->nthreads - base : w;
+    ex->warp_slots[me] = value;
+    ocu_cpu_warp_sync(); /* every lane has written */
+    memcpy(all, &ex->warp_slots[base], count * sizeof(*all));
+    ocu_cpu_warp_sync(); /* every lane has read: slots may be reused */
+    return count;
 }

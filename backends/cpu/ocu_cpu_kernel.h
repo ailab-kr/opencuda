@@ -65,6 +65,30 @@ void ocu_cpu_barrier(void);
 /* Start of this block's dynamic shared memory (NULL when none). */
 void *ocu_cpu_dynamic_shared(void);
 
+/* ---- warp-level operations ---------------------------------------------
+ * A warp is warp_size consecutive threads of a block (by linear thread
+ * index). Every live lane of the warp must reach the same warp operation;
+ * lanes that already returned do not take part. A warp whose lanes wait on
+ * each other in incompatible ways (one at a warp operation, another at the
+ * block barrier) fails the launch with OCU_ERR_LAUNCH_FAILED instead of
+ * hanging.
+ */
+
+/* This thread's lane within its warp. */
+uint32_t ocu_cpu_lane_id(void);
+
+/* Warp-wide barrier. */
+void ocu_cpu_warp_sync(void);
+
+/*
+ * Every lane contributes `value`; `all[i]` receives lane i's value. Returns
+ * the number of lanes in this warp (smaller than warp_size only for the
+ * last warp of a block whose size is not a multiple of it). `all` must
+ * hold OCU_CPU_MAX_WARP entries. Shuffles and votes are built on this.
+ */
+#define OCU_CPU_MAX_WARP 64
+uint32_t ocu_cpu_warp_gather(uint64_t value, uint64_t *all);
+
 #ifdef __cplusplus
 }
 #endif
