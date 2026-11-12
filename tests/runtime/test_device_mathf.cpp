@@ -101,6 +101,16 @@ using F1 = float (*)(float);
 using R1 = double (*)(double);
 using L1 = long double (*)(long double);
 
+// Special and boundary values. sweep1 checks them in every mode, because
+// the 1-in-257 stride of the regular sweep misses them (+-0, +-inf, NaN,
+// 1.0, the smallest subnormal, FLT_MAX ...).
+static const float SPECIAL[] = {0.0f, -0.0f, INFINITY, -INFINITY, NAN, 1.0f, -1.0f, 0.5f, -0.5f, 2.0f,
+                                -2.0f, 3.0f, -3.0f, 1.5f, -1.5f, 0x1p-149f, -0x1p-149f, 0x1p-126f,
+                                FLT_MAX, -FLT_MAX, 0x1.000002p0f, 0x1.fffffep-1f, -0x1.fffffep-1f,
+                                10.0f, 0.1f, 1e-20f, 1e20f, 0x1p24f, 0x1p25f + 2.0f, 127.0f, 128.0f,
+                                -149.0f, -150.0f, 0x1.8p-140f};
+static const int NSPECIAL = sizeof SPECIAL / sizeof SPECIAL[0];
+
 // All floats (or every 257th) through ours vs ref.
 static void sweep1(const char *name, F1 ours, R1 ref, L1 refl, double bound)
 {
@@ -113,8 +123,13 @@ static void sweep1(const char *name, F1 ours, R1 ref, L1 refl, double bound)
             result r;
             std::uint64_t lo = (0x100000000ull * t / nt) / step * step;
             std::uint64_t hi = 0x100000000ull * (t + 1) / nt;
-            for (std::uint64_t b = lo; b < hi; b += step) {
-                float x = as_float((std::uint32_t)b);
+            // Thread 0 also takes the SPECIAL list; the stride sweep follows it.
+            const std::uint64_t nsp = (t == 0) ? (std::uint64_t)NSPECIAL : 0;
+            std::uint64_t b = lo;
+            for (std::uint64_t k = 0; k < nsp || b < hi; ++k) {
+                float x;
+                if (k < nsp) x = SPECIAL[k];
+                else { x = as_float((std::uint32_t)b); b += step; }
                 float got = ours(x);
                 double w = ref((double)x);
                 long double wl = w;
@@ -173,12 +188,6 @@ static void sweep2(const char *name, Ours ours, Ref ref, Gen gen, long long coun
     report(name, all, bound, at);
 }
 
-static const float SPECIAL[] = {0.0f, -0.0f, INFINITY, -INFINITY, NAN, 1.0f, -1.0f, 0.5f, -0.5f, 2.0f,
-                                -2.0f, 3.0f, -3.0f, 1.5f, -1.5f, 0x1p-149f, -0x1p-149f, 0x1p-126f,
-                                FLT_MAX, -FLT_MAX, 0x1.000002p0f, 0x1.fffffep-1f, -0x1.fffffep-1f,
-                                10.0f, 0.1f, 1e-20f, 1e20f, 0x1p24f, 0x1p25f + 2.0f, 127.0f, 128.0f,
-                                -149.0f, -150.0f, 0x1.8p-140f};
-static const int NSPECIAL = sizeof SPECIAL / sizeof SPECIAL[0];
 
 // Two-argument special values: every pair of SPECIAL against the host's
 // double function (C99 Annex F), which must agree exactly when exact.
