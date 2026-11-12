@@ -638,10 +638,10 @@ static ocu_status mt_kernel_launch(ocu_queue *q, ocu_kernel *k, const ocu_launch
                                                  options:MTLResourceStorageModeShared];
         [enc setBuffer:argbuf offset:0 atIndex:0];
         [enc setBuffer:offbuf offset:0 atIndex:1];
-        if (p->shared_memory_bytes > 0) {
-            NSUInteger len = (p->shared_memory_bytes + 15) / 16 * 16;
-            [enc setThreadgroupMemoryLength:len atIndex:0];
-        }
+        /* Translated kernels always declare threadgroup memory 0; give it
+           at least the minimum length even when the launch asks for none. */
+        NSUInteger len = (p->shared_memory_bytes + 15) / 16 * 16;
+        [enc setThreadgroupMemoryLength:(len < 16 ? 16 : len) atIndex:0];
         /* Every allocation may be reached through a pointer argument. */
         pthread_mutex_lock(&d->lock);
         size_t n = d->count;
