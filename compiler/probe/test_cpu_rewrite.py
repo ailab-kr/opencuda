@@ -8,7 +8,8 @@ def rw(src):
 
 
 def launch(cfg, callee, args=""):
-    lam = f"[](auto &&...{LAMBDA_ARG}) {{ {callee}({LAMBDA_ARG}...); }}"
+    lam = (f"[](auto &&...{LAMBDA_ARG}) -> decltype({callee}({LAMBDA_ARG}...)) "
+           f"{{ {callee}({LAMBDA_ARG}...); }}")
     sep = ", " if args.strip() else ""
     return f"::ocu_cpu::launch(::ocu_cpu::cfg({cfg}), {lam}{sep}{args})"
 
@@ -151,9 +152,29 @@ class PreprocessedTests(unittest.TestCase):
     def test_shared_marker(self):
         src = "__global__ void f() { extern __ocu_shared__ float s[]; __ocu_shared__ int t[4]; }"
         out = rewrite(src, preprocessed=True)[0]
-        self.assertIn("static ::ocu_cpu::dyn_shared<float> s;", out)
+        self.assertIn("float *const s = static_cast<float *>(::ocu_cpu::dynamic_shared());", out)
         self.assertIn("static thread_local int t[4];", out)
         self.assertNotIn("__ocu_shared__", out)
+
+    def test_extern_shared_scope(self):
+        # review 5: inside a function a pointer, so casts to other element
+        # types work; at namespace scope a per-use lookup
+        out = rw("template <class T> __global__ void f(T *o) {\n"
+                 "  if (o) { extern __shared__ unsigned char smem[]; }\n}\n")
+        self.assertIn("unsigned char *const smem = static_cast<unsigned char *>(", out)
+        out = rw("namespace n { extern __shared__ float g[]; }\n")
+        self.assertIn("static ::ocu_cpu::dyn_shared<float> g;", out)
+        out = rw("struct S { void m() const { extern __shared__ int a[]; } };")
+        self.assertIn("int *const a =", out)
+
+    def test_template_operator_is_not_a_launch(self):
+        src = "friend std::ostream &operator<< <>(std::ostream &, const Foo<T> &);"
+        self.assertEqual(rw(src), src)
+
+    def test_null_stream_in_config(self):
+        self.assertEqual(rw("k<<<g, b, 0, NULL>>>(x);"), launch("g, b, 0, nullptr", "k", "x") + ";")
+        # a literal 0 in the configuration stays 0 (shared bytes, stream)
+        self.assertEqual(rw("k<<<g, b, 0, 0>>>(x);"), launch("g, b, 0, 0", "k", "x") + ";")
 
     def test_many_launches_in_a_large_unit(self):
         body = "".join(f"k{i}<<<1, {i}>>>(p);\n" for i in range(200))

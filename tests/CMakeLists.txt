@@ -137,16 +137,28 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   add_test(NAME runtime_lang_random COMMAND rt_lang)
   set_tests_properties(runtime_lang_random PROPERTIES
     ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_THREADS=3;OCU_CPU_WARP=64")
+  ocu_add_cpu_cu_executable(rt_review runtime/rt_review.cu)
+  add_test(NAME runtime_review COMMAND rt_review)
+  add_test(NAME runtime_review_random COMMAND rt_review)
+  set_tests_properties(runtime_review_random PROPERTIES
+    ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_THREADS=2")
   ocu_add_cpu_cu_executable(ocu_cc_saxpy probe/main_saxpy.cu
     ${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu)
   add_test(NAME ocu_cc_cpu_saxpy COMMAND ocu_cc_saxpy)
 
-  # The installed package works for a project outside this tree.
-  add_test(NAME install_package
-    COMMAND ${CMAKE_COMMAND} -DBUILD=${PROJECT_BINARY_DIR}
-            -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/install
-            -DWORK=${CMAKE_CURRENT_BINARY_DIR}/install_test
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/install/install_test.cmake)
+  # The installed package works for a project outside this tree, built
+  # with the same compilers and flags (sanitizers included). Not when
+  # cross-compiling: the consumer would need the whole toolchain setup.
+  if(NOT CMAKE_CROSSCOMPILING)
+    add_test(NAME install_package
+      COMMAND ${CMAKE_COMMAND} -DBUILD=${PROJECT_BINARY_DIR}
+              -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/install
+              -DWORK=${CMAKE_CURRENT_BINARY_DIR}/install_test
+              -DCC=${CMAKE_C_COMPILER} -DCXX=${CMAKE_CXX_COMPILER}
+              "-DCFLAGS=${CMAKE_C_FLAGS}" "-DCXXFLAGS=${CMAKE_CXX_FLAGS}"
+              "-DLDFLAGS=${CMAKE_EXE_LINKER_FLAGS}"
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/install/install_test.cmake)
+  endif()
 
   # GPU-target compiles need an LLVM clang with the NVPTX and AMDGPU
   # back ends (Apple's clang has neither).

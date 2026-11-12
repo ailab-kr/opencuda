@@ -1,6 +1,7 @@
 # Install the build into a fresh prefix, then configure, build and run a
 # separate project against it with find_package(Ocu).
-#   cmake -DBUILD=<build dir> -DSRC=<this folder> -DWORK=<scratch> -P install_test.cmake
+#   cmake -DBUILD=<build dir> -DSRC=<this folder> -DWORK=<scratch>
+#         -DCC=.. -DCXX=.. -DCFLAGS=.. -DCXXFLAGS=.. -DLDFLAGS=.. -P install_test.cmake
 file(REMOVE_RECURSE ${WORK})
 file(MAKE_DIRECTORY ${WORK})
 macro(run)
@@ -10,7 +11,10 @@ macro(run)
   endif()
 endmacro()
 run(${CMAKE_COMMAND} --install ${BUILD} --prefix ${WORK}/prefix)
-run(${CMAKE_COMMAND} -S ${SRC}/consumer -B ${WORK}/build -DCMAKE_PREFIX_PATH=${WORK}/prefix)
+run(${CMAKE_COMMAND} -S ${SRC}/consumer -B ${WORK}/build -DCMAKE_PREFIX_PATH=${WORK}/prefix
+    -DCMAKE_C_COMPILER=${CC} -DCMAKE_CXX_COMPILER=${CXX}
+    "-DCMAKE_C_FLAGS=${CFLAGS}" "-DCMAKE_CXX_FLAGS=${CXXFLAGS}"
+    "-DCMAKE_EXE_LINKER_FLAGS=${LDFLAGS}")
 run(${CMAKE_COMMAND} --build ${WORK}/build)
 foreach(exe consumer_saxpy consumer_host)
   run(${WORK}/build/${exe})
