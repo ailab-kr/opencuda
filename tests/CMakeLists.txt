@@ -124,24 +124,16 @@ endif()
 if(OCU_BACKEND_CPU AND Python3_FOUND)
   set(OCU_CC ${PROJECT_SOURCE_DIR}/compiler/probe/ocu_cc.py)
   set(OCU_CC_OUT ${CMAKE_CURRENT_BINARY_DIR}/ocu_cc)
-  add_custom_command(
-    OUTPUT ${OCU_CC_OUT}/probe_kernel.cpu.o
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${OCU_CC_OUT}
-    COMMAND ${CMAKE_COMMAND} -E env CXX=${CMAKE_CXX_COMPILER}
-            ${Python3_EXECUTABLE} ${OCU_CC} --target cpu -O2
-            -I ${PROJECT_SOURCE_DIR}/runtime/core
-            -c ${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu
-            -o ${OCU_CC_OUT}/probe_kernel.cpu.o
-    DEPENDS ${OCU_CC} ${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu
-            ${PROJECT_SOURCE_DIR}/compiler/probe/cpu_rewrite.py
-            ${PROJECT_SOURCE_DIR}/compiler/probe/probe_cpu.h
-    COMMENT "ocu_cc.py --target cpu probe_kernel.cu")
-  add_executable(ocu_cc_saxpy probe/main_saxpy.cpp
-    ${PROJECT_SOURCE_DIR}/compiler/probe/probe_cpu_runtime.cpp
-    ${OCU_CC_OUT}/probe_kernel.cpu.o)
-  target_include_directories(ocu_cc_saxpy PRIVATE ${PROJECT_SOURCE_DIR}/compiler/probe)
-  target_compile_definitions(ocu_cc_saxpy PRIVATE OCU_CPU_PATH)
-  target_link_libraries(ocu_cc_saxpy PRIVATE ocu_core ocu_backend_cpu)
+
+  # Ordinary CUDA programs on the CPU path: runtime API + launches.
+  include(OcuCpuPath)
+  ocu_add_cpu_cu_executable(rt_api runtime/rt_api.cu)
+  add_test(NAME runtime_api COMMAND rt_api)
+  add_test(NAME runtime_api_random COMMAND rt_api)
+  set_tests_properties(runtime_api_random PROPERTIES
+    ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_THREADS=3")
+  ocu_add_cpu_cu_executable(ocu_cc_saxpy probe/main_saxpy.cu
+    ${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu)
   add_test(NAME ocu_cc_cpu_saxpy COMMAND ocu_cc_saxpy)
 
   # GPU-target compiles need an LLVM clang with the NVPTX and AMDGPU
