@@ -38,6 +38,7 @@
 #endif
 
 #define NS_ALIGN        256u  /* allocation granularity */
+#define NS_GAP          256u  /* unmapped bytes kept between allocations */
 #define NS_TENSOR_ALIGN 64u   /* required alignment of op tensors */
 #define NS_MAGIC_QUEUE  0x6e737171u
 #define NS_MAGIC_MARKER 0x6e736d6bu
@@ -203,12 +204,12 @@ static ocu_status ns_mem_alloc(ocu_device *dev, size_t bytes, void **ptr)
     uintptr_t at = G.base;
     ns_alloc **link = &G.allocs;
     while (*link != NULL) {
-        if ((*link)->base - at >= need) break;
+        if ((*link)->base >= at && (*link)->base - at >= need + NS_GAP) break;
         uintptr_t end = (*link)->base + (*link)->bytes;
-        at = (end + NS_ALIGN - 1) / NS_ALIGN * NS_ALIGN;
+        at = (end + NS_ALIGN - 1) / NS_ALIGN * NS_ALIGN + NS_GAP;
         link = &(*link)->next;
     }
-    if (G.base + G.mem_bytes - at < need) {
+    if (at > G.base + G.mem_bytes || G.base + G.mem_bytes - at < need) {
         pthread_mutex_unlock(&g_lock);
         free(n);
         return OCU_ERR_OUT_OF_MEMORY;
@@ -601,15 +602,16 @@ static ocu_status ns_op_support(ocu_device *dev, ocu_op op, ocu_dtype dtype, ocu
     out->layouts = OCU_LAYOUT_DENSE | OCU_LAYOUT_ROW_STRIDED;
     out->max_rank = op == OCU_OP_GEMM ? 3u : OCU_OPS_MAX_RANK;
     if (op == OCU_OP_RMS_NORM || op == OCU_OP_SOFTMAX) {
-        /* Longest row that fits, weight included, input dtype on both sides. */
-        uint64_t per = op == OCU_OP_RMS_NORM ? 3u * in : 2u * in;
+        /* Longest row query accepts (no weight; input dtype on both sides). */
+        uint64_t per = 2u * in;
         if (G.scratch_bytes < 64u + per) return OCU_ERR_NOT_SUPPORTED;
         out->max_row = (int64_t)((G.scratch_bytes - 64u) / per);
     }
     out->align_bytes = NS_TENSOR_ALIGN;
     out->accum_dtype = OCU_DT_F32;
     out->out_dtypes = 1u << dtype;
-    if (op == OCU_OP_GEMM && (G.dtype_mask & (1u << OCU_DT_F32))) out->out_dtypes |= 1u << OCU_DT_F32;
+    /* OCU_NPUSIM_DTYPES limits inputs only: f32 C stays accepted. */
+    if (op == OCU_OP_GEMM) out->out_dtypes |= 1u << OCU_DT_F32;
     out->needs_plan_ms = G.plan_ms;
     out->var_rows = 1;
     return OCU_OK;

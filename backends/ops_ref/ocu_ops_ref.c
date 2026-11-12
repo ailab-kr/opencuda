@@ -197,7 +197,7 @@ ocu_status ocu_ref_check_desc(const ocu_op_desc *d)
         want_lo = want_hi = 3; break;
     case OCU_OP_RMS_NORM: want_lo = 2; want_hi = 3; break;
     case OCU_OP_SOFTMAX:  want_lo = want_hi = 2; break;
-    case OCU_OP_QMATMUL:  return OCU_ERR_NOT_SUPPORTED;
+    case OCU_OP_QMATMUL:  want_lo = 1; want_hi = OCU_OPS_MAX_TENSORS; break;
     default:              return OCU_ERR_INVALID_VALUE;
     }
     uint32_t n = d->num_tensors;
@@ -207,6 +207,7 @@ ocu_status ocu_ref_check_desc(const ocu_op_desc *d)
         if (!tensor_ok(&d->tensors[i])) return OCU_ERR_INVALID_VALUE;
         if (!is_float(d->tensors[i].dtype)) listed = 0;
     }
+    if (d->op == OCU_OP_QMATMUL) return OCU_ERR_NOT_SUPPORTED; /* reserved */
     const ocu_tensor_desc *t = d->tensors;
     /* Variable rows vary shape[0] of a row / element-wise output. */
     if ((d->flags & OCU_OP_FLAG_VAR_ROWS) && d->op != OCU_OP_GEMM && t[n - 1].rank < 2) {
@@ -245,6 +246,9 @@ ocu_status ocu_ref_check_desc(const ocu_op_desc *d)
         if (t[1].dtype != t[0].dtype) return OCU_ERR_INVALID_VALUE;
         return OCU_OK;
     case OCU_OP_ROPE:
+        for (uint32_t i = 0; i < n; ++i) {
+            if (ocu_dtype_is_blocked(t[i].dtype)) return OCU_ERR_NOT_SUPPORTED;
+        }
         return OCU_ERR_NOT_IMPLEMENTED;
     default:
         return OCU_ERR_INVALID_VALUE;
