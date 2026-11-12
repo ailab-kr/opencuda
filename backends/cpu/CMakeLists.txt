@@ -21,7 +21,13 @@ if(_ocu_fast_switch)
 endif()
 
 add_library(ocu_backend_cpu STATIC ${_ocu_cpu_sources})
-target_include_directories(ocu_backend_cpu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(ocu_backend_cpu PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+  $<INSTALL_INTERFACE:${OCU_INSTALL_INCLUDEDIR}>)
+set_target_properties(ocu_backend_cpu PROPERTIES EXPORT_NAME backend_cpu)
+install(TARGETS ocu_backend_cpu EXPORT OcuTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+# Public headers only: the device-side API and the backend entry point.
+install(FILES ocu_backend_cpu.h ocu_cpu_kernel.h DESTINATION ${OCU_INSTALL_INCLUDEDIR})
 target_link_libraries(ocu_backend_cpu PUBLIC ocu_backend_interface Threads::Threads)
 if(NOT APPLE)
   target_link_libraries(ocu_backend_cpu PUBLIC m)

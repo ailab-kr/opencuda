@@ -2,7 +2,12 @@
 # through it.
 add_library(ocu_backend_interface INTERFACE)
 target_include_directories(ocu_backend_interface INTERFACE
-  ${CMAKE_CURRENT_SOURCE_DIR}/interface)
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/interface>
+  $<INSTALL_INTERFACE:${OCU_INSTALL_INCLUDEDIR}>)
+set_target_properties(ocu_backend_interface PROPERTIES EXPORT_NAME backend_interface)
+install(TARGETS ocu_backend_interface EXPORT OcuTargets)
+install(FILES interface/ocu_backend.h interface/ocu_blas_provider.h
+        DESTINATION ${OCU_INSTALL_INCLUDEDIR})
 
 if(OCU_BACKEND_CPU)
   add_subdirectory(cpu)

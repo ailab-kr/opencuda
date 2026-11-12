@@ -70,6 +70,17 @@ def _llvm_tool(name: str) -> str:
     return name
 
 
+def header_dirs() -> list[Path]:
+    """Our headers: one folder in an installed package (<prefix>/include/ocu
+    next to <prefix>/libexec/ocu/ocu_cc.py), three in the source tree. The
+    first holds cuda_runtime.h."""
+    installed = HERE.parent.parent / "include" / "ocu"
+    if (installed / "cuda_runtime.h").is_file() and not (REPO / "runtime" / "include").is_dir():
+        return [installed]
+    return [REPO / "runtime" / "include", REPO / "backends" / "interface",
+            REPO / "backends" / "cpu"]
+
+
 def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
     codegen = []  # options that matter after preprocessing
     if args.O:
@@ -85,9 +96,9 @@ def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
 
     if args.target == "cpu":
         cxx = os.environ.get("CXX", "c++")
-        rt = REPO / "runtime" / "include"
-        ours = [f"-I{rt}", f"-I{REPO / 'backends' / 'interface'}",
-                f"-I{REPO / 'backends' / 'cpu'}"]
+        dirs = header_dirs()
+        rt = dirs[0]
+        ours = [f"-I{d}" for d in dirs]
         if src.suffix in (".c",):
             cc = os.environ.get("CC", "cc")
             return [[cc, *ours, *common, "-c", str(src), "-o", str(out)]]
