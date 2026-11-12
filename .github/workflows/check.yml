@@ -1,0 +1,35 @@
+# Full repository check (tools/check.sh): gcc and clang builds, address,
+# undefined-behaviour and thread sanitizers, AArch64 under qemu, harness
+# tests, the compiler probe for NVIDIA and AMD targets, the clean-room guard.
+#
+# Manual only for now: the repository is private and runner minutes count
+# against the organisation's quota. Add push/pull_request triggers when the
+# maintainers decide.
+name: check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build python3 clang-18 llvm-18 lld-18 \
+            g++-aarch64-linux-gnu qemu-user
+      - name: tools/check.sh
+        run: sh tools/check.sh "$RUNNER_TEMP/ocu-check"
+      - name: Logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-logs
+          path: ${{ runner.temp }}/ocu-check/*.log
