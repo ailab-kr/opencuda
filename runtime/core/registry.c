@@ -14,6 +14,9 @@
 #ifdef OCU_HAVE_BACKEND_NVIDIA
 #include "ocu_backend_nvidia.h"
 #endif
+#ifdef OCU_HAVE_BACKEND_METAL
+#include "ocu_backend_metal.h"
+#endif
 
 #define OCU_MAX_BACKENDS 8
 
@@ -84,6 +87,9 @@ static void register_builtin_once(void)
 #endif
 #ifdef OCU_HAVE_BACKEND_NVIDIA
     (void)register_locked(ocu_backend_nvidia());
+#endif
+#ifdef OCU_HAVE_BACKEND_METAL
+    (void)register_locked(ocu_backend_metal());
 #endif
     pthread_mutex_unlock(&g_lock);
 }

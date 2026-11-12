@@ -3,6 +3,7 @@ project(ocu VERSION 0.0.1 LANGUAGES C CXX)
 
 option(OCU_BACKEND_CPU "Build the CPU reference backend" ON)
 option(OCU_BACKEND_NVIDIA "Build the NVIDIA GPU backend (uses the installed driver at run time)" ${UNIX})
+option(OCU_BACKEND_METAL "Build the Apple GPU (Metal) backend" ${APPLE})
 option(OCU_BACKEND_AMD "Build the AMD GPU backend (not available yet)" OFF)
 option(OCU_BACKEND_INTEL "Build the Intel GPU backend (not available yet)" OFF)
 option(OCU_BUILD_TESTS "Build smoke tests" ON)
