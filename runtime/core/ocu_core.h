@@ -21,6 +21,13 @@ ocu_status ocu_register_backend(const ocu_backend *backend);
 ocu_status ocu_select_backend(const char *name);
 
 /*
+ * The backend to use when nothing chose one before first use and
+ * OCU_BACKEND is unset (e.g. the one whose device code a program carries).
+ * No effect after the first use. OCU_ERR_NOT_FOUND when not built in.
+ */
+ocu_status ocu_prefer_backend(const char *name);
+
+/*
  * The active backend. On first use it is chosen by the OCU_BACKEND
  * environment variable, or the first registered backend when unset.
  * Returns NULL when no backend is available or OCU_BACKEND names an

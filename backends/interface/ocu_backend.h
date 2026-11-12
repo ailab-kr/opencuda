@@ -23,7 +23,7 @@
 extern "C" {
 #endif
 
-#define OCU_BACKEND_ABI 1u
+#define OCU_BACKEND_ABI 2u
 
 /* Largest total size of one launch's argument values, in bytes. */
 #define OCU_MAX_ARG_BYTES 32768u
@@ -171,6 +171,25 @@ typedef struct ocu_backend {
      * May itself be NULL.
      */
     const void *(*get_provider)(const char *library);
+
+    /*
+     * Optional (ABI 2). May be NULL.
+     *
+     * module_get_global: device address and size of a variable defined in
+     * the module's device code (`__device__` / `__constant__` variables), by
+     * its device-code name. The address is a device pointer accepted by
+     * mem_copy and mem_set for `bytes` bytes. OCU_ERR_NOT_FOUND if absent.
+     *
+     * kernel_arg_sizes: the kernel's parameter count and the size in bytes
+     * of each parameter, as the device code declares them, for callers that
+     * hold only an array of argument pointers (an API launch). At most
+     * `max` sizes are written; `*count` is the real count. Backends whose
+     * images carry no parameter list return OCU_ERR_NOT_SUPPORTED.
+     */
+    ocu_status (*module_get_global)(ocu_module *module, const char *name,
+                                    void **ptr, size_t *bytes);
+    ocu_status (*kernel_arg_sizes)(ocu_kernel *kernel, uint32_t *count,
+                                   size_t *sizes, uint32_t max);
 } ocu_backend;
 
 /* Human-readable name of a status value. Never returns NULL. */

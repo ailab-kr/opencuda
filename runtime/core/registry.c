@@ -11,6 +11,9 @@
 #ifdef OCU_HAVE_BACKEND_CPU
 #include "ocu_backend_cpu.h"
 #endif
+#ifdef OCU_HAVE_BACKEND_NVIDIA
+#include "ocu_backend_nvidia.h"
+#endif
 
 #define OCU_MAX_BACKENDS 8
 
@@ -25,8 +28,9 @@ static const ocu_backend *g_backends[OCU_MAX_BACKENDS];
 static size_t             g_backend_count;
 static const ocu_backend *g_active;
 static int                g_active_chosen; /* the first-use choice was made */
+static char               g_preferred[32]; /* default choice when OCU_BACKEND is unset */
 
-/* Every entry except get_provider is mandatory. */
+/* Every entry except get_provider and the ABI 2 optional ones is mandatory. */
 static int table_is_complete(const ocu_backend *b)
 {
     return b->dev_count && b->dev_info && b->dev_open && b->dev_close &&
@@ -78,6 +82,9 @@ static void register_builtin_once(void)
 #ifdef OCU_HAVE_BACKEND_CPU
     (void)register_locked(ocu_backend_cpu());
 #endif
+#ifdef OCU_HAVE_BACKEND_NVIDIA
+    (void)register_locked(ocu_backend_nvidia());
+#endif
     pthread_mutex_unlock(&g_lock);
 }
 
@@ -120,6 +127,8 @@ const ocu_backend *ocu_active_backend(void)
         const char *want = getenv("OCU_BACKEND");
         if (want != NULL && want[0] != '\0') {
             g_active = find_backend(want); /* NULL when unknown: caller reports */
+        } else if (g_preferred[0] != '\0' && find_backend(g_preferred) != NULL) {
+            g_active = find_backend(g_preferred);
         } else if (g_backend_count > 0) {
             g_active = g_backends[0];
         }
@@ -128,6 +137,23 @@ const ocu_backend *ocu_active_backend(void)
     const ocu_backend *b = g_active;
     pthread_mutex_unlock(&g_lock);
     return b;
+}
+
+ocu_status ocu_prefer_backend(const char *name)
+{
+    register_builtin_backends();
+    if (name == NULL || strlen(name) >= sizeof(g_preferred)) {
+        return OCU_ERR_INVALID_VALUE;
+    }
+    pthread_mutex_lock(&g_lock);
+    ocu_status st = OCU_OK;
+    if (find_backend(name) == NULL) {
+        st = OCU_ERR_NOT_FOUND;
+    } else if (!g_active_chosen) {
+        memcpy(g_preferred, name, strlen(name) + 1);
+    }
+    pthread_mutex_unlock(&g_lock);
+    return st;
 }
 
 ocu_status ocu_core_device(const ocu_backend **backend, ocu_device **device)

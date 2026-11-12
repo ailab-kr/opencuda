@@ -13,6 +13,11 @@ if(OCU_BACKEND_CPU)
   add_subdirectory(cpu)
 endif()
 
+if(OCU_BACKEND_NVIDIA)
+  find_package(Threads REQUIRED)
+  add_subdirectory(nvidia)
+endif()
+
 if(OCU_BACKEND_AMD)
   message(FATAL_ERROR "The AMD backend is not implemented yet (see backends/amd/README.md).")
 endif()

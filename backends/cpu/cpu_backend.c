@@ -175,6 +175,8 @@ static const ocu_backend cpu_backend = {
     .marker_query = cpu_marker_query,
     .marker_elapsed_ms = cpu_marker_elapsed_ms,
     .get_provider = cpu_get_provider,
+    .module_get_global = NULL, /* host addresses are device addresses */
+    .kernel_arg_sizes = NULL,  /* CPU images are called with typed thunks */
 };
 
 const ocu_backend *ocu_backend_cpu(void)
