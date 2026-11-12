@@ -132,6 +132,14 @@ if (cd $C/nn && build nn nn_cuda.cu); then
     r=$(cd $C/nn && python3 "$HERE/nn_check.py" flist 10 30 90 ocu.txt); report nn "$(verdict "$r")" "$r"
 else report nn BUILD-FAIL "$(head -c 200 $C/nn/.ocu/build.log)"; fi
 
+# streamcluster: centres against the OpenMP version on one thread (both
+# draw from lrand48 with the same fixed seed)
+if (cd $C/streamcluster && build sc streamcluster_cuda_cpu.cpp streamcluster_cuda.cu streamcluster_header.cu); then
+    (cd $C/streamcluster && ./sc 10 20 16 4096 4096 1000 none ocu.txt 1 > /dev/null 2>&1)
+    (cd $O/streamcluster && g++ -O2 -fopenmp streamcluster_omp.cpp -o sc_omp -lpthread 2>/dev/null         && ./sc_omp 10 20 16 4096 4096 1000 none ref.txt 1 > /dev/null 2>&1)
+    r=$(cmp_num $C/streamcluster/ocu.txt $O/streamcluster/ref.txt 1e-5); report streamcluster "$(verdict "$r")" "$r vs OpenMP"
+else report streamcluster BUILD-FAIL "$(head -c 200 $C/streamcluster/.ocu/build.log)"; fi
+
 # Built and run to completion; no independent check yet.
 run_only() { # run_only <name> <dir> <exe> <run command> -- <build args>
     local name=$1 dir=$2 exe=$3 cmd=$4; shift 5
@@ -145,7 +153,6 @@ run_only gaussian $C/gaussian gaussian "./gaussian -s 256 -q" -- gaussian.cu
 run_only backprop $C/backprop backprop "./backprop 65536" -- backprop_cuda.cu backprop.c facetrain.c imagenet.c
 run_only srad_v2 $C/srad/srad_v2 srad "./srad 512 512 0 127 0 127 0.5 2" -- srad.cu
 run_only particlefilter $C/particlefilter pf "./pf -x 128 -y 128 -z 10 -np 1000" -- ex_particle_CUDA_float_seq.cu
-run_only streamcluster $C/streamcluster sc "./sc 10 20 16 4096 4096 1000 none sc.txt 1" -- streamcluster_cuda_cpu.cpp streamcluster_cuda.cu streamcluster_header.cu
 
 # Built only (they need input files this script does not generate).
 build_only() { # build_only <name> <dir> -- <build args>
