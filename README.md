@@ -9,9 +9,10 @@ CUDA용으로 짠 소스를 고치지 않고 다른 GPU에서 빌드해 실행�
 - **적합성 시험의 바탕**: BLAS의 정확한 기준 답, 오차 한계, 결과 기록 형식, 시험 묶음 자체의 검증(정상 구현은 통과, 일부러 망가뜨린 구현 15종은 모두 검출).
 - **실행 API와 헤더**(`runtime/`): 장치·오류·메모리(통합 메모리·포인터 조회 포함)·기호 복사·스트림·사건·실행·점유율 등 80여 개 함수, 벡터 형, 반정밀도(`cuda_fp16.h`), 장치 쪽 내장 변수·원자 연산·워프 함수. 공개 문서만 보고 새로 썼다. 실행 API 호출 기준(이름) llama.cpp의 87%, Rodinia의 90%.
 - **보통의 CUDA 프로그램을 CPU에서**: 공개 벤치마크 Rodinia의 CUDA 프로그램 18개 중 17개가 소스 수정 없이 빌드되고, 8개는 독립 기준(같은 프로그램의 OpenMP판, 계산식을 옮긴 직렬 구현, 프로그램 자체 검사)과 결과가 같다(`conformance/external/rodinia/`).
+- **엔비디아 GPU에서 실행**(`backends/nvidia/`): 설치된 드라이버의 공개 API만 실행 중에 불러 쓴다(빌드에 엔비디아 파일 불필요). 장치 코드는 공개 컴파일러(Clang)가 만든 PTX, 수학 함수는 직접 구현(`ocu_device_math.h`). RTX 5070 Ti에서 같은 CUDA 시험 프로그램 9개가 모두 통과하고, Rodinia는 CPU 경로와 같이 17개 빌드·9개 독립 기준과 일치.
 - **컴파일러 실험**: 고치지 않은 `.cu` 파일이 엔비디아(sm_80)·AMD(gfx1100, gfx1201)용으로 컴파일된다. CPU 경로는 전처리 뒤 실행 구문을 바꿔 C++로 컴파일한다(`compiler/probe/`, 배포 전 실험 단계).
 
-아직 없는 것: AMD·인텔 백엔드, nvcc와 같은 명령줄 드라이버, 텍스처·그래프·통합 메모리 같은 API.
+아직 없는 것: AMD·인텔·Apple GPU 백엔드, nvcc와 같은 명령줄 드라이버, 텍스처·그래프 API, 커널 시간 측정 대조.
 
 ## 읽을 순서
 
@@ -40,7 +41,8 @@ sh tools/check.sh
 보통의 CUDA 프로그램(Rodinia)을 CPU 경로로 빌드해 결과 대조(소스는 저장소 밖에 내려받는다):
 
 ```sh
-conformance/external/rodinia/run.sh build
+conformance/external/rodinia/run.sh build                      # CPU 경로
+OCU_TARGET=nvidia conformance/external/rodinia/run.sh build    # 엔비디아 GPU
 ```
 
 BLAS 기준 사례를 CPU 백엔드에서 실행하고 채점:
