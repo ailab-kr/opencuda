@@ -73,6 +73,17 @@ Features those files use that the CPU path does not support yet (number of files
 | Warp votes | 0 | 4 |
 | Inline PTX assembly | 0 | 4 |
 
+## Runtime functions real code calls (2026-11-12)
+
+`compiler/probe/survey_api.py` counted calls to the CUDA runtime in the same two code bases (text only):
+
+| Code base | Distinct runtime/library functions | Runtime calls | Covered by the 27 planned for phase 0 | Covered with 8 additions | Files fully covered: 27 / with additions |
+|---|---|---|---|---|---|
+| Rodinia | 39 | 908 | 87 % | 95 % | 21 / 40 of 49 |
+| llama.cpp ggml-cuda | 82 | 232 | 60 % | 76 % | 10 / 15 of 26 |
+
+The 8 additions: `cudaThreadSynchronize` (an old alias, 36 calls in 23 Rodinia files), `cudaMemcpyToSymbol` (34 calls; needs `__constant__`), `cudaMemsetAsync`, `cudaThreadExit`, `cudaEventCreateWithFlags`, `cudaStreamWaitEvent`, `cudaMemcpy2D`, `cudaMemcpy2DAsync`. Still outside after that: textures (Rodinia; the old texture-reference API they use is gone from current CUDA versions), graphs, peer copies and `cudaFuncSetAttribute` (llama.cpp), and the extended BLAS calls `cublasGemmEx`, `cublasGemmStridedBatchedEx` and the `cublasLt*` family (llama.cpp).
+
 ## CPU path limits found so far
 
 - Kernels launched from inside a kernel (dynamic parallelism) are refused with "not supported".
