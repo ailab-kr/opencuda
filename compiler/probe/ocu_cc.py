@@ -16,9 +16,9 @@ What it guarantees on every path:
     only content is a one-line version marker;
   - include paths that point into a vendor SDK are refused.
 
-cpu:    rewrite (cpu_rewrite.py) then compile as C++17 with probe_cpu.h.
-        Link the object with ocu_backend_cpu, ocu_core and
-        probe_cpu_runtime.cpp.
+cpu:    rewrite (cpu_rewrite.py) then compile as C++17 with our
+        cuda_runtime.h force-included (as nvcc does). Link with ocu_cudart
+        (see cmake/OcuCpuPath.cmake).
 nvidia: device code only, as PTX (-S).
 amd:    device code only, as a code object.
 """
@@ -82,9 +82,13 @@ def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
     if args.target == "cpu":
         rewritten = work / (src.stem + ".ocu.cpp")
         cxx = os.environ.get("CXX", "c++")
+        rt = REPO / "runtime" / "include"
         return [["<rewrite>", str(src), str(rewritten)],
                 [cxx, "-std=c++17", "-DOCU_CPU_PATH",
-                 f"-I{REPO / 'backends' / 'interface'}", f"-I{REPO / 'backends' / 'cpu'}",
+                 f"-I{rt}", f"-I{REPO / 'backends' / 'interface'}",
+                 f"-I{REPO / 'backends' / 'cpu'}",
+                 # nvcc includes cuda_runtime.h in every .cu file
+                 "-include", str(rt / "cuda_runtime.h"),
                  *common, "-c", str(rewritten), "-o", str(out)]]
     clang = _llvm_tool("clang++")
     if args.target == "nvidia":

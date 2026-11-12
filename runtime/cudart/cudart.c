@@ -1,0 +1,795 @@
+/*
+ * The runtime API (cuda_runtime_api.h) on top of the backend interface.
+ * Chip-neutral: nothing here knows which backend is active.
+ *
+ * Ordering model (the documented behaviour of the legacy default stream):
+ *   - stream 0 (and cudaStreamLegacy) is one backend queue per device;
+ *   - work submitted to the default stream first waits for every blocking
+ *     stream of the device; work submitted to a blocking stream first waits
+ *     for the default stream; non-blocking streams take part in neither;
+ *   - cudaMemcpy (not ...Async) returns when the copy is done.
+ * Waiting is done on the host by synchronising the queues involved, which
+ * keeps the order exact at some cost in overlap.
+ *
+ * Errors: every call records a failure as the calling thread's last error
+ * (cudaGetLastError returns and clears it, cudaPeekAtLastError only
+ * returns it). Failures of queued work surface at the next synchronising
+ * call on that queue as cudaErrorLaunchFailure or the backend's error.
+ */
+#define _POSIX_C_SOURCE 200809L
+
+#include "ocu_rt.h"
+#include "ocu_core.h"
+
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define MAX_DEVICES 16
+
+/* ---- objects ------------------------------------------------------------ */
+
+struct ocu_rt_stream {
+    ocu_queue           *queue;
+    unsigned             flags;
+    int                  device;
+    struct ocu_rt_stream *next;   /* the device's list of streams */
+};
+
+struct ocu_rt_event {
+    ocu_marker *marker;
+    unsigned    flags;
+    int         device;
+};
+
+typedef struct rt_device {
+    pthread_mutex_t       lock;
+    bool                  open;
+    ocu_device           *dev;
+    ocu_queue            *legacy;   /* the default stream */
+    struct ocu_rt_stream *streams;
+} rt_device;
+
+static const ocu_backend *g_backend;
+static int                g_device_count = -1;
+static rt_device          g_devices[MAX_DEVICES];
+static pthread_once_t     g_init_once = PTHREAD_ONCE_INIT;
+static cudaError_t        g_init_error = cudaSuccess;
+
+static _Thread_local int         tl_device;
+static _Thread_local cudaError_t tl_last_error = cudaSuccess;
+
+/* ---- errors -------------------------------------------------------------- */
+
+cudaError_t ocu_rt_error(ocu_status st)
+{
+    switch (st) {
+    case OCU_OK:                  return cudaSuccess;
+    case OCU_ERR_INVALID_VALUE:   return cudaErrorInvalidValue;
+    case OCU_ERR_INVALID_DEVICE:  return cudaErrorInvalidDevice;
+    case OCU_ERR_INVALID_HANDLE:  return cudaErrorInvalidResourceHandle;
+    case OCU_ERR_OUT_OF_MEMORY:   return cudaErrorMemoryAllocation;
+    case OCU_ERR_NOT_READY:       return cudaErrorNotReady;
+    case OCU_ERR_LAUNCH_FAILED:   return cudaErrorLaunchFailure;
+    case OCU_ERR_NOT_SUPPORTED:   return cudaErrorNotSupported;
+    case OCU_ERR_NOT_IMPLEMENTED: return cudaErrorNotSupported;
+    case OCU_ERR_NOT_FOUND:       return cudaErrorInvalidDeviceFunction;
+    case OCU_ERR_UNKNOWN:         return cudaErrorUnknown;
+    }
+    return cudaErrorUnknown;
+}
+
+/* Record a failure as the thread's last error; pass the value through. */
+static cudaError_t set_error(cudaError_t e)
+{
+    if (e != cudaSuccess && e != cudaErrorNotReady) {
+        tl_last_error = e;
+    }
+    return e;
+}
+
+static cudaError_t from(ocu_status st) { return set_error(ocu_rt_error(st)); }
+
+cudaError_t cudaGetLastError(void)
+{
+    cudaError_t e = tl_last_error;
+    tl_last_error = cudaSuccess;
+    return e;
+}
+
+cudaError_t cudaPeekAtLastError(void) { return tl_last_error; }
+
+const char *cudaGetErrorName(cudaError_t e)
+{
+    switch (e) {
+    case cudaSuccess:                     return "cudaSuccess";
+    case cudaErrorInvalidValue:           return "cudaErrorInvalidValue";
+    case cudaErrorMemoryAllocation:       return "cudaErrorMemoryAllocation";
+    case cudaErrorInitializationError:    return "cudaErrorInitializationError";
+    case cudaErrorInvalidConfiguration:   return "cudaErrorInvalidConfiguration";
+    case cudaErrorInvalidSymbol:          return "cudaErrorInvalidSymbol";
+    case cudaErrorInvalidMemcpyDirection: return "cudaErrorInvalidMemcpyDirection";
+    case cudaErrorInvalidDeviceFunction:  return "cudaErrorInvalidDeviceFunction";
+    case cudaErrorNoDevice:               return "cudaErrorNoDevice";
+    case cudaErrorInvalidDevice:          return "cudaErrorInvalidDevice";
+    case cudaErrorInvalidResourceHandle:  return "cudaErrorInvalidResourceHandle";
+    case cudaErrorNotReady:               return "cudaErrorNotReady";
+    case cudaErrorLaunchFailure:          return "cudaErrorLaunchFailure";
+    case cudaErrorNotSupported:           return "cudaErrorNotSupported";
+    case cudaErrorUnknown:                return "cudaErrorUnknown";
+    }
+    return "cudaErrorUnknown";
+}
+
+const char *cudaGetErrorString(cudaError_t e)
+{
+    switch (e) {
+    case cudaSuccess:                     return "no error";
+    case cudaErrorInvalidValue:           return "invalid argument";
+    case cudaErrorMemoryAllocation:       return "out of memory";
+    case cudaErrorInitializationError:    return "initialization error";
+    case cudaErrorInvalidConfiguration:   return "invalid launch configuration";
+    case cudaErrorInvalidSymbol:          return "invalid device symbol";
+    case cudaErrorInvalidMemcpyDirection: return "invalid copy direction";
+    case cudaErrorInvalidDeviceFunction:  return "invalid device function";
+    case cudaErrorNoDevice:               return "no device available";
+    case cudaErrorInvalidDevice:          return "invalid device ordinal";
+    case cudaErrorInvalidResourceHandle:  return "invalid resource handle";
+    case cudaErrorNotReady:               return "device not ready";
+    case cudaErrorLaunchFailure:          return "kernel launch failed";
+    case cudaErrorNotSupported:           return "operation not supported";
+    case cudaErrorUnknown:                return "unknown error";
+    }
+    return "unknown error";
+}
+
+/* ---- devices ------------------------------------------------------------- */
+
+static void init_once(void)
+{
+    ocu_device *ignored = NULL;
+    if (ocu_core_device(&g_backend, &ignored) != OCU_OK || g_backend == NULL) {
+        g_init_error = cudaErrorNoDevice;
+        g_device_count = 0;
+        return;
+    }
+    uint32_t n = 0;
+    if (g_backend->dev_count(&n) != OCU_OK) {
+        g_init_error = cudaErrorInitializationError;
+        n = 0;
+    }
+    g_device_count = n > MAX_DEVICES ? MAX_DEVICES : (int)n;
+    for (int i = 0; i < MAX_DEVICES; ++i) {
+        pthread_mutex_init(&g_devices[i].lock, NULL);
+    }
+    if (g_device_count == 0 && g_init_error == cudaSuccess) {
+        g_init_error = cudaErrorNoDevice;
+    }
+}
+
+static cudaError_t init(void)
+{
+    pthread_once(&g_init_once, init_once);
+    return g_init_error;
+}
+
+/* The device record for `index`, opened on first use. */
+static cudaError_t device_at(int index, rt_device **out)
+{
+    cudaError_t e = init();
+    if (e != cudaSuccess) {
+        return e;
+    }
+    if (index < 0 || index >= g_device_count) {
+        return cudaErrorInvalidDevice;
+    }
+    rt_device *d = &g_devices[index];
+    pthread_mutex_lock(&d->lock);
+    ocu_status st = OCU_OK;
+    if (!d->open) {
+        st = g_backend->dev_open((uint32_t)index, &d->dev);
+        if (st == OCU_OK) {
+            st = g_backend->queue_create(d->dev, &d->legacy);
+            if (st != OCU_OK) {
+                g_backend->dev_close(d->dev);
+            }
+        }
+        d->open = st == OCU_OK;
+    }
+    pthread_mutex_unlock(&d->lock);
+    if (st != OCU_OK) {
+        return ocu_rt_error(st);
+    }
+    *out = d;
+    return cudaSuccess;
+}
+
+static cudaError_t current(rt_device **out) { return device_at(tl_device, out); }
+
+const ocu_backend *ocu_rt_backend(void)
+{
+    rt_device *d;
+    if (set_error(current(&d)) != cudaSuccess) {
+        return NULL;
+    }
+    return g_backend;
+}
+
+ocu_device *ocu_rt_device(void)
+{
+    rt_device *d;
+    if (set_error(current(&d)) != cudaSuccess) {
+        return NULL;
+    }
+    return d->dev;
+}
+
+cudaError_t cudaGetDeviceCount(int *count)
+{
+    if (count == NULL) {
+        return set_error(cudaErrorInvalidValue);
+    }
+    cudaError_t e = init();
+    *count = g_device_count > 0 ? g_device_count : 0;
+    return set_error(e);
+}
+
+cudaError_t cudaGetDevice(int *device)
+{
+    if (device == NULL) {
+        return set_error(cudaErrorInvalidValue);
+    }
+    *device = tl_device;
+    return cudaSuccess;
+}
+
+cudaError_t cudaSetDevice(int device)
+{
+    cudaError_t e = init();
+    if (e != cudaSuccess) {
+        return set_error(e);
+    }
+    if (device < 0 || device >= g_device_count) {
+        return set_error(cudaErrorInvalidDevice);
+    }
+    tl_device = device;
+    return cudaSuccess;
+}
+
+cudaError_t cudaGetDeviceProperties(struct cudaDeviceProp *prop, int device)
+{
+    if (prop == NULL) {
+        return set_error(cudaErrorInvalidValue);
+    }
+    cudaError_t e = init();
+    if (e != cudaSuccess) {
+        return set_error(e);
+    }
+    if (device < 0 || device >= g_device_count) {
+        return set_error(cudaErrorInvalidDevice);
+    }
+    ocu_dev_info info;
+    ocu_status st = g_backend->dev_info((uint32_t)device, &info);
+    if (st != OCU_OK) {
+        return from(st);
+    }
+    memset(prop, 0, sizeof(*prop));
+    memcpy(prop->name, info.name, sizeof(prop->name));
+    prop->name[sizeof(prop->name) - 1] = '\0';
+    prop->totalGlobalMem = (size_t)info.total_memory_bytes;
+    prop->sharedMemPerBlock = (size_t)info.max_shared_memory_per_block;
+    prop->sharedMemPerBlockOptin = (size_t)info.max_shared_memory_per_block;
+    prop->sharedMemPerMultiprocessor = (size_t)info.max_shared_memory_per_block;
+    prop->regsPerBlock = 65536;
+    prop->regsPerMultiprocessor = 65536;
+    prop->warpSize = (int)info.warp_size;
+    prop->memPitch = SIZE_MAX / 2;
+    prop->maxThreadsPerBlock = (int)info.max_threads_per_block;
+    prop->maxThreadsPerMultiProcessor = (int)info.max_threads_per_block;
+    prop->maxBlocksPerMultiProcessor = 32;
+    for (int i = 0; i < 3; ++i) {
+        prop->maxThreadsDim[i] = (int)info.max_block_dim[i];
+        prop->maxGridSize[i] = (int)(info.max_grid_dim[i] > 2147483647u
+                                         ? 2147483647u : info.max_grid_dim[i]);
+    }
+    prop->clockRate = 1000000;
+    prop->memoryClockRate = 1000000;
+    prop->memoryBusWidth = 64;
+    prop->totalConstMem = 65536;
+    /* The capability this layer compiles device code for (sm_80). */
+    prop->major = 8;
+    prop->minor = 0;
+    prop->textureAlignment = 512;
+    prop->deviceOverlap = 1;
+    prop->asyncEngineCount = 1;
+    prop->multiProcessorCount = 1;
+    prop->concurrentKernels = 1;
+    prop->unifiedAddressing = info.supports_unified_memory ? 1 : 0;
+    prop->integrated = info.supports_unified_memory ? 1 : 0;
+    prop->l2CacheSize = 4 * 1024 * 1024;
+    return cudaSuccess;
+}
+
+cudaError_t cudaRuntimeGetVersion(int *version)
+{
+    if (version == NULL) {
+        return set_error(cudaErrorInvalidValue);
+    }
+    *version = CUDART_VERSION;
+    return cudaSuccess;
+}
+
+cudaError_t cudaDriverGetVersion(int *version)
+{
+    if (version == NULL) {
+        return set_error(cudaErrorInvalidValue);
+    }
+    *version = CUDART_VERSION;
+    return cudaSuccess;
+}
+
+/* Synchronise the default stream and every stream of the device. The first
+   failure wins; all queues are still waited for. */
+static cudaError_t sync_device(rt_device *d)
+{
+    ocu_status first = g_backend->queue_sync(d->legacy);
+    pthread_mutex_lock(&d->lock);
+    for (struct ocu_rt_stream *s = d->streams; s != NULL; s = s->next) {
+        ocu_status st = g_backend->queue_sync(s->queue);
+        if (first == OCU_OK) first = st;
+    }
+    pthread_mutex_unlock(&d->lock);
+    return ocu_rt_error(first);
+}
+
+cudaError_t cudaDeviceSynchronize(void)
+{
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) {
+        return set_error(e);
+    }
+    return set_error(sync_device(d));
+}
+
+cudaError_t cudaThreadSynchronize(void) { return cudaDeviceSynchronize(); }
+
+cudaError_t cudaDeviceReset(void)
+{
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) {
+        return set_error(e);
+    }
+    /* Finish all work; streams and events the program still holds stay
+       valid (their queues keep working). */
+    (void)sync_device(d);
+    tl_last_error = cudaSuccess;
+    return cudaSuccess;
+}
+
+cudaError_t cudaThreadExit(void) { return cudaDeviceReset(); }
+
+/* ---- stream resolution and the default-stream rules ---------------------- */
+
+/*
+ * The backend queue for `stream`, after applying the legacy ordering rule
+ * for work about to be submitted to it.
+ */
+static cudaError_t queue_for_submit(rt_device *d, cudaStream_t stream, ocu_queue **q)
+{
+    if (stream == NULL || stream == cudaStreamLegacy || stream == cudaStreamPerThread) {
+        /* Default stream: wait for every blocking stream first. */
+        pthread_mutex_lock(&d->lock);
+        ocu_status first = OCU_OK;
+        for (struct ocu_rt_stream *s = d->streams; s != NULL; s = s->next) {
+            if (!(s->flags & cudaStreamNonBlocking)) {
+                ocu_status st = g_backend->queue_sync(s->queue);
+                if (first == OCU_OK) first = st;
+            }
+        }
+        pthread_mutex_unlock(&d->lock);
+        *q = d->legacy;
+        return ocu_rt_error(first);
+    }
+    if (!(stream->flags & cudaStreamNonBlocking)) {
+        /* Blocking stream: wait for the default stream first. */
+        ocu_status st = g_backend->queue_sync(d->legacy);
+        if (st != OCU_OK) {
+            return ocu_rt_error(st);
+        }
+    }
+    *q = stream->queue;
+    return cudaSuccess;
+}
+
+/* The queue a synchronising call on `stream` waits for. */
+static ocu_queue *queue_of(rt_device *d, cudaStream_t stream)
+{
+    if (stream == NULL || stream == cudaStreamLegacy || stream == cudaStreamPerThread) {
+        return d->legacy;
+    }
+    return stream->queue;
+}
+
+/* ---- memory -------------------------------------------------------------- */
+
+cudaError_t cudaMalloc(void **ptr, size_t size)
+{
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    if (ptr == NULL) return set_error(cudaErrorInvalidValue);
+    return from(g_backend->mem_alloc(d->dev, size, ptr));
+}
+
+cudaError_t cudaFree(void *ptr)
+{
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    return from(g_backend->mem_free(d->dev, ptr)); /* waits for queued work */
+}
+
+cudaError_t cudaMallocHost(void **ptr, size_t size)
+{
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    if (ptr == NULL) return set_error(cudaErrorInvalidValue);
+    return from(g_backend->host_alloc_pinned(d->dev, size, ptr));
+}
+
+cudaError_t cudaFreeHost(void *ptr)
+{
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    return from(g_backend->host_free_pinned(d->dev, ptr));
+}
+
+cudaError_t cudaMemGetInfo(size_t *free_bytes, size_t *total_bytes)
+{
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    if (free_bytes == NULL || total_bytes == NULL) return set_error(cudaErrorInvalidValue);
+    uint64_t f = 0, t = 0;
+    ocu_status st = g_backend->mem_info(d->dev, &f, &t);
+    if (st == OCU_OK) {
+        *free_bytes = (size_t)f;
+        *total_bytes = (size_t)t;
+    }
+    return from(st);
+}
+
+static cudaError_t copy_dir(enum cudaMemcpyKind kind, ocu_copy_dir *dir)
+{
+    switch (kind) {
+    case cudaMemcpyHostToDevice:   *dir = OCU_COPY_HOST_TO_DEVICE; return cudaSuccess;
+    case cudaMemcpyDeviceToHost:   *dir = OCU_COPY_DEVICE_TO_HOST; return cudaSuccess;
+    case cudaMemcpyDeviceToDevice: *dir = OCU_COPY_DEVICE_TO_DEVICE; return cudaSuccess;
+    case cudaMemcpyHostToHost:     return cudaErrorNotReady; /* sentinel: plain copy */
+    case cudaMemcpyDefault:        return cudaErrorNotSupported; /* needs pointer kinds */
+    }
+    return cudaErrorInvalidMemcpyDirection;
+}
+
+static cudaError_t copy(void *dst, const void *src, size_t count, enum cudaMemcpyKind kind,
+                        cudaStream_t stream, bool wait)
+{
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    if (count == 0) return cudaSuccess;
+    ocu_copy_dir dir;
+    e = copy_dir(kind, &dir);
+    if (e == cudaErrorNotReady) { /* host to host: ordered after the stream */
+        ocu_queue *q;
+        e = queue_for_submit(d, stream, &q);
+        if (e == cudaSuccess) e = ocu_rt_error(g_backend->queue_sync(q));
+        if (e != cudaSuccess) return set_error(e);
+        if (dst == NULL || src == NULL) return set_error(cudaErrorInvalidValue);
+        memmove(dst, src, count);
+        return cudaSuccess;
+    }
+    if (e != cudaSuccess) return set_error(e);
+    ocu_queue *q;
+    e = queue_for_submit(d, stream, &q);
+    if (e != cudaSuccess) return set_error(e);
+    ocu_status st = g_backend->mem_copy(d->dev, q, dst, src, count, dir);
+    if (st == OCU_OK && wait) {
+        st = g_backend->queue_sync(q);
+    }
+    return from(st);
+}
+
+cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, enum cudaMemcpyKind kind)
+{
+    return copy(dst, src, count, kind, NULL, true);
+}
+
+cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count,
+                            enum cudaMemcpyKind kind, cudaStream_t stream)
+{
+    return copy(dst, src, count, kind, stream, false);
+}
+
+static cudaError_t copy2d(void *dst, size_t dpitch, const void *src, size_t spitch,
+                          size_t width, size_t height, enum cudaMemcpyKind kind,
+                          cudaStream_t stream, bool wait)
+{
+    if (width > dpitch || width > spitch) return set_error(cudaErrorInvalidValue);
+    if (width == 0 || height == 0) return cudaSuccess;
+    for (size_t row = 0; row < height; ++row) {
+        cudaError_t e = copy((char *)dst + row * dpitch, (const char *)src + row * spitch,
+                             width, kind, stream, false);
+        if (e != cudaSuccess) return e;
+    }
+    if (wait) {
+        rt_device *d;
+        cudaError_t e = current(&d);
+        if (e != cudaSuccess) return set_error(e);
+        return from(g_backend->queue_sync(queue_of(d, stream)));
+    }
+    return cudaSuccess;
+}
+
+cudaError_t cudaMemcpy2D(void *dst, size_t dpitch, const void *src, size_t spitch,
+                         size_t width, size_t height, enum cudaMemcpyKind kind)
+{
+    return copy2d(dst, dpitch, src, spitch, width, height, kind, NULL, true);
+}
+
+cudaError_t cudaMemcpy2DAsync(void *dst, size_t dpitch, const void *src, size_t spitch,
+                              size_t width, size_t height, enum cudaMemcpyKind kind,
+                              cudaStream_t stream)
+{
+    return copy2d(dst, dpitch, src, spitch, width, height, kind, stream, false);
+}
+
+static cudaError_t fill(void *ptr, int value, size_t count, cudaStream_t stream)
+{
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    ocu_queue *q;
+    e = queue_for_submit(d, stream, &q);
+    if (e != cudaSuccess) return set_error(e);
+    return from(g_backend->mem_set(d->dev, q, ptr, value, count));
+}
+
+cudaError_t cudaMemset(void *ptr, int value, size_t count)
+{
+    return fill(ptr, value, count, NULL);
+}
+
+cudaError_t cudaMemsetAsync(void *ptr, int value, size_t count, cudaStream_t stream)
+{
+    return fill(ptr, value, count, stream);
+}
+
+/*
+ * Symbols: the address of a __device__ / __constant__ variable. On
+ * backends with unified memory (the CPU backend) that host address is the
+ * device address and the copy is a plain copy after the default stream.
+ * Other backends need module-level symbol lookup: not supported yet.
+ */
+static cudaError_t symbol_copy(void *dst, const void *src, size_t count)
+{
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    ocu_dev_info info;
+    ocu_status st = g_backend->dev_info((uint32_t)tl_device, &info);
+    if (st != OCU_OK) return from(st);
+    if (!info.supports_unified_memory) return set_error(cudaErrorNotSupported);
+    ocu_queue *q;
+    e = queue_for_submit(d, NULL, &q);
+    if (e == cudaSuccess) e = ocu_rt_error(g_backend->queue_sync(q));
+    if (e != cudaSuccess) return set_error(e);
+    if (count > 0) memmove(dst, src, count);
+    return cudaSuccess;
+}
+
+cudaError_t cudaMemcpyToSymbol(const void *symbol, const void *src, size_t count,
+                               size_t offset, enum cudaMemcpyKind kind)
+{
+    if (symbol == NULL || (src == NULL && count > 0)) return set_error(cudaErrorInvalidSymbol);
+    if (kind != cudaMemcpyHostToDevice && kind != cudaMemcpyDeviceToDevice &&
+        kind != cudaMemcpyDefault) {
+        return set_error(cudaErrorInvalidMemcpyDirection);
+    }
+    return symbol_copy((char *)(uintptr_t)symbol + offset, src, count);
+}
+
+cudaError_t cudaMemcpyFromSymbol(void *dst, const void *symbol, size_t count, size_t offset,
+                                 enum cudaMemcpyKind kind)
+{
+    if (symbol == NULL || (dst == NULL && count > 0)) return set_error(cudaErrorInvalidSymbol);
+    if (kind != cudaMemcpyDeviceToHost && kind != cudaMemcpyDeviceToDevice &&
+        kind != cudaMemcpyDefault) {
+        return set_error(cudaErrorInvalidMemcpyDirection);
+    }
+    return symbol_copy(dst, (const char *)symbol + offset, count);
+}
+
+/* ---- streams ------------------------------------------------------------- */
+
+cudaError_t cudaStreamCreateWithFlags(cudaStream_t *stream, unsigned int flags)
+{
+    if (stream == NULL || (flags & ~cudaStreamNonBlocking) != 0) {
+        return set_error(cudaErrorInvalidValue);
+    }
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    struct ocu_rt_stream *s = calloc(1, sizeof(*s));
+    if (s == NULL) return set_error(cudaErrorMemoryAllocation);
+    ocu_status st = g_backend->queue_create(d->dev, &s->queue);
+    if (st != OCU_OK) {
+        free(s);
+        return from(st);
+    }
+    s->flags = flags;
+    s->device = tl_device;
+    pthread_mutex_lock(&d->lock);
+    s->next = d->streams;
+    d->streams = s;
+    pthread_mutex_unlock(&d->lock);
+    *stream = s;
+    return cudaSuccess;
+}
+
+cudaError_t cudaStreamCreate(cudaStream_t *stream)
+{
+    return cudaStreamCreateWithFlags(stream, cudaStreamDefault);
+}
+
+static bool is_default(cudaStream_t s)
+{
+    return s == NULL || s == cudaStreamLegacy || s == cudaStreamPerThread;
+}
+
+cudaError_t cudaStreamDestroy(cudaStream_t stream)
+{
+    if (is_default(stream)) return set_error(cudaErrorInvalidResourceHandle);
+    rt_device *d;
+    cudaError_t e = device_at(stream->device, &d);
+    if (e != cudaSuccess) return set_error(e);
+    pthread_mutex_lock(&d->lock);
+    bool found = false;
+    for (struct ocu_rt_stream **pp = &d->streams; *pp != NULL; pp = &(*pp)->next) {
+        if (*pp == stream) {
+            *pp = stream->next;
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&d->lock);
+    if (!found) return set_error(cudaErrorInvalidResourceHandle);
+    ocu_status st = g_backend->queue_destroy(stream->queue); /* finishes queued work */
+    free(stream);
+    return from(st);
+}
+
+cudaError_t cudaStreamSynchronize(cudaStream_t stream)
+{
+    rt_device *d;
+    cudaError_t e = is_default(stream) ? current(&d) : device_at(stream->device, &d);
+    if (e != cudaSuccess) return set_error(e);
+    return from(g_backend->queue_sync(queue_of(d, stream)));
+}
+
+cudaError_t cudaStreamQuery(cudaStream_t stream)
+{
+    rt_device *d;
+    cudaError_t e = is_default(stream) ? current(&d) : device_at(stream->device, &d);
+    if (e != cudaSuccess) return set_error(e);
+    return from(g_backend->queue_query(queue_of(d, stream)));
+}
+
+/*
+ * Later work on `stream` waits for the event's current record. The wait is
+ * done on the host here, which keeps the order and gives up overlap.
+ */
+cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t event, unsigned int flags)
+{
+    (void)stream;
+    if (event == NULL || flags != 0) return set_error(cudaErrorInvalidValue);
+    rt_device *d;
+    cudaError_t e = device_at(event->device, &d);
+    if (e != cudaSuccess) return set_error(e);
+    return from(g_backend->marker_wait(event->marker));
+}
+
+/* ---- events -------------------------------------------------------------- */
+
+cudaError_t cudaEventCreateWithFlags(cudaEvent_t *event, unsigned int flags)
+{
+    const unsigned known = cudaEventBlockingSync | cudaEventDisableTiming | cudaEventInterprocess;
+    if (event == NULL || (flags & ~known) != 0) return set_error(cudaErrorInvalidValue);
+    if (flags & cudaEventInterprocess) return set_error(cudaErrorNotSupported);
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    struct ocu_rt_event *ev = calloc(1, sizeof(*ev));
+    if (ev == NULL) return set_error(cudaErrorMemoryAllocation);
+    ocu_status st = g_backend->marker_create(d->dev, &ev->marker);
+    if (st != OCU_OK) {
+        free(ev);
+        return from(st);
+    }
+    ev->flags = flags;
+    ev->device = tl_device;
+    *event = ev;
+    return cudaSuccess;
+}
+
+cudaError_t cudaEventCreate(cudaEvent_t *event)
+{
+    return cudaEventCreateWithFlags(event, cudaEventDefault);
+}
+
+cudaError_t cudaEventDestroy(cudaEvent_t event)
+{
+    if (event == NULL) return set_error(cudaErrorInvalidResourceHandle);
+    ocu_status st = g_backend->marker_destroy(event->marker);
+    free(event);
+    return from(st);
+}
+
+cudaError_t cudaEventRecord(cudaEvent_t event, cudaStream_t stream)
+{
+    if (event == NULL) return set_error(cudaErrorInvalidResourceHandle);
+    rt_device *d;
+    cudaError_t e = device_at(event->device, &d);
+    if (e != cudaSuccess) return set_error(e);
+    ocu_queue *q;
+    e = queue_for_submit(d, stream, &q);
+    if (e != cudaSuccess) return set_error(e);
+    return from(g_backend->marker_record(event->marker, q));
+}
+
+cudaError_t cudaEventSynchronize(cudaEvent_t event)
+{
+    if (event == NULL) return set_error(cudaErrorInvalidResourceHandle);
+    return from(g_backend->marker_wait(event->marker));
+}
+
+cudaError_t cudaEventQuery(cudaEvent_t event)
+{
+    if (event == NULL) return set_error(cudaErrorInvalidResourceHandle);
+    return from(g_backend->marker_query(event->marker));
+}
+
+cudaError_t cudaEventElapsedTime(float *ms, cudaEvent_t start, cudaEvent_t end)
+{
+    if (ms == NULL) return set_error(cudaErrorInvalidValue);
+    if (start == NULL || end == NULL) return set_error(cudaErrorInvalidResourceHandle);
+    if ((start->flags | end->flags) & cudaEventDisableTiming) {
+        return set_error(cudaErrorInvalidResourceHandle);
+    }
+    return from(g_backend->marker_elapsed_ms(start->marker, end->marker, ms));
+}
+
+/* ---- launches ------------------------------------------------------------ */
+
+cudaError_t ocu_rt_launch(ocu_kernel *kernel, const ocu_launch_params *params,
+                          cudaStream_t stream)
+{
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    if (kernel == NULL || params == NULL) return set_error(cudaErrorInvalidDeviceFunction);
+    ocu_queue *q;
+    e = queue_for_submit(d, stream, &q);
+    if (e != cudaSuccess) return set_error(e);
+    ocu_status st = g_backend->kernel_launch(q, kernel, params);
+    if (st == OCU_ERR_INVALID_VALUE) {
+        return set_error(cudaErrorInvalidConfiguration); /* dimensions, sizes */
+    }
+    return from(st);
+}

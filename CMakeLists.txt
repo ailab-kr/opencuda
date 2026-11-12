@@ -17,6 +17,9 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake)
+find_package(Python3 COMPONENTS Interpreter)
+
 add_subdirectory(backends)
 add_subdirectory(runtime)
 add_subdirectory(libs)

@@ -9,8 +9,10 @@
  */
 #pragma once
 
-#if defined(OCU_CPU_PATH)
-/* CPU path: the file was rewritten by cpu_rewrite.py and is plain C++. */
+#if defined(OCU_CPU_PATH) && defined(OCU_CUDA_RUNTIME_H)
+/* CPU path through ocu_cc.py: the product headers are already included. */
+#elif defined(OCU_CPU_PATH)
+/* CPU path, probe headers (tests/probe): rewritten, plain C++. */
 #include "probe_cpu.h"
 #else
 
