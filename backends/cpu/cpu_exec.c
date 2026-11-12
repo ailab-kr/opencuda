@@ -237,6 +237,14 @@ typedef struct block_exec {
 
 static _Thread_local block_exec *tl_exec;
 
+_Thread_local ocu_cpu_dim3 ocu_cpu_tls_thread_idx;
+_Thread_local ocu_cpu_dim3 ocu_cpu_tls_block_idx;
+_Thread_local ocu_cpu_dim3 ocu_cpu_tls_block_dim;
+_Thread_local ocu_cpu_dim3 ocu_cpu_tls_grid_dim;
+_Thread_local int          ocu_cpu_tls_warp_size;
+
+static ocu_cpu_dim3 linear_to_dim3(uint32_t linear, ocu_cpu_dim3 dim);
+
 static uint64_t rng_next(uint64_t *s)
 {
     /* xorshift64*: small, fast, good enough for shuffling. */
@@ -253,6 +261,7 @@ static void switch_to_fiber(block_exec *ex, uint32_t i)
 {
     fiber *f = &ex->fibers[i];
     ex->current = i;
+    ocu_cpu_tls_thread_idx = linear_to_dim3(i, ex->block_dim);
 #ifdef OCU_ASAN
     __sanitizer_start_switch_fiber(&ex->sched_fake_stack, f->stack,
                                    ex->stack_bytes);
@@ -681,6 +690,9 @@ static bool work_on(grid_job *job, bool primary)
     ex->block_dim = (ocu_cpu_dim3){job->block[0], job->block[1], job->block[2]};
     ex->grid_dim = (ocu_cpu_dim3){job->grid[0], job->grid[1], job->grid[2]};
     tl_exec = ex;
+    ocu_cpu_tls_block_dim = ex->block_dim;
+    ocu_cpu_tls_grid_dim = ex->grid_dim;
+    ocu_cpu_tls_warp_size = (int)ex->warp_size;
     for (;;) {
         if (atomic_load(&job->status) != OCU_OK) {
             break;
@@ -693,6 +705,7 @@ static bool work_on(grid_job *job, bool primary)
         ex->block_idx.x = (uint32_t)(b % gx);
         ex->block_idx.y = (uint32_t)((b / gx) % gy);
         ex->block_idx.z = (uint32_t)(b / (gx * gy));
+        ocu_cpu_tls_block_idx = ex->block_idx;
         st = run_block(ex, b);
         if (st != OCU_OK) {
             record_error(job, st);
@@ -700,6 +713,10 @@ static bool work_on(grid_job *job, bool primary)
         }
     }
     tl_exec = NULL;
+    const ocu_cpu_dim3 zero = {0, 0, 0};
+    ocu_cpu_tls_thread_idx = ocu_cpu_tls_block_idx = zero;
+    ocu_cpu_tls_block_dim = ocu_cpu_tls_grid_dim = zero;
+    ocu_cpu_tls_warp_size = 0;
     if (owned != NULL) {
         cache_destroy(owned);
     }

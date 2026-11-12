@@ -59,6 +59,24 @@ ocu_cpu_dim3 ocu_cpu_block_dim(void);
 ocu_cpu_dim3 ocu_cpu_grid_dim(void);
 uint32_t     ocu_cpu_warp_size(void);
 
+/*
+ * The same values as per-thread variables, for language layers that need
+ * real variables (CUDA's threadIdx and friends are variables: host code may
+ * declare locals of the same name). Inside a kernel each GPU thread sees
+ * its own values, which do not change while it runs: the backend updates
+ * them whenever it switches to a thread. Outside a kernel they are zero.
+ */
+#ifdef __cplusplus
+#define OCU_CPU_THREAD_LOCAL thread_local
+#else
+#define OCU_CPU_THREAD_LOCAL _Thread_local
+#endif
+extern OCU_CPU_THREAD_LOCAL ocu_cpu_dim3 ocu_cpu_tls_thread_idx;
+extern OCU_CPU_THREAD_LOCAL ocu_cpu_dim3 ocu_cpu_tls_block_idx;
+extern OCU_CPU_THREAD_LOCAL ocu_cpu_dim3 ocu_cpu_tls_block_dim;
+extern OCU_CPU_THREAD_LOCAL ocu_cpu_dim3 ocu_cpu_tls_grid_dim;
+extern OCU_CPU_THREAD_LOCAL int          ocu_cpu_tls_warp_size;
+
 /* Block-wide barrier. Threads that already returned count as arrived. */
 void ocu_cpu_barrier(void);
 
