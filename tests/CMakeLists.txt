@@ -179,6 +179,14 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   add_executable(test_device_math runtime/test_device_math.cpp)
   target_include_directories(test_device_math PRIVATE ${PROJECT_SOURCE_DIR}/runtime/include)
   add_test(NAME device_math COMMAND test_device_math)
+  # The float functions against the host's double ones, on all cores; the
+  # one-argument ones on every 257th float (OCU_MATHF_EXHAUSTIVE=1: all).
+  find_package(Threads REQUIRED)
+  add_executable(test_device_mathf runtime/test_device_mathf.cpp)
+  target_include_directories(test_device_mathf PRIVATE ${PROJECT_SOURCE_DIR}/runtime/include)
+  target_compile_options(test_device_mathf PRIVATE -O2 -ffp-contract=off)
+  target_link_libraries(test_device_mathf PRIVATE Threads::Threads m)
+  add_test(NAME device_mathf COMMAND test_device_mathf)
 
   # The installed package works for a project outside this tree, built
   # with the same compilers and flags (sanitizers included). Not when
@@ -244,6 +252,11 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
       set_tests_properties(gpu_${t} PROPERTIES SKIP_RETURN_CODE 77
         ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
     endforeach()
+    # The float math functions on the GPU: same bits as on the host, and
+    # kernel times against the double-based versions.
+    ocu_add_nvidia_cu_executable(rt_mathf_gpu_nv runtime/rt_mathf_gpu.cu runtime/rt_mathf_ref.cpp)
+    add_test(NAME gpu_rt_mathf COMMAND run_if_nvidia $<TARGET_FILE:rt_mathf_gpu_nv>)
+    set_tests_properties(gpu_rt_mathf PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
     ocu_add_nvidia_cu_executable(ocu_cc_saxpy_nv probe/main_saxpy.cu
       ${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu)
     add_test(NAME gpu_saxpy COMMAND run_if_nvidia $<TARGET_FILE:ocu_cc_saxpy_nv>)
