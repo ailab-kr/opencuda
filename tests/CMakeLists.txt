@@ -2,6 +2,10 @@ add_executable(smoke_registry smoke/test_registry.c)
 target_link_libraries(smoke_registry PRIVATE ocu_core)
 add_test(NAME smoke_registry COMMAND smoke_registry)
 
+add_executable(test_bench backend/test_bench.c)
+target_link_libraries(test_bench PRIVATE ocu_bench m)
+add_test(NAME bench_statistics COMMAND test_bench)
+
 add_executable(smoke_registry_threads smoke/test_registry_threads.c)
 target_link_libraries(smoke_registry_threads PRIVATE ocu_core)
 add_test(NAME smoke_registry_threads COMMAND smoke_registry_threads)
