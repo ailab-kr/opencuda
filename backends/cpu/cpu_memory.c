@@ -15,7 +15,7 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+#include "cpu_os.h"
 
 typedef struct alloc_rec {
     uintptr_t base;
@@ -43,17 +43,17 @@ static void mem_prepare(void) { pthread_mutex_lock(&g_mem_lock); }
 static void mem_release(void) { pthread_mutex_unlock(&g_mem_lock); }
 static void mem_install_atfork(void)
 {
+#if CPU_OS_HAS_FORK
     (void)pthread_atfork(mem_prepare, mem_release, mem_release);
+#else
+    (void)mem_prepare;
+    (void)mem_release;
+#endif
 }
 
 uint64_t cpu_total_memory(void)
 {
-    long pages = sysconf(_SC_PHYS_PAGES);
-    long page = sysconf(_SC_PAGESIZE);
-    if (pages <= 0 || page <= 0) {
-        return 0;
-    }
-    return (uint64_t)pages * (uint64_t)page;
+    return cpu_os_phys_bytes();
 }
 
 /* Index of the first record with base >= key. */
@@ -122,14 +122,14 @@ static ocu_status tracked_alloc(alloc_table *t, size_t bytes, void **ptr)
     }
     size_t rounded = (bytes + CPU_ALLOC_ALIGN - 1) & ~(size_t)(CPU_ALLOC_ALIGN - 1);
     void *mem = NULL;
-    if (posix_memalign(&mem, CPU_ALLOC_ALIGN, rounded) != 0 || mem == NULL) {
+    if ((mem = cpu_os_aligned_alloc(CPU_ALLOC_ALIGN, rounded)) == NULL) {
         return OCU_ERR_OUT_OF_MEMORY;
     }
     pthread_mutex_lock(&g_mem_lock);
     ocu_status st = table_insert(t, (uintptr_t)mem, bytes);
     pthread_mutex_unlock(&g_mem_lock);
     if (st != OCU_OK) {
-        free(mem);
+        cpu_os_aligned_free(mem);
         return st;
     }
     *ptr = mem;
@@ -152,7 +152,7 @@ static ocu_status tracked_free(alloc_table *t, void *ptr)
     if (!found) {
         return OCU_ERR_INVALID_VALUE;
     }
-    free(ptr);
+    cpu_os_aligned_free(ptr);
     return OCU_OK;
 }
 

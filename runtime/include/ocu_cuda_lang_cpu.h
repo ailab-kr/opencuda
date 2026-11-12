@@ -304,6 +304,19 @@ inline T atomic_update_fp(T *addr, Op op)
 #endif
 static_assert(sizeof(dim3) == sizeof(ocu_cpu_dim3) && sizeof(uint3) == sizeof(ocu_cpu_dim3),
               "built-in variable layout");
+#if defined(_WIN32)
+/* Windows (MinGW): thread-local storage is emulated, and assembler names
+   cannot be given to emulated variables. Per-thread references to the
+   backend's variables keep the CUDA names as real names. */
+#define OCU_CPU_BUILTIN_REF(T, name, var)                                              \
+    static thread_local const T &name = *reinterpret_cast<const T *>(&var);
+OCU_CPU_BUILTIN_REF(uint3, threadIdx, ocu_cpu_tls_thread_idx)
+OCU_CPU_BUILTIN_REF(uint3, blockIdx, ocu_cpu_tls_block_idx)
+OCU_CPU_BUILTIN_REF(dim3, blockDim, ocu_cpu_tls_block_dim)
+OCU_CPU_BUILTIN_REF(dim3, gridDim, ocu_cpu_tls_grid_dim)
+OCU_CPU_BUILTIN_REF(int, warpSize, ocu_cpu_tls_warp_size)
+#undef OCU_CPU_BUILTIN_REF
+#else
 extern "C" {
 OCU_CPU_CONSTINIT extern thread_local const uint3 threadIdx OCU_CPU_TLS_(ocu_cpu_tls_thread_idx);
 OCU_CPU_CONSTINIT extern thread_local const uint3 blockIdx OCU_CPU_TLS_(ocu_cpu_tls_block_idx);
@@ -311,6 +324,7 @@ OCU_CPU_CONSTINIT extern thread_local const dim3 blockDim OCU_CPU_TLS_(ocu_cpu_t
 OCU_CPU_CONSTINIT extern thread_local const dim3 gridDim OCU_CPU_TLS_(ocu_cpu_tls_grid_dim);
 OCU_CPU_CONSTINIT extern thread_local const int warpSize OCU_CPU_TLS_(ocu_cpu_tls_warp_size);
 }
+#endif
 #undef OCU_CPU_TLS_
 
 /* ---- synchronisation and fences ------------------------------------------- */

@@ -8,6 +8,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "cpu_internal.h"
+#include "cpu_os.h"
 
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -222,7 +223,7 @@ static ocu_status op_run(cpu_op *op)
 static void op_free(cpu_op *op)
 {
     if (op->kind == OP_LAUNCH) {
-        free(op->u.launch.storage);
+        cpu_os_aligned_free(op->u.launch.storage);
     } else if (op->kind == OP_MARKER) {
         marker_unref(op->u.mark.marker);
     }
@@ -255,7 +256,13 @@ static void queues_child(void)
 
 static void queue_install_atfork(void)
 {
+#if CPU_OS_HAS_FORK
     (void)pthread_atfork(queues_prepare, queues_parent, queues_child);
+#else
+    (void)queues_prepare;
+    (void)queues_parent;
+    (void)queues_child;
+#endif
 }
 
 /* True when the handle belongs to an ancestor process. */
@@ -547,7 +554,7 @@ ocu_status cpu_kernel_launch(ocu_queue *queue, ocu_kernel *kernel,
     size_t table = (size_t)p->num_args * sizeof(void *);
     table = (table + ARG_ALIGN - 1) & ~(size_t)(ARG_ALIGN - 1);
     /* cpu_check_launch bounded the sizes, so these sums cannot overflow. */
-    unsigned char *storage = aligned_alloc(ARG_ALIGN, table + total + ARG_ALIGN);
+    unsigned char *storage = cpu_os_aligned_alloc(ARG_ALIGN, table + total + ARG_ALIGN);
     if (storage == NULL) {
         return OCU_ERR_OUT_OF_MEMORY;
     }
@@ -564,7 +571,7 @@ ocu_status cpu_kernel_launch(ocu_queue *queue, ocu_kernel *kernel,
 
     cpu_op *op = calloc(1, sizeof(*op));
     if (op == NULL) {
-        free(storage);
+        cpu_os_aligned_free(storage);
         return OCU_ERR_OUT_OF_MEMORY;
     }
     op->kind = OP_LAUNCH;

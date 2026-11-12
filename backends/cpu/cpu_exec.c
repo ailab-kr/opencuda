@@ -33,15 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <sys/mman.h>
-#include <unistd.h>
-
-#if !defined(MAP_ANONYMOUS) && defined(MAP_ANON)
-#define MAP_ANONYMOUS MAP_ANON
-#endif
-#if !defined(MAP_NORESERVE)
-#define MAP_NORESERVE 0
-#endif
+#include "cpu_os.h"
 
 /* ---- sanitizer hooks ---------------------------------------------------- */
 
@@ -104,7 +96,7 @@ static void load_config(void)
                          : CPU_ORDER_FIXED;
     g_config.seed = env_u64("OCU_CPU_SEED", 1);
 
-    long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    long cpus = cpu_os_cpu_count();
     uint64_t workers = env_u64("OCU_CPU_THREADS", cpus > 0 ? (uint64_t)cpus : 1);
     if (workers < 1) {
         workers = 1;
@@ -288,7 +280,11 @@ static void yield_to_scheduler(block_exec *ex, bool exiting)
 #ifdef OCU_TSAN
     __tsan_switch_to_fiber(ex->sched_tsan_fiber, 0);
 #endif
-    cpu_ctx_switch(&f->ctx, &ex->sched_ctx);
+    if (exiting) {
+        cpu_ctx_finish(&f->ctx, &ex->sched_ctx);
+    } else {
+        cpu_ctx_switch(&f->ctx, &ex->sched_ctx);
+    }
 #ifdef OCU_ASAN
     __sanitizer_finish_switch_fiber(f->fake_stack, NULL, NULL);
 #endif
@@ -303,7 +299,10 @@ static void fiber_entry(void)
     ex->fn(ex->args);
     ex->fibers[ex->current].state = FIBER_DONE;
     yield_to_scheduler(ex, true);
+#if !CPU_CTX_REUSED
     abort(); /* a finished fiber is never resumed */
+#endif
+    /* Reused (Windows): return; the fiber runs this entry again next block. */
 }
 
 static ocu_status block_exec_init(block_exec *ex, uint32_t nthreads,
@@ -312,19 +311,19 @@ static ocu_status block_exec_init(block_exec *ex, uint32_t nthreads,
     const cpu_config *cfg = cpu_get_config();
     memset(ex, 0, sizeof(*ex));
     ex->nthreads = nthreads;
-    long page = sysconf(_SC_PAGESIZE);
-    size_t pg = page > 0 ? (size_t)page : 4096u;
+    size_t pg = cpu_os_page_size();
     ex->stack_bytes = (cfg->stack_bytes + pg - 1) & ~(pg - 1);
+#if CPU_OS_OWN_STACKS
     ex->stack_region_bytes = pg + ex->stack_bytes * nthreads;
-    void *region = mmap(NULL, ex->stack_region_bytes, PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    if (region == MAP_FAILED) {
+    void *region = cpu_os_map(ex->stack_region_bytes);
+    if (region == NULL) {
         return OCU_ERR_OUT_OF_MEMORY;
     }
     ex->stack_region = region;
-    if (mprotect(region, pg, PROT_NONE) != 0) { /* guard below fiber 0 */
+    if (cpu_os_guard(region, pg) != 0) { /* guard below fiber 0 */
         return OCU_ERR_OUT_OF_MEMORY;
     }
+#endif
     ex->fibers = calloc(nthreads, sizeof(*ex->fibers));
     ex->order = calloc(nthreads, sizeof(*ex->order));
     ex->warp_slots = calloc(nthreads, sizeof(*ex->warp_slots));
@@ -336,12 +335,14 @@ static ocu_status block_exec_init(block_exec *ex, uint32_t nthreads,
         ex->warp_tags == NULL || ex->warp_seq == NULL || ex->warp_masks == NULL) {
         return OCU_ERR_OUT_OF_MEMORY;
     }
+#if CPU_OS_OWN_STACKS
     for (uint32_t i = 0; i < nthreads; ++i) {
         ex->fibers[i].stack = ex->stack_region + pg + (size_t)i * ex->stack_bytes;
     }
+#endif
     if (shared_bytes > 0) {
         size_t a = CPU_SHARED_ALIGN;
-        ex->dyn_shared = aligned_alloc(a, (shared_bytes + a - 1) & ~(a - 1));
+        ex->dyn_shared = cpu_os_aligned_alloc(a, (shared_bytes + a - 1) & ~(a - 1));
         if (ex->dyn_shared == NULL) {
             return OCU_ERR_OUT_OF_MEMORY;
         }
@@ -355,8 +356,13 @@ static ocu_status block_exec_init(block_exec *ex, uint32_t nthreads,
 
 static void block_exec_release(block_exec *ex)
 {
+#if CPU_OS_OWN_STACKS
     if (ex->stack_region != NULL) {
-        munmap(ex->stack_region, ex->stack_region_bytes);
+        cpu_os_unmap(ex->stack_region, ex->stack_region_bytes);
+    }
+#endif
+    if (ex->fibers != NULL) {
+        for (uint32_t i = 0; i < ex->nthreads; ++i) cpu_ctx_destroy(&ex->fibers[i].ctx);
     }
     free(ex->fibers);
     free(ex->order);
@@ -364,7 +370,7 @@ static void block_exec_release(block_exec *ex)
     free(ex->warp_tags);
     free(ex->warp_seq);
     free(ex->warp_masks);
-    free(ex->dyn_shared);
+    cpu_os_aligned_free(ex->dyn_shared);
     memset(ex, 0, sizeof(*ex));
 }
 
@@ -374,6 +380,7 @@ static void block_exec_release(block_exec *ex)
 
 static void canary_set(const fiber *f)
 {
+    if (!CPU_OS_OWN_STACKS) return; /* system fiber stacks: the system guards them */
     uint64_t *w = (uint64_t *)(void *)f->stack;
     for (int i = 0; i < CANARY_WORDS; ++i) {
         w[i] = CANARY_VALUE;
@@ -382,6 +389,7 @@ static void canary_set(const fiber *f)
 
 static bool canary_ok(const fiber *f)
 {
+    if (!CPU_OS_OWN_STACKS) return true;
     const uint64_t *w = (const uint64_t *)(const void *)f->stack;
     for (int i = 0; i < CANARY_WORDS; ++i) {
         if (w[i] != CANARY_VALUE) {
@@ -783,7 +791,13 @@ static void pool_child(void)
 static pthread_once_t g_atfork_once = PTHREAD_ONCE_INIT;
 static void install_atfork(void)
 {
+#if CPU_OS_HAS_FORK
     (void)pthread_atfork(pool_prepare, pool_parent, pool_child);
+#else
+    (void)pool_prepare;
+    (void)pool_parent;
+    (void)pool_child;
+#endif
 }
 
 /* Caller holds g_pool_lock. Start pool threads up to `want` in total. */
