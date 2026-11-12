@@ -344,7 +344,8 @@ static void test_stack_overflow_reported(void)
     ocu_launch_params p = one(args, sizes, 2);
     p.block[0] = 2;
     CHECK_ST(B->kernel_launch(NULL, kernel("deep"), &p), OCU_OK);
-    depth = 15; /* about 15 KiB plus frames: reaches the canary */
+    depth = 20; /* about 20 KiB: past the 16 KiB stack whatever the frame layout,
+                   and well inside the neighbouring stack, so the canary sees it */
     CHECK_ST(B->kernel_launch(NULL, kernel("deep"), &p), OCU_ERR_LAUNCH_FAILED);
     CHECK_ST(B->mem_free(D, sink), OCU_OK);
 }
