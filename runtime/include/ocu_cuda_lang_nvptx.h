@@ -110,6 +110,9 @@
 #define OCU_D  static __device__ inline __attribute__((always_inline))
 #define OCU_HD static __host__ __device__ inline
 
+#define OCU_LANG_FN static __device__ inline __attribute__((always_inline))
+#include "ocu_cuda_lang_common.h"
+
 /* ---- launch ABI the compiler calls (see runtime/cudart/fatbin.c) ---------- */
 
 extern "C" unsigned __cudaPushCallConfiguration(dim3 grid, dim3 block, size_t shared = 0,
@@ -153,7 +156,7 @@ OCU_D int __syncthreads_count(int p) { return __nvvm_bar0_popc(p); }
 OCU_D int __syncthreads_and(int p) { return __nvvm_bar0_and(p); }
 OCU_D int __syncthreads_or(int p) { return __nvvm_bar0_or(p); }
 OCU_D void __threadfence() { __nvvm_membar_gl(); }
-OCU_D void __trap() { __builtin_trap(); }
+[[noreturn]] OCU_D void __trap() { __builtin_trap(); }
 OCU_D void __threadfence_block() { __nvvm_membar_cta(); }
 OCU_D void __threadfence_system() { __nvvm_membar_sys(); }
 
