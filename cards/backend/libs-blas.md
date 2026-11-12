@@ -24,7 +24,7 @@ cost: { hours: 1, ai_usage: 0 }
 
 - [x] 기준 사례 526건 전부 통과: 동기 실행, 대기열 + 무작위 순서 (`tests/conformance/blas_driver.c`, `conformance/harness/ocu_conf/blas_run.py`)
 - [x] 일부러 망가뜨린 C 커널 3종(beta 0일 때 C를 읽음, iamax 0부터, 오른쪽 trsm의 연산 방향) 모두 검출
-- [ ] 잘못된 인자(음수 크기, lda 부족, 증가폭 0)에 대한 오류 코드 시험
+- [x] 잘못된 인자(음수 크기, lda 부족, 증가폭 0, 잘못된 열거값)와 빠른 반환 시험 (`tests/backend/test_blas_args.c`, 43개 확인 항목)
 
 ## 메모
 

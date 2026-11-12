@@ -76,6 +76,11 @@ endif()
 
 # ---- conformance: BLAS reference cases on the CPU backend ---------------
 if(OCU_BACKEND_CPU AND Python3_FOUND)
+  add_executable(test_blas_args backend/test_blas_args.c)
+  target_link_libraries(test_blas_args PRIVATE ocu_blas)
+  add_test(NAME blas_args COMMAND test_blas_args)
+  set_tests_properties(blas_args PROPERTIES ENVIRONMENT "OCU_BACKEND=cpu")
+
   add_executable(blas_driver conformance/blas_driver.c)
   target_link_libraries(blas_driver PRIVATE ocu_blas)
   add_test(NAME conformance_blas_cpu
