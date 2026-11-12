@@ -170,11 +170,18 @@ our CPU path:
 The two outputs drift apart after about 20 words:
 
 - **Our CPU path vs. our GPU path:** 63 of 64 tokens agree.
-- **Our paths vs. the reference:** 47–48 of 64 tokens agree.
+- **Our paths vs. the reference:** 47–48 of 64 tokens agree (explained below).
 
-Different floating-point summation orders are the likely cause, but this is
-not confirmed yet. Deciding what counts as "the same answer" for
-floating-point programs is the next step for the suite.
+This is floating-point ordering, not a defect. With the same tokens fed to
+every build and compared against a float32 oracle (same weights,
+dequantised), our paths stay as close to the oracle as llama.cpp's own CPU
+backend, and much closer when the prompt is processed in one batch
+(mean KL 5e-8 to 6e-7 for ours, 3.7e-4 to 3.0e-3 for the reference).
+Top-token changes happen only at near-ties: wherever the oracle's top two
+logits differ by 0.5 or more, every build agrees. Greedy token matching is
+therefore not a useful metric. The suite's application level uses KL
+divergence against the oracle instead
+([study](docs/llama-cpp-logit-agreement.md)).
 
 ### Libraries and math
 
