@@ -6,6 +6,9 @@
  * returning. Kernel arguments are copied when the launch is submitted.
  */
 #define _POSIX_C_SOURCE 200809L
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE /* _POSIX_C_SOURCE alone hides sysconf names and MAP_ANONYMOUS */
+#endif
 
 #include "cpu_internal.h"
 #include "cpu_os.h"
