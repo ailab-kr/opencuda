@@ -161,6 +161,43 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   add_test(NAME runtime_fp16 COMMAND rt_fp16)
   ocu_add_cpu_cu_executable(rt_bf16 runtime/rt_bf16.cu)
   add_test(NAME runtime_bf16 COMMAND rt_bf16)
+  # card compiler-ptx-shift: --ptx-shift semantics (tests/compiler/ptx_shift/).
+  ocu_add_cpu_cu_executable(ptx_shift_run compiler/ptx_shift/ptx_shift_run.cu PTX_SHIFT)
+  add_test(NAME ptx_shift_cpu COMMAND ptx_shift_run)
+  # Control: the same program without the option must fail (C++ leaves the
+  # out-of-range shifts undefined; hardware takes the amount modulo the
+  # width), so the matrix would notice a rewrite that does nothing.
+  ocu_add_cpu_cu_executable(ptx_shift_run_plain compiler/ptx_shift/ptx_shift_run.cu)
+  add_test(NAME ptx_shift_cpu_control_without_option COMMAND ptx_shift_run_plain)
+  set_tests_properties(ptx_shift_cpu_control_without_option PROPERTIES WILL_FAIL TRUE)
+  # Evaluation order: ISO C++17 [expr.shift] sequences the left operand of << and >>
+  # before the right one, [expr.ass] the right of <<= and >>= before the left.
+  add_test(NAME ptx_shift_cpu_eval_order COMMAND ptx_shift_run order)
+  set(_psdir ${CMAKE_CURRENT_SOURCE_DIR}/compiler/ptx_shift)
+  function(ocu_ptx_shift_cmd name target)
+    cmake_parse_arguments(A "" "OUTEXT" "DEFS" ${ARGN})
+    if(NOT A_OUTEXT)
+      set(A_OUTEXT o)
+    endif()
+    add_test(NAME ${name}
+      COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DCC=${OCU_CC} -DCXX=${CMAKE_CXX_COMPILER}
+              -DCC_COMPILER=${CMAKE_C_COMPILER} -DDIR=${_psdir} -DTGT=${target}
+              -DOUT=${CMAKE_CURRENT_BINARY_DIR}/${name}.${A_OUTEXT} ${A_DEFS}
+              -P ${_psdir}/ptx_shift_cmd.cmake)
+  endfunction()
+  foreach(c "1|warn|ptx_shift_cases.cu" "2|warn|ptx_shift_cases.cu" "3|warn|outside_shift.h"
+            "4|warn|ptx_shift_cases.cu" "8|warn|ptx_shift_cases.h" "5|quiet|-" "0|quiet|-" "6|error|-")
+    string(REPLACE "|" ";" c "${c}")
+    list(GET c 0 cn)
+    list(GET c 1 cx)
+    list(GET c 2 cf)
+    ocu_ptx_shift_cmd(ptx_shift_cmd_case${cn}_${cx}_cpu cpu DEFS -DMODE=warn -DCASE=${cn} -DEXPECT=${cx} -DMARK_FILE=${cf})
+  endforeach()
+  # Without the option the same sources compile and say nothing.
+  ocu_ptx_shift_cmd(ptx_shift_cmd_case1_no_option_cpu cpu DEFS -DMODE=warn -DCASE=1 -DEXPECT=quiet -DNO_OPTION=1)
+  ocu_ptx_shift_cmd(ptx_shift_cmd_print_cpu cpu DEFS -DMODE=print)
+  ocu_ptx_shift_cmd(ptx_shift_cmd_unsupported_amd cpu DEFS -DMODE=unsupported -DARGS=--target|amd)
+  ocu_ptx_shift_cmd(ptx_shift_cmd_unsupported_nvidia_ptx cpu DEFS -DMODE=unsupported "-DARGS=--target|nvidia|--arch|sm_80" OUTEXT ptx)
   # Runtime API gaps (card runtime-llama-gaps): data types, attribute
   # policy, PCI bus id, peer access, cooperative launch. The compute
   # capability variants pass the expected value as arguments.
@@ -401,6 +438,15 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
                 -DOUT=${CMAKE_CURRENT_BINARY_DIR}/cg_case${cn}_nvidia.o -DTARGET=nvidia -DCASE=${cn} -DEXPECT=${cx}
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/runtime/compile_case.cmake)
     endforeach()
+    foreach(c "1|warn|ptx_shift_cases.cu" "2|warn|ptx_shift_cases.cu" "3|warn|outside_shift.h"
+              "4|warn|ptx_shift_cases.cu" "8|warn|ptx_shift_cases.h" "5|quiet|-" "0|quiet|-" "6|error|-")
+      string(REPLACE "|" ";" c "${c}")
+      list(GET c 0 cn)
+      list(GET c 1 cx)
+      list(GET c 2 cf)
+      ocu_ptx_shift_cmd(ptx_shift_cmd_case${cn}_${cx}_nvidia nvidia DEFS -DMODE=warn -DCASE=${cn} -DEXPECT=${cx} -DMARK_FILE=${cf})
+    endforeach()
+    ocu_ptx_shift_cmd(ptx_shift_cmd_print_nvidia nvidia DEFS -DMODE=print)
     foreach(t "nvidia;sm_80;ptx" "amd;gfx1100;co" "amd;gfx1201;co")
       list(GET t 0 target)
       list(GET t 1 arch)
@@ -439,6 +485,11 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
       set_tests_properties(gpu_${t} PROPERTIES SKIP_RETURN_CODE 77
         ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
     endforeach()
+    ocu_add_nvidia_cu_executable(ptx_shift_run_nv compiler/ptx_shift/ptx_shift_run.cu PTX_SHIFT)
+    add_test(NAME gpu_ptx_shift COMMAND run_if_nvidia $<TARGET_FILE:ptx_shift_run_nv>)
+    set_tests_properties(gpu_ptx_shift PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+    add_test(NAME gpu_ptx_shift_eval_order COMMAND run_if_nvidia $<TARGET_FILE:ptx_shift_run_nv> order)
+    set_tests_properties(gpu_ptx_shift_eval_order PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
     ocu_add_nvidia_cu_executable(rt_trap_nv runtime/rt_trap.cu)
     foreach(mode trap nodevcode gridsync)
       add_test(NAME gpu_runtime_trap_${mode}
