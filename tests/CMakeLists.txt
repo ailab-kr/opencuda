@@ -46,6 +46,10 @@ if(OCU_BACKEND_CPU)
   set_tests_properties(cpu_pool_random_4workers PROPERTIES
     ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_THREADS=4")
 
+  add_executable(test_cpu_fork backend/test_cpu_fork.c)
+  target_link_libraries(test_cpu_fork PRIVATE ocu_backend_cpu)
+  add_test(NAME cpu_fork COMMAND test_cpu_fork)
+
   add_executable(test_cpu_regressions backend/test_cpu_regressions.c)
   target_link_libraries(test_cpu_regressions PRIVATE ocu_backend_cpu)
   add_test(NAME cpu_regressions COMMAND test_cpu_regressions)
