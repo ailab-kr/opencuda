@@ -22,7 +22,8 @@ Headers: `compiler/probe/probe_defs.h` (GPU targets) and `compiler/probe/probe_c
 | 5 | Plain C++ (for a CPU backend) | Fails: `<<<...>>>` does not parse |
 | 6 | Kernel bodies in the host pass | Not emitted; only `__device_stub__*` |
 | 7 | `probe_features.cu` for NVIDIA, gfx1100, gfx1201 | OK: 5 kernels on each target |
-| 8 | CPU path: rewrite, compile as C++17, run on the CPU backend | OK: both files give correct results in fixed and random thread order (test `probe_cpu`) |
+| 8 | CPU path: rewrite, compile as C++17, run on the CPU backend | OK: all three files give correct results in fixed and random thread order (test `probe_cpu`) |
+| 9 | `probe_review.cu` (patterns from the independent review) for sm_80 and gfx1201 | OK: 4 kernels on each |
 
 Launch symbols the compiler emits calls to:
 
@@ -43,7 +44,7 @@ Launch symbols the compiler emits calls to:
    - b. Compile the device side for a CPU target through an offload toolchain (needs research, may not exist for this use).
    - c. Build a small clang plugin that emits host bodies for `__global__` functions.
 
-   Option a is implemented in the probe (`compiler/probe/cpu_rewrite.py`, 11 unit tests). It rewrites only the launch syntax and `extern __shared__` declarations, never inside comments, strings, raw strings or preprocessor lines, and keeps line numbers. The rewritten launch goes through the backend interface: one module per kernel signature holding a trampoline that unpacks the copied arguments. Static `__shared__` arrays become `static thread_local`, which is correct because one block's threads share one OS thread.
+   Option a is implemented in the probe (`compiler/probe/cpu_rewrite.py`, 18 unit tests). It rewrites only the launch syntax and `extern __shared__` declarations, never inside comments, strings, raw or prefixed literals or directives other than `#define` (macro bodies are rewritten, continuations kept), and keeps line numbers. A launch becomes `launch(cfg, [](auto &&...a) { K(a...); }, args)`: the kernel call is an ordinary C++ call, so template deduction, overloads and conversions work as written. It goes through the backend interface: one module per launch site and argument types. Static `__shared__` arrays become `static thread_local` (one block's threads share one OS thread); `extern __shared__` becomes an accessor that looks the block's memory up at each use, so file-scope declarations work.
 6. **Clean-room guard is required.** This machine has a vendor CUDA installation at `/usr/local/cuda` (13.3), and clang finds it automatically. `-nocudainc` alone stops header inclusion, but our driver and build must always pass `--cuda-path=<a folder we own>` and `-nocudainc -nocudalib`. A CI check should fail if any vendor path appears in compiler command lines or dependency files.
 7. **Toolchain gap.** Ubuntu's clang-18 package does not ship `clang-offload-bundler`, so a multi-target fat binary did not build. We can embed per-target code objects ourselves (we own the registration format), or install a fuller LLVM. Decide in P0-W4.
 
@@ -51,7 +52,7 @@ Launch symbols the compiler emits calls to:
 
 - Kernels launched from inside a kernel (dynamic parallelism) are refused with "not supported".
 - Warp-level operations (shuffles, votes) are not in the probe yet. They need lock-step emulation across the fibers of one warp.
-- Overloaded kernel names are ambiguous for the rewritten launch. Not seen yet in real code; Rodinia will tell.
+- A literal `0` passed for a pointer parameter does not convert after being copied (an int is passed); `NULL` is rewritten to `nullptr` and works.
 - The stream argument of a launch is accepted and ignored: the probe runs every launch synchronously.
 
 ## Open questions
