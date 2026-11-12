@@ -1,0 +1,809 @@
+#!/usr/bin/env python3
+"""ocu-nvcc: a CUDA compiler driver with nvcc's documented command line.
+
+    ocu-nvcc [--ocu-target=cpu|nvidia] [nvcc options] inputs...
+
+Build systems call it where they would call nvcc: compile (-c), preprocess
+(-E), dependencies (-M, -MD, -MF, -MT), link (default), shared libraries
+(-shared), static libraries (-lib). The backend comes from --ocu-target, or
+the name the driver is called by (ocu-nvcc-cpu, ocu-nvcc-nvidia), or the
+environment variable OCU_TARGET, or "cpu":
+
+  cpu     .cu files go through the CPU path of compiler/probe/ocu_cc.py
+          (preprocess with our cuda_runtime.h, rewrite launches, compile as
+          C++); the program runs on the CPU backend.
+  nvidia  .cu files become PTX in our container plus a host object, built
+          by LLVM Clang's CUDA mode; the program runs on an NVIDIA GPU
+          through the installed driver.
+
+.c/.cpp files go to the host compiler with our headers on the include
+path. Linking adds our runtime libraries (ocu_cudart and what it needs).
+
+The host and device compiler is LLVM Clang (default: the newest
+/usr/lib/llvm-N/bin/clang++, else clang++, else c++); -ccbin picks another
+host compiler. --version says so; build systems that identify compilers by
+their --version output (CMake) therefore see a Clang-based CUDA compiler,
+which is what this is.
+
+GPU architecture options (-arch, -code, -gencode, --cuda-gpu-arch) are
+recorded. The nvidia target builds PTX for the lowest one Clang supports;
+the cpu target needs none. Options for NVIDIA's own back-end tools
+(-Xptxas, -Xnvlink, -Xfatbin, -Xcudafe) are accepted and ignored.
+
+No vendor SDK file is ever read: include and library paths inside a vendor
+SDK are refused, as in ocu_cc.py.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+
+OCU_VERSION = "0.0.1"
+PROG = "ocu-nvcc"
+
+SELF = Path(os.path.abspath(__file__))  # as invoked: may be a link in a toolkit folder
+REAL = SELF.resolve()
+
+
+def _module_dir() -> Path:
+    """Where ocu_cc.py lives: compiler/probe in the source tree,
+    <prefix>/libexec/ocu when installed."""
+    for d in (os.environ.get("OCU_LIBEXEC"), REAL.parent.parent / "probe",
+              REAL.parent.parent / "libexec" / "ocu"):
+        if d and (Path(d) / "ocu_cc.py").is_file():
+            return Path(d)
+    sys.exit(f"{PROG}: cannot find ocu_cc.py (set OCU_LIBEXEC)")
+
+
+sys.path.insert(0, str(_module_dir()))
+import ocu_cc  # noqa: E402
+
+CU_SUFFIXES = {".cu"}
+C_SUFFIXES = {".c"}
+CPP_SUFFIXES = {".cpp", ".cc", ".cxx", ".C", ".c++", ".cp"}
+LANG_NAMES = {"cu": "cu", "cuda": "cu", "c": "c", "c++": "cpp", "cpp": "cpp"}
+
+# Libraries a CUDA build names, and what links instead. The runtime set is
+# added once, at the end of the link line.
+RUNTIME_LIBS = ("cudart", "cudart_static", "cudadevrt", "cuda")
+BLAS_LIBS = ("cublas", "cublas_static")
+NO_IMPL_LIBS = ("cublasLt", "cublasLt_static", "culibos")
+CLANG_MAX_SM = 90    # highest sm_ the LLVM 18 NVPTX back end accepts
+NVCC_WERROR_KINDS = {"all-warnings", "cross-execution-space-call", "reorder",
+                     "default-stream-launch", "missing-launch-bounds",
+                     "ext-lambda-captures-this", "deprecated-declarations"}
+
+
+class UsageError(Exception):
+    pass
+
+
+# ---- option table ---------------------------------------------------------
+# name -> (key, takes_value). Long and short spellings of the same nvcc
+# option share a key. Values come as "-opt value", "-opt=value" or, for
+# the one-letter options, "-Ovalue".
+OPTIONS: dict[str, tuple[str, bool]] = {}
+
+
+def _opt(key: str, value: bool, *names: str) -> None:
+    for n in names:
+        OPTIONS[n] = (key, value)
+
+
+_opt("compile", False, "-c", "--compile")
+_opt("device_c", False, "-dc", "--device-c")
+_opt("device_w", False, "-dw", "--device-w")
+_opt("dlink", False, "-dlink", "--device-link")
+_opt("lib", False, "-lib", "--lib")
+_opt("link", False, "-link", "--link")
+_opt("preprocess", False, "-E", "--preprocess")
+_opt("ptx", False, "-ptx", "--ptx")
+_opt("unsupported_phase", False, "-cubin", "--cubin", "-fatbin", "--fatbin", "-cuda", "--cuda",
+     "-optix-ir", "--optix-ir", "-ltoir", "--ltoir", "-run", "--run")
+_opt("M", False, "-M", "--generate-dependencies")
+_opt("MM", False, "-MM", "--generate-nonsystem-dependencies")
+_opt("MD", False, "-MD", "--generate-dependencies-with-compile")
+_opt("MMD", False, "-MMD", "--generate-nonsystem-dependencies-with-compile")
+_opt("MF", True, "-MF", "--dependency-output")
+_opt("MT", True, "-MT", "--dependency-target-name")
+_opt("MP", False, "-MP")
+_opt("output", True, "-o", "--output-file")
+_opt("x", True, "-x", "--x")
+_opt("I", True, "-I", "--include-path")
+_opt("isystem", True, "-isystem", "--system-include")
+_opt("include", True, "-include", "--pre-include")
+_opt("D", True, "-D", "--define-macro")
+_opt("U", True, "-U", "--undefine-macro")
+_opt("L", True, "-L", "--library-path")
+_opt("l", True, "-l", "--library")
+_opt("O", True, "-O", "--optimize")
+_opt("dopt", True, "-dopt", "--dopt")
+_opt("g", False, "-g", "--debug")
+_opt("G", False, "-G", "--device-debug")
+_opt("lineinfo", False, "-lineinfo", "--generate-line-info")
+_opt("std", True, "-std", "--std")
+_opt("arch", True, "-arch", "--gpu-architecture")
+_opt("code", True, "-code", "--gpu-code")
+_opt("gencode", True, "-gencode", "--generate-code")
+_opt("Xcompiler", True, "-Xcompiler", "--compiler-options")
+_opt("Xlinker", True, "-Xlinker", "--linker-options")
+_opt("Xignored", True, "-Xptxas", "--ptxas-options", "-Xnvlink", "--nvlink-options",
+     "-Xfatbin", "--fatbin-options", "-Xcudafe", "-Xarchive", "--archive-options")
+_opt("fast_math", False, "-use_fast_math", "--use_fast_math", "--use-fast-math")
+_opt("math_value", True, "-ftz", "--ftz", "-prec-div", "--prec-div", "-prec-sqrt",
+     "--prec-sqrt", "-fmad", "--fmad")
+_opt("accepted", False, "-expt-relaxed-constexpr", "--expt-relaxed-constexpr",
+     "-extended-lambda", "--extended-lambda", "-expt-extended-lambda",
+     "--expt-extended-lambda", "-allow-unsupported-compiler",
+     "--allow-unsupported-compiler", "-res-usage", "--resource-usage",
+     "-err-no", "--display-error-number", "--no-display-error-number",
+     "-no-compress", "--no-compress", "-restrict", "--restrict",
+     "-src-in-ptx", "--source-in-ptx", "-ewp", "--extensible-whole-program",
+     "--no-host-device-initializer-list", "--no-host-device-move-forward",
+     "-Wno-deprecated-gpu-targets", "--Wno-deprecated-gpu-targets",
+     "--Wno-deprecated-declarations", "-Wreorder", "--Wreorder",
+     "-Wdefault-stream-launch", "--Wdefault-stream-launch",
+     "-Wmissing-launch-bounds", "--Wmissing-launch-bounds",
+     "-Wext-lambda-captures-this", "--Wext-lambda-captures-this",
+     "-nocudainc", "-nocudalib", "--cuda-host-only", "-fno-gpu-rdc", "-static-global-template-stub")
+_opt("accepted_value", True, "-compress-mode", "--compress-mode", "-t", "--threads",
+     "-split-compile", "--split-compile", "-diag-suppress", "--diag-suppress",
+     "-diag-error", "--diag-error", "-diag-warn", "--diag-warn", "-default-stream",
+     "--default-stream", "-maxrregcount", "--maxrregcount", "-cudadevrt", "--cudadevrt",
+     "-m", "--machine", "--cuda-path", "--cuda-include-ptx", "--no-cuda-include-ptx",
+     "-time", "--time", "-Xclang-cuda", "-static-global-template-stub=")
+_opt("ccbin", True, "-ccbin", "--compiler-bindir")
+_opt("shared", False, "-shared", "--shared")
+_opt("rdc", True, "-rdc", "--relocatable-device-code")
+_opt("fgpu_rdc", False, "-fgpu-rdc")
+_opt("cudart", True, "-cudart", "--cudart")
+_opt("version", False, "-V", "--version")
+_opt("dryrun", False, "-dryrun", "--dryrun")
+_opt("verbose", False, "-v", "--verbose")
+_opt("keep", False, "-keep", "--keep", "-save-temps", "--save-temps")
+_opt("keep_dir", True, "-keep-dir", "--keep-dir")
+_opt("w", False, "-w", "--disable-warnings")
+_opt("Werror", True, "-Werror", "--Werror")
+_opt("list_arch", False, "-arch-ls", "--list-gpu-arch", "-code-ls", "--list-gpu-code")
+_opt("forward_unknown", False, "-forward-unknown-to-host-compiler",
+     "--forward-unknown-to-host-compiler")
+_opt("forward_unknown_ld", False, "-forward-unknown-to-host-linker",
+     "--forward-unknown-to-host-linker")
+_opt("optf", True, "-optf", "--options-file")
+_opt("cuda_gpu_arch", True, "--cuda-gpu-arch", "--offload-arch")
+_opt("cuda_device_only", False, "--cuda-device-only")
+_opt("ocu_target", True, "--ocu-target")
+_opt("help", False, "-h", "--help")
+# Host-compiler options that take a separate value, passed through.
+HOST_PAIR = {"-Xclang", "-isysroot", "-target", "-idirafter", "-iquote", "-imacros",
+             "-iprefix", "-iwithprefix", "-mllvm"}
+# One-letter options whose value may be attached ("-Ipath", "-O3", "-lm").
+ATTACHED = ("-I", "-D", "-U", "-L", "-l", "-O", "-o", "-x", "-isystem")
+
+
+def expand_response_files(argv: list[str], depth: int = 0) -> list[str]:
+    out: list[str] = []
+    it = iter(argv)
+    for a in it:
+        path = None
+        if a.startswith("@") and len(a) > 1:
+            path = a[1:]
+        elif a in ("-optf", "--options-file"):
+            path = next(it, None)
+            if path is None:
+                raise UsageError(f"{a} needs a file name")
+        elif a.startswith(("-optf=", "--options-file=")):
+            path = a.split("=", 1)[1]
+        if path is None:
+            out.append(a)
+            continue
+        if depth > 8:
+            raise UsageError("response files nested too deeply")
+        for one in path.split(","):
+            try:
+                text = Path(one).read_text()
+            except OSError as e:
+                raise UsageError(f"cannot read options file {one}: {e}")
+            out += expand_response_files(shlex.split(text), depth + 1)
+    return out
+
+
+def default_target() -> str:
+    """The backend when --ocu-target is not given: from the name the driver
+    was called by (ocu-nvcc-cpu, ocu-nvcc-nvidia: links in the toolkit
+    folder, so a build system's compiler path fixes the target), else the
+    environment variable OCU_TARGET, else cpu."""
+    m = re.fullmatch(r"ocu-nvcc-(cpu|nvidia)", SELF.name)
+    if m:
+        return m.group(1)
+    return os.environ.get("OCU_TARGET") or "cpu"
+
+
+def parse(argv: list[str]) -> SimpleNamespace:
+    o = SimpleNamespace(
+        inputs=[],          # (path, lang or None)
+        phase=None, ptx=False, dlink=False, lib=False,
+        deps=None, MF=None, MT=[], MP=False,
+        output=None, pre=[], host=[], device=[], linker=[], link_items=[],
+        libdirs=[], O=None, g=False, G=False, std=None, archs=[],
+        ccbin=None, shared=False, rdc=False, cudart="static",
+        version=False, dryrun=False, verbose=False, keep=False, keep_dir=None,
+        target=default_target(), ignored=[], notes=[],
+        fast_math=False, forward_unknown=False, list_arch=False, help=False,
+        cuda_device_only=False, include_dirs=[])
+    lang_now = None
+    lang_global = None
+    i = 0
+
+    def take(name: str) -> str:
+        nonlocal i
+        i += 1
+        if i >= len(argv):
+            raise UsageError(f"option {name} needs a value")
+        return argv[i]
+
+    while i < len(argv):
+        a = argv[i]
+        key = value = None
+        if a in OPTIONS:
+            key, has_value = OPTIONS[a]
+            if has_value:
+                value = take(a)
+        elif a.startswith("-") and "=" in a and a.split("=", 1)[0] in OPTIONS:
+            name, value = a.split("=", 1)
+            key, has_value = OPTIONS[name]
+            if not has_value:
+                raise UsageError(f"option {name} takes no value")
+        elif a.startswith("-") and not a.startswith("--"):
+            for p in ATTACHED:
+                if a.startswith(p) and len(a) > len(p):
+                    key, value = OPTIONS[p][0], a[len(p):]
+                    break
+        if key is None:
+            if not a.startswith("-") or a == "-":
+                o.inputs.append([a, lang_now])
+            elif a in HOST_PAIR:
+                o.host += [a, take(a)]
+            elif a.startswith("-Wl,"):
+                o.linker.append(a)
+            elif a.startswith(("-f", "-W", "-m", "--target=", "--sysroot=", "-pthread",
+                               "-march", "-mtune", "-pipe", "-nostdinc", "-stdlib=",
+                               "-rtlib=", "-fuse-ld=", "-static", "-rdynamic", "-pie",
+                               "-no-pie", "-s")) and a != "-shared":
+                # Host-compiler options (CMake's Clang rules and projects
+                # pass them directly): they go to the host compiler.
+                o.host.append(a)
+            elif o.forward_unknown:
+                o.host.append(a)
+            else:
+                raise UsageError(f"unknown option '{a}'")
+            i += 1
+            continue
+
+        if key == "compile":
+            o.phase = "compile"
+        elif key in ("device_c",):
+            o.phase, o.rdc = "compile", True
+        elif key == "device_w":
+            o.phase = "compile"
+        elif key == "dlink":
+            o.dlink = True
+        elif key == "lib":
+            o.lib = True
+        elif key == "link":
+            o.phase = None
+        elif key == "preprocess":
+            o.phase = "preprocess"
+        elif key == "ptx":
+            o.ptx = True
+        elif key == "cuda_device_only":
+            o.cuda_device_only = True
+        elif key == "unsupported_phase":
+            raise UsageError(f"{a}: not supported (this toolkit makes no "
+                             "NVIDIA binary formats; see --help)")
+        elif key in ("M", "MM"):
+            o.phase = "deps"
+            o.deps = "-M" if key == "M" else "-MM"
+        elif key in ("MD", "MMD"):
+            o.deps = "-MD" if key == "MD" else "-MMD"
+        elif key == "MF":
+            o.MF = value
+        elif key == "MT":
+            o.MT.append(value)
+        elif key == "MP":
+            o.MP = True
+        elif key == "output":
+            o.output = value
+        elif key == "x":
+            lang = LANG_NAMES.get(value)
+            if lang is None:
+                if value in ("none",):
+                    lang = None
+                else:
+                    raise UsageError(f"-x {value}: unknown language (cu, c, c++)")
+            lang_now = lang_global = lang
+        elif key in ("I", "isystem"):
+            if ocu_cc.vendor_path(value):
+                raise UsageError(f"refusing vendor SDK include path {value}")
+            o.pre += ["-I" if key == "I" else "-isystem", value]
+            o.include_dirs.append(value)
+        elif key == "include":
+            o.pre += ["-include", value]
+        elif key == "D":
+            # One macro per option: values may hold commas (CMake passes
+            # -DLIST="a,b"), so nvcc's comma-separated form is not split.
+            o.pre += ["-D", value]
+        elif key == "U":
+            o.pre += ["-U", value]
+        elif key == "L":
+            if ocu_cc.vendor_path(value):
+                raise UsageError(f"refusing vendor SDK library path {value}")
+            o.libdirs.append(value)
+        elif key == "l":
+            o.link_items.append(("lib", value))
+        elif key == "O":
+            if value not in ("0", "1", "2", "3", "s", "z", "fast", "g"):
+                raise UsageError(f"-O{value}: unknown optimisation level")
+            o.O = {"fast": "3"}.get(value, value)
+        elif key == "dopt":
+            o.notes.append(f"-dopt {value}: accepted (device code follows -O)")
+        elif key == "g":
+            o.g = True
+        elif key == "G":
+            o.G = True
+        elif key == "lineinfo":
+            pass
+        elif key == "std":
+            o.std = value
+        elif key in ("arch", "code", "gencode", "cuda_gpu_arch"):
+            o.archs += parse_arch(value)
+        elif key == "Xcompiler":
+            o.host += split_list(value)
+        elif key == "Xlinker":
+            for v in value.split(","):
+                o.linker += ["-Xlinker", v]
+        elif key == "Xignored":
+            o.ignored.append(f"{a} {value}")
+        elif key == "fast_math":
+            o.fast_math = True
+        elif key == "math_value":
+            o.notes.append(f"{a}={value}: accepted (device math follows Clang's defaults)")
+        elif key in ("accepted", "accepted_value"):
+            pass
+        elif key == "ccbin":
+            o.ccbin = value
+        elif key == "shared":
+            o.shared = True
+        elif key == "rdc":
+            o.rdc = value.lower() in ("true", "1", "yes")
+        elif key == "fgpu_rdc":
+            o.rdc = True
+        elif key == "cudart":
+            if value not in ("none", "shared", "static"):
+                raise UsageError(f"-cudart {value}: expected none, shared or static")
+            o.cudart = value
+        elif key == "version":
+            o.version = True
+        elif key == "dryrun":
+            o.dryrun = True
+        elif key == "verbose":
+            o.verbose = True
+        elif key == "keep":
+            o.keep = True
+        elif key == "keep_dir":
+            o.keep_dir = value
+        elif key == "w":
+            o.host.append("-w")
+        elif key == "Werror":
+            kinds = set(value.split(","))
+            if not kinds <= NVCC_WERROR_KINDS:
+                raise UsageError(f"-Werror {value}: unknown kind")
+            if "all-warnings" in kinds:
+                o.host.append("-Werror")
+        elif key == "list_arch":
+            o.list_arch = True
+        elif key == "forward_unknown":
+            o.forward_unknown = True
+        elif key == "forward_unknown_ld":
+            o.forward_unknown = True
+        elif key == "ocu_target":
+            o.target = value
+        elif key == "help":
+            o.help = True
+        else:  # pragma: no cover - table and handler out of step
+            raise UsageError(f"internal: unhandled option {a}")
+        i += 1
+
+    if o.target not in ("cpu", "nvidia"):
+        raise UsageError(f"--ocu-target={o.target}: expected cpu or nvidia")
+    for item in o.inputs:   # nvcc: -x applies to every input
+        if item[1] is None:
+            item[1] = lang_global
+    return o
+
+
+def split_list(value: str) -> list[str]:
+    """nvcc's -Xcompiler value: options separated by commas; each piece is
+    also split like a shell word list (build systems pass "-Wa -Wb")."""
+    out = []
+    for piece in value.split(","):
+        out += shlex.split(piece)
+    return out
+
+
+def parse_arch(value: str) -> list[int]:
+    """Architecture numbers in sm_80, compute_80, 80, "arch=compute_80,
+    code=[sm_80,compute_80]", sm_90a. Names without a number (native, all,
+    all-major) record nothing."""
+    return [int(n) for n in re.findall(r"(?:sm|compute|lto)_(\d+)[a-z]?", value)] or \
+        ([int(value)] if value.isdigit() else [])
+
+
+# ---- toolchain pieces -----------------------------------------------------
+
+def host_compilers(o) -> tuple[str, str]:
+    """(C++ compiler, C compiler) for host code."""
+    cxx = o.ccbin or os.environ.get("OCU_HOST_CXX")
+    if cxx and Path(cxx).is_dir():
+        for name in ("clang++", "g++", "c++"):
+            if (Path(cxx) / name).exists():
+                cxx = str(Path(cxx) / name)
+                break
+    if not cxx:
+        llvm = ocu_cc._llvm_tool("clang++")
+        cxx = llvm if Path(llvm).is_file() else (shutil.which("clang++") or "c++")
+    base = Path(cxx).name
+    cc_name = re.sub(r"clang\+\+", "clang", base)
+    cc_name = re.sub(r"g\+\+", "gcc", cc_name)
+    cc_name = re.sub(r"^c\+\+", "cc", cc_name)
+    cc = os.environ.get("OCU_HOST_CC") or \
+        (str(Path(cxx).with_name(cc_name)) if os.sep in cxx else cc_name)
+    return cxx, cc
+
+
+def toolkit_libdir() -> Path | None:
+    """Our runtime libraries: next to the driver in a toolkit layout
+    (<root>/bin/ocu-nvcc, <root>/lib), in an installed prefix, or where
+    OCU_TOOLKIT_LIBDIR says."""
+    env = os.environ.get("OCU_TOOLKIT_LIBDIR")
+    cands = [Path(env)] if env else []
+    for root in (SELF.parent.parent, REAL.parent.parent):
+        cands += [root / "lib", root / "lib64"]
+        cands += sorted((root / "lib").glob("*-linux-gnu")) if (root / "lib").is_dir() else []
+    for d in cands:
+        if (d / "libocu_cudart.a").is_file():
+            return d
+    return None
+
+
+def runtime_link(libdir: Path, blas: bool, target: str = "cpu") -> list[str]:
+    # -lcublas: the cublas_v2.h library built for the same target as the
+    # CUDA code (libs/cublas), then the internal BLAS layer.
+    names = ([f"ocu_cublas_{target}", "ocu_blas"] if blas else []) + \
+        ["ocu_cudart", "ocu_core", "ocu_backend_cpu", "ocu_backend_nvidia", "ocu_backend_metal"]
+    files = [str(libdir / f"lib{n}.a") for n in names if (libdir / f"lib{n}.a").is_file()]
+    if sys.platform == "darwin":
+        out = files
+        if (libdir / "libocu_backend_metal.a").is_file():
+            out += ["-framework", "Metal", "-framework", "Foundation"]
+        return out + ["-lpthread", "-lm"]
+    return ["-Wl,--start-group", *files, "-Wl,--end-group", "-lpthread", "-ldl", "-lm"]
+
+
+def cuda_api_version() -> tuple[int, int]:
+    """The CUDA API level our headers declare (CUDART_VERSION)."""
+    header = ocu_cc.header_dirs()[0] / "cuda_runtime_api.h"
+    try:
+        m = re.search(r"#define\s+CUDART_VERSION\s+(\d+)", header.read_text())
+    except OSError:
+        m = None
+    v = int(m.group(1)) if m else 12030
+    return v // 1000, (v % 1000) // 10
+
+
+def print_version(o) -> int:
+    cxx, _ = host_compilers(o)
+    major, minor = cuda_api_version()
+    print(f"{PROG} {OCU_VERSION}: CUDA compiler driver of the ocu project "
+          f"(target {o.target})")
+    try:
+        first = subprocess.run([cxx, "--version"], capture_output=True, text=True,
+                               check=False).stdout.splitlines()
+    except OSError:
+        first = []
+    if first:
+        print(f"{first[0]}  [host and device compiler: {cxx}]")
+    print(f"CUDA API level {major}.{minor} (V{major}.{minor}.0), "
+          "runtime and headers from the ocu project")
+    return 0
+
+
+def list_archs() -> int:
+    print("\n".join(f"sm_{n}" for n in (50, 52, 53, 60, 61, 62, 70, 72, 75, 80, 86, 87, 89, 90)))
+    return 0
+
+
+# ---- the build --------------------------------------------------------------
+
+class Driver:
+    def __init__(self, o):
+        self.o = o
+        self.cxx, self.cc = host_compilers(o)
+        self.env = ocu_cc.clean_env()
+
+    def show(self, cmd):
+        if not (self.o.verbose or self.o.dryrun):
+            return
+        if cmd and cmd[0] == "<rewrite>":
+            line = f"{PROG}: rewrite launches for the CPU path {cmd[1]} -> {cmd[2]}"
+        elif cmd and cmd[0] == "<container>":
+            line = f"{PROG}: device-code container {cmd[1]} ({cmd[2]}: {cmd[3]})"
+        else:
+            line = " ".join(shlex.quote(c) for c in cmd)
+        print(f"#$ {line}", file=sys.stderr if not self.o.dryrun else sys.stdout)
+
+    def run(self, cmds, label) -> int:
+        return ocu_cc.run_commands(cmds, self.env, label, self.o.dryrun, self.show)
+
+    def language(self, path: str, lang) -> str | None:
+        if lang:
+            return lang
+        suffix = Path(path).suffix
+        if suffix in CU_SUFFIXES:
+            return "cu"
+        if suffix in C_SUFFIXES:
+            return "c"
+        if suffix in CPP_SUFFIXES:
+            return "cpp"
+        return None  # a linker input
+
+    def ptx_arch(self) -> str:
+        if getattr(self, "_ptx_arch", None) is None:
+            self._ptx_arch = self._pick_ptx_arch()
+        return self._ptx_arch
+
+    def _pick_ptx_arch(self) -> str:
+        archs = sorted(set(self.o.archs))
+        if not archs:
+            return "sm_80"
+        usable = [a for a in archs if a <= CLANG_MAX_SM]
+        if not usable:
+            self.note(f"sm_{archs[0]} is newer than Clang's NVPTX back end knows; "
+                      f"building sm_{CLANG_MAX_SM} PTX (the driver compiles it for the GPU)")
+            return f"sm_{CLANG_MAX_SM}"
+        return f"sm_{usable[0]}"
+
+    def note(self, text: str):
+        if self.o.verbose:
+            print(f"{PROG}: note: {text}", file=sys.stderr)
+
+    def compile_args(self, lang: str, deps: list[str]) -> SimpleNamespace:
+        o = self.o
+        level = o.O
+        if level is None and lang == "cu" and not o.G:
+            level = "3"  # device code is optimised by default, as with nvcc
+        level = {"z": "s"}.get(level, level)
+        device = []
+        if o.fast_math:
+            device += ["-fcuda-approx-transcendentals", "-fgpu-flush-denormals-to-zero"]
+        host = list(o.host)
+        if o.verbose:
+            host.append("-v")
+        return SimpleNamespace(
+            target=o.target, arch=self.ptx_arch() if o.target == "nvidia" else None,
+            I=[], D=[], O=level, g=o.g or o.G, cache=None, lang=lang, std=o.std,
+            pre=list(o.pre), host=host, device=device, deps=deps,
+            cxx=self.cxx, cc=self.cc)
+
+    def dep_flags(self, obj: str) -> list[str]:
+        o = self.o
+        if not o.deps or o.phase == "deps":
+            return []
+        mf = o.MF or str(Path(obj).with_suffix(".d"))
+        flags = [o.deps, "-MF", mf]
+        for t in o.MT or [obj]:
+            flags += ["-MT", t]
+        if o.MP:
+            flags.append("-MP")
+        return flags
+
+    def compile_one(self, src: str, lang: str, obj: str, work: Path) -> int:
+        args = self.compile_args(lang, self.dep_flags(obj))
+        if self.o.target == "cpu" and self.o.ptx:
+            raise UsageError("-ptx needs --ocu-target=nvidia")
+        cmds = ocu_cc.build_commands(args, Path(src).resolve(), Path(obj).resolve(), work)
+        return self.run(cmds, src)
+
+    def preprocess_one(self, src: str, lang: str, out: str | None, work: Path) -> int:
+        """-E (preprocessed source) or -M/-MM (dependencies only), with the
+        same options the compile step would use."""
+        o = self.o
+        args = self.compile_args(lang, [])
+        args.host = [h for h in args.host if h != "-v"]
+        obj = str(Path(Path(src).name).with_suffix(".o"))
+        cmds = ocu_cc.build_commands(args, Path(src).resolve(), Path(work / "x.o"), work)
+        cmd = list(cmds[0] if o.target == "cpu" or lang != "cu" else cmds[-1])
+        # Drop the step's own output and object options, keep the rest.
+        clean, skip = [], 0
+        for k, c in enumerate(cmd):
+            if skip:
+                skip -= 1
+                continue
+            if c == "-o":
+                skip = 1
+                continue
+            if c in ("-c", "-E"):
+                continue
+            if c == "-Xclang" and k + 1 < len(cmd) and cmd[k + 1] == "-fcuda-include-gpubinary":
+                skip = 3
+                continue
+            clean.append(c)
+        if o.phase == "deps":
+            clean += [o.deps]
+            for t in o.MT or [obj]:
+                clean += ["-MT", t]
+            if o.MP:
+                clean.append("-MP")
+            target = o.MF or out
+        else:
+            clean += ["-E"]
+            target = out
+        if target:
+            clean += ["-o", target]
+        return self.run([clean], src)
+
+    def link(self, items: list[str], out: str, work: Path) -> int:
+        o = self.o
+        if o.lib:
+            cmd = [os.environ.get("AR", "ar"), "rcs", out,
+                   *[p for kind, p in items if kind == "file"]]
+            if not o.dryrun and Path(out).exists():
+                Path(out).unlink()
+            return self.run([cmd], out)
+        line, want_runtime, want_blas = [], o.cudart != "none", False
+        for kind, value in items:
+            if kind == "file":
+                line.append(value)
+            elif value in RUNTIME_LIBS:
+                want_runtime = True
+            elif value in BLAS_LIBS:
+                want_blas = want_runtime = True
+            elif value in NO_IMPL_LIBS:
+                self.note(f"-l{value}: no implementation in this toolkit yet; "
+                          "its functions stay unresolved")
+            else:
+                line.append(f"-l{value}")
+        extra = []
+        if want_runtime or want_blas:
+            libdir = toolkit_libdir()
+            if libdir is None:
+                raise UsageError("runtime libraries not found next to the driver "
+                                 "(build the ocu_toolkit target, or set OCU_TOOLKIT_LIBDIR)")
+            extra = runtime_link(libdir, want_blas, o.target)
+        cmd = [self.cxx, *(["-shared"] if o.shared else []), *o.host,
+               *(["-v"] if o.verbose else []),
+               *line, "-o", out, *[f"-L{d}" for d in o.libdirs], *o.linker, *extra]
+        return self.run([cmd], out)
+
+    def empty_object(self, out: str, work: Path) -> int:
+        stub = work / "ocu_dlink.c"
+        stub.write_text("/* device code is linked into the host objects already */\n"
+                        "typedef int ocu_dlink_empty;\n")
+        return self.run([[self.cc, *[h for h in self.o.host if h.startswith(("-f", "-m"))],
+                          "-c", str(stub), "-o", out]], out)
+
+    def main(self) -> int:
+        o = self.o
+        if o.rdc and o.target == "nvidia":
+            raise UsageError("relocatable device code (-rdc=true, -dc, -fgpu-rdc) needs "
+                             "device linking, which the nvidia target does not support yet")
+        for item in o.ignored:
+            self.note(f"{item}: options for NVIDIA's back-end tools are ignored")
+        for n in o.notes:
+            self.note(n)
+        if o.verbose and o.archs:
+            for a in sorted(set(o.archs)):
+                # One line per recorded architecture, in the form build
+                # systems look for when they read a compiler's -v output.
+                where = ("PTX for " + self.ptx_arch()) if o.target == "nvidia" \
+                    else "device code runs on the host CPU"
+                print(f"#$ {PROG}: GPU architecture -target-cpu sm_{a} recorded ({where})",
+                      file=sys.stderr)
+        if not o.inputs:
+            raise UsageError("no input files")
+        if any(h in ("--version", "-dumpversion", "-dumpfullversion") for h in o.host):
+            # e.g. "-Xcompiler --version": the host compiler's answer.
+            return self.run([[self.cxx, *o.host]], "host")
+
+        compiling = [(p, self.language(p, lang)) for p, lang in o.inputs]
+        sources = [(p, lang) for p, lang in compiling if lang]
+        for p, _lang in sources:
+            if p != "-" and not Path(p).is_file():
+                raise UsageError(f"{p}: no such file")
+
+        keep_dir = Path(o.keep_dir) if o.keep_dir else (Path.cwd() if o.keep else None)
+        tmp = tempfile.TemporaryDirectory(prefix="ocu-nvcc-")
+        try:
+            work = Path(tmp.name)
+            if o.phase in ("preprocess", "deps"):
+                if o.output and len(sources) > 1:
+                    raise UsageError("-o with several inputs")
+                for p, lang in sources:
+                    rc = self.preprocess_one(p, lang, o.output, work)
+                    if rc:
+                        return rc
+                return 0
+
+            if o.dlink:
+                if o.target != "cpu":
+                    raise UsageError("-dlink: device linking is not supported on the nvidia target")
+                # CPU path: device code already sits in the host objects.
+                return self.empty_object(o.output or "a_dlink.o", work)
+
+            if o.phase == "compile" or o.ptx or o.cuda_device_only:
+                if o.output and len(sources) > 1:
+                    raise UsageError("-o with several inputs")
+                for p, lang in sources:
+                    suffix = ".ptx" if (o.ptx or o.cuda_device_only) else ".o"
+                    obj = o.output or Path(p).with_suffix(suffix).name
+                    if (o.ptx or o.cuda_device_only) and not obj.endswith(".ptx"):
+                        if o.target != "nvidia":
+                            raise UsageError("PTX output needs --ocu-target=nvidia")
+                        # build_commands picks the PTX step from the name
+                        ptx = work / "out.ptx"
+                        rc = self.compile_one(p, lang, str(ptx), work)
+                        if not rc and not o.dryrun:
+                            shutil.copyfile(ptx, obj)
+                    else:
+                        rc = self.compile_one(p, lang, obj, work)
+                    if rc:
+                        return rc
+                return 0
+
+            # Compile then link (or archive) everything.
+            items, n = [], 0
+            for (p, lang) in compiling:
+                if lang:
+                    n += 1
+                    d = keep_dir or work
+                    obj = str((d / f"{Path(p).stem}.{n}.o").resolve())
+                    rc = self.compile_one(p, lang, obj, work)
+                    if rc:
+                        return rc
+                    items.append(("file", obj))
+                else:
+                    items.append(("file", p))
+            # -l options keep their order after the inputs.
+            items += o.link_items
+            out = o.output or ("a.out" if not o.lib else "a.a")
+            return self.link(items, out, work)
+        finally:
+            tmp.cleanup()
+
+
+def main(argv: list[str]) -> int:
+    try:
+        o = parse(expand_response_files(argv))
+        if o.help:
+            print(__doc__)
+            return 0
+        if o.version:
+            return print_version(o)
+        if o.list_arch:
+            return list_archs()
+        return Driver(o).main()
+    except UsageError as e:
+        print(f"{PROG}: error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

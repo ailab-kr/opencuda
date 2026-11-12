@@ -327,3 +327,124 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
             -c ${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu -o ${OCU_CC_OUT}/x.o)
   set_tests_properties(ocu_cc_refuses_vendor_path PROPERTIES WILL_FAIL TRUE)
 endif()
+
+# ---- the BLAS library API (cublas_v2.h): the same test program on the CPU
+# path and on an NVIDIA GPU (skipped without one). OCU_CUBLAS_TILE forces
+# each tile configuration, so both are checked whatever the device size.
+if(TARGET ocu_cublas_cpu)
+  ocu_add_cpu_cu_executable(cublas_accuracy libs/cublas_accuracy.cu LIBRARIES ocu_cublas_cpu)
+  add_test(NAME cublas_cpu COMMAND cublas_accuracy)
+  add_test(NAME cublas_cpu_tile64_random COMMAND cublas_accuracy)
+  set_tests_properties(cublas_cpu_tile64_random PROPERTIES
+    ENVIRONMENT "OCU_CUBLAS_TILE=64;OCU_CPU_ORDER=random;OCU_CPU_SEED=9")
+  add_test(NAME cublas_cpu_tile128 COMMAND cublas_accuracy)
+  set_tests_properties(cublas_cpu_tile128 PROPERTIES ENVIRONMENT "OCU_CUBLAS_TILE=128")
+endif()
+# The reference BLAS cases (conformance/oracle) through the library, for
+# the functions it offers.
+set(OCU_CUBLAS_CASES "gemm,gemv:f32,axpy:f32,dot:f32,scal:f32,nrm2:f32,trsm:f32")
+if(TARGET ocu_cublas_cpu)
+  ocu_add_cpu_cu_executable(cublas_driver conformance/cublas_driver.cu LIBRARIES ocu_cublas_cpu)
+  add_test(NAME conformance_cublas_cpu
+    COMMAND ${Python3_EXECUTABLE} -m ocu_conf.blas_run $<TARGET_FILE:cublas_driver>
+            --only ${OCU_CUBLAS_CASES} --out ${CMAKE_CURRENT_BINARY_DIR}/cublas_cpu_result.json
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/conformance/harness)
+  add_test(NAME conformance_cublas_cpu_stream
+    COMMAND ${Python3_EXECUTABLE} -m ocu_conf.blas_run $<TARGET_FILE:cublas_driver>
+            --only ${OCU_CUBLAS_CASES}
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/conformance/harness)
+  set_tests_properties(conformance_cublas_cpu_stream PROPERTIES
+    ENVIRONMENT "OCU_DRIVER_STREAM=1;OCU_CPU_ORDER=random")
+endif()
+if(TARGET ocu_cublas_nvidia AND TARGET run_if_nvidia)
+  ocu_add_nvidia_cu_executable(cublas_accuracy_nv libs/cublas_accuracy.cu LIBRARIES ocu_cublas_nvidia)
+  foreach(tile default 64 128)
+    add_test(NAME gpu_cublas_${tile} COMMAND run_if_nvidia $<TARGET_FILE:cublas_accuracy_nv>)
+    set(_env "ASAN_OPTIONS=detect_leaks=0")
+    if(NOT tile STREQUAL "default")
+      list(APPEND _env "OCU_CUBLAS_TILE=${tile}")
+    endif()
+    set_tests_properties(gpu_cublas_${tile} PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "${_env}")
+  endforeach()
+  ocu_add_nvidia_cu_executable(cublas_driver_nv conformance/cublas_driver.cu LIBRARIES ocu_cublas_nvidia)
+  add_test(NAME gpu_conformance_cublas
+    COMMAND run_if_nvidia ${Python3_EXECUTABLE} -m ocu_conf.blas_run
+            $<TARGET_FILE:cublas_driver_nv> --backend nvidia --only ${OCU_CUBLAS_CASES}
+            --out ${CMAKE_CURRENT_BINARY_DIR}/cublas_nvidia_result.json
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/conformance/harness)
+  set_tests_properties(gpu_conformance_cublas PROPERTIES SKIP_RETURN_CODE 77
+    ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0;OCU_DRIVER_STREAM=1")
+endif()
+
+# ---- ocu-nvcc: the nvcc-compatible driver and the toolkit folder ----------
+if(OCU_BACKEND_CPU AND Python3_FOUND AND NOT WIN32 AND NOT CMAKE_CROSSCOMPILING)
+  set(OCU_NVCC ${OCU_TOOLKIT_DIR}/bin/ocu-nvcc)
+  set(_drv ${CMAKE_CURRENT_SOURCE_DIR}/driver)
+  # The command line: spellings, phases, dependencies, libraries, refusals.
+  add_test(NAME ocu_nvcc_options
+    COMMAND ${Python3_EXECUTABLE} -m unittest -v test_ocu_nvcc
+    WORKING_DIRECTORY ${_drv})
+  set_tests_properties(ocu_nvcc_options PROPERTIES ENVIRONMENT "OCU_NVCC=${OCU_NVCC};OCU_TARGET=cpu")
+
+  # The runtime test programs, compiled one file at a time and linked, as a
+  # Makefile drives nvcc.
+  set(_ocu_nvcc_programs
+    "rt_api|${CMAKE_CURRENT_SOURCE_DIR}/runtime/rt_api.cu"
+    "rt_lang|${CMAKE_CURRENT_SOURCE_DIR}/runtime/rt_lang.cu"
+    "rt_mem|${CMAKE_CURRENT_SOURCE_DIR}/runtime/rt_mem.cu"
+    "rt_misc|${CMAKE_CURRENT_SOURCE_DIR}/runtime/rt_misc.cu"
+    "rt_fp16|${CMAKE_CURRENT_SOURCE_DIR}/runtime/rt_fp16.cu"
+    "rt_launch_api|${CMAKE_CURRENT_SOURCE_DIR}/runtime/rt_launch_api.cu"
+    "rt_review|${CMAKE_CURRENT_SOURCE_DIR}/runtime/rt_review.cu"
+    "rt_review2|${CMAKE_CURRENT_SOURCE_DIR}/runtime/rt_review2.cu"
+    "saxpy|${CMAKE_CURRENT_SOURCE_DIR}/probe/main_saxpy.cu,${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu")
+  set(_ocu_nvcc_targets cpu)
+  if(OCU_CLANG_GPU_TARGETS AND OCU_BACKEND_NVIDIA)
+    list(APPEND _ocu_nvcc_targets nvidia)
+  endif()
+  foreach(target IN LISTS _ocu_nvcc_targets)
+    set(_wrap)
+    set(_env)
+    if(target STREQUAL "nvidia")
+      # Skipped (exit 77) without a usable NVIDIA device.
+      set(_wrap -DRUN_WRAPPER=$<TARGET_FILE:run_if_nvidia>)
+      set(_env "ASAN_OPTIONS=detect_leaks=0")
+    endif()
+    foreach(p IN LISTS _ocu_nvcc_programs)
+      string(REPLACE "|" ";" p "${p}")
+      list(GET p 0 name)
+      list(GET p 1 srcs)
+      add_test(NAME ocu_nvcc_${target}_${name}
+        COMMAND ${CMAKE_COMMAND} -DDRIVER=${OCU_NVCC} -DTARGET=${target}
+                -DWORK=${CMAKE_CURRENT_BINARY_DIR}/ocu_nvcc/${target}_${name}
+                "-DSOURCES=${srcs}" -DINCLUDES=${CMAKE_CURRENT_SOURCE_DIR}/runtime
+                "-DFLAGS=${CMAKE_CXX_FLAGS}" ${_wrap}
+                -P ${_drv}/run_driver.cmake)
+      set_tests_properties(ocu_nvcc_${target}_${name} PROPERTIES
+        SKIP_REGULAR_EXPRESSION "OCU_SKIP" ENVIRONMENT "${_env}")
+    endforeach()
+
+    # An ordinary CMake project with enable_language(CUDA) and
+    # find_package(CUDAToolkit), using the toolkit through OcuCUDA.cmake.
+    add_test(NAME ocu_nvcc_cmake_project_${target}
+      COMMAND ${CMAKE_COMMAND} -DSRC=${_drv}/cmake_project
+              -DWORK=${CMAKE_CURRENT_BINARY_DIR}/ocu_nvcc/cmake_${target}
+              -DTARGET=${target} -DTOOLKIT=${OCU_TOOLKIT_DIR}
+              -DCC=${CMAKE_C_COMPILER} -DCXX=${CMAKE_CXX_COMPILER}
+              "-DCFLAGS=${CMAKE_C_FLAGS}" "-DCXXFLAGS=${CMAKE_CXX_FLAGS}"
+              "-DLDFLAGS=${CMAKE_EXE_LINKER_FLAGS}" ${_wrap}
+              -P ${_drv}/cmake_project_test.cmake)
+    set_tests_properties(ocu_nvcc_cmake_project_${target} PROPERTIES
+      SKIP_REGULAR_EXPRESSION "OCU_SKIP" ENVIRONMENT "${_env}")
+  endforeach()
+
+  # The same project with the installed toolkit (<prefix>/<libdir>/ocu/toolkit).
+  add_test(NAME ocu_nvcc_cmake_project_installed
+    COMMAND ${CMAKE_COMMAND} -DSRC=${_drv}/cmake_project
+            -DWORK=${CMAKE_CURRENT_BINARY_DIR}/ocu_nvcc/cmake_installed
+            -DTARGET=cpu -DINSTALL_FROM=${PROJECT_BINARY_DIR} -DLIBDIR=${CMAKE_INSTALL_LIBDIR}
+            -DCC=${CMAKE_C_COMPILER} -DCXX=${CMAKE_CXX_COMPILER}
+            "-DCFLAGS=${CMAKE_C_FLAGS}" "-DCXXFLAGS=${CMAKE_CXX_FLAGS}"
+            "-DLDFLAGS=${CMAKE_EXE_LINKER_FLAGS}"
+            -P ${_drv}/cmake_project_test.cmake)
+endif()

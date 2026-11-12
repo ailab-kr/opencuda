@@ -5,3 +5,8 @@ if(OCU_BACKEND_CPU)
   add_executable(bench_blas bench_blas.c)
   target_link_libraries(bench_blas PRIVATE ocu_bench ocu_blas)
 endif()
+
+# GEMM throughput of the BLAS library API on an NVIDIA GPU.
+if(TARGET ocu_cublas_nvidia)
+  ocu_add_nvidia_cu_executable(bench_cublas bench_cublas.cu LIBRARIES ocu_cublas_nvidia ocu_bench)
+endif()

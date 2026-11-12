@@ -1,0 +1,9 @@
+Test project /build
+      Start  1: cpu_backend
+ 1/5 Test  #1: cpu_backend ..........................   Passed    0.04 sec
+ 2/5 Test  #2: runtime_api ..........................   Passed    0.01 sec
+ 3/5 Test  #3: gpu_rt_api ...........................   Passed    0.26 sec
+ 4/5 Test  #4: metal_cu2msl_host ....................***Failed   18.13 sec
+ 5/5 Test  #5: nvidia_backend .......................***Skipped   0.00 sec
+
+80% tests passed, 1 tests failed out of 5

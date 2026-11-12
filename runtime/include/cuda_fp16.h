@@ -329,6 +329,8 @@ OCU_HMATH(hrint, __builtin_rintf(x))
 
 OCU_F16_FN __half2 __halves2half2(__half a, __half b) { return __half2(a, b); }
 OCU_F16_FN __half2 __half2half2(__half a) { return __half2(a, a); }
+/* make_half2(x, y): the pair (x, y); x is the low half. */
+OCU_F16_FN __half2 make_half2(__half x, __half y) { return __half2(x, y); }
 OCU_F16_FN __half2 __float2half2_rn(float a) { return __half2half2(__float2half_rn(a)); }
 OCU_F16_FN __half2 __floats2half2_rn(float a, float b)
 {

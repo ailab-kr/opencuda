@@ -1,0 +1,5 @@
+pathfinder      ok         SAME vs OpenMP
+nw              ok         SAME vs OpenMP
+srad_v1         BUILT      built (needs input data to run)
+huffman         BUILD-FAIL texture reference
+summary: 4 programs, 3 built, 2 checked equal, 1 failed or not built

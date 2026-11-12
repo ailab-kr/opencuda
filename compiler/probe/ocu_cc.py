@@ -151,13 +151,14 @@ def normalized_copies(src: Path, dest: Path):
 
 def header_dirs() -> list[Path]:
     """Our headers: one folder in an installed package (<prefix>/include/ocu
-    next to <prefix>/libexec/ocu/ocu_cc.py), three in the source tree. The
-    first holds cuda_runtime.h."""
+    next to <prefix>/libexec/ocu/ocu_cc.py), four in the source tree (the
+    last: the library headers, cublas_v2.h). The first holds
+    cuda_runtime.h."""
     installed = HERE.parent.parent / "include" / "ocu"
     if (installed / "cuda_runtime.h").is_file() and not (REPO / "runtime" / "include").is_dir():
         return [installed]
     return [REPO / "runtime" / "include", REPO / "backends" / "interface",
-            REPO / "backends" / "cpu"]
+            REPO / "backends" / "cpu", REPO / "libs" / "cublas" / "include"]
 
 
 # Clang's CUDA default (-ffp-contract=fast) fuses a*b+c into fma everywhere,
@@ -168,24 +169,38 @@ def header_dirs() -> list[Path]:
 FP_CONTRACT = ["-ffp-contract=fast-honor-pragmas"]
 
 
-def ptx_shift_step(args, src: Path, work: Path, common: list[str], side: str):
+def source_language(args, src: Path) -> str:
+    """"cu", "c" or "cpp": an explicit choice (args.lang, from -x) wins,
+    else the file suffix decides, as nvcc does."""
+    lang = getattr(args, "lang", None)
+    if lang:
+        return lang
+    if src.suffix == ".c":
+        return "c"
+    if src.suffix in (".cpp", ".cc", ".cxx", ".C", ".c++"):
+        return "cpp"
+    return "cu"
+
+
+def ptx_shift_step(args, src: Path, work: Path, common: list[str], std: str, side: str):
     """--ptx-shift (ptx_shift.py): a step that writes rewritten copies of
     the source and its local includes, the source to compile instead, and
     the extra compiler options (the helpers, the original folder for
     quoted includes). Without the option: nothing, src, nothing."""
-    if not args.ptx_shift:
+    if not getattr(args, "ptx_shift", False):
         return [], src, []
     dirs = header_dirs()
     path = pinned_cuda_path(work.parent if args.cache is None else Path(args.cache))
-    ast = [_llvm_tool("clang++"), "-x", "cuda", "-std=c++17", "-nocudainc", "-nocudalib",
+    ast = [_llvm_tool("clang++"), "-x", "cuda", f"-std={std}", "-nocudainc", "-nocudalib",
            f"--cuda-path={path}", f"--cuda-gpu-arch={args.arch or 'sm_80'}", side,
-           *[f"-I{d}" for d in dirs], "-include", str(dirs[0] / "cuda_runtime.h"),
+           *[f"-I{d}" for d in dirs], "-D__CUDACC__", "-include", str(dirs[0] / "cuda_runtime.h"),
            "-Wno-unknown-cuda-version", *common]
     if args.target == "cpu":
         # Headers the CPU compiler finds in its own folder (omp.h with GCC)
         # come after Clang's own, so that both read the same program.
         try:
-            own = subprocess.run([os.environ.get("CXX", "c++"), "-print-file-name=include"],
+            own = subprocess.run([getattr(args, "cxx", None) or os.environ.get("CXX", "c++"),
+                                  "-print-file-name=include"],
                                  capture_output=True, text=True).stdout.strip()
         except OSError:
             own = ""
@@ -198,6 +213,29 @@ def ptx_shift_step(args, src: Path, work: Path, common: list[str], side: str):
 
 
 def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
+    """The commands that compile one source. `args` has target, arch, I, D,
+    O, g and cache (the ocu_cc.py command line); the compiler driver
+    (compiler/driver/ocu-nvcc) also sets, all optional:
+      lang   "cu" | "c" | "cpp" (default: from the suffix)
+      std    C++ dialect, e.g. "c++17" or "gnu++20" (default c++17)
+      pre    preprocessor options in command-line order (-I, -isystem, -D,
+             -U, -include ...)
+      host   host-compiler options (-Xcompiler, -fPIC, -march ...)
+      device extra options for the NVIDIA device-code step
+      deps   dependency-file options (-MD -MF f -MT t), given to the step
+             that sees the original includes
+      cxx, cc  host compilers (default: $CXX / $CC, then c++ / cc)
+      ptx_shift  True: --ptx-shift (cpu, and nvidia objects)
+    """
+    lang = source_language(args, src)
+    std = getattr(args, "std", None) or "c++17"
+    pre = list(getattr(args, "pre", None) or [])
+    host = list(getattr(args, "host", None) or [])
+    device = list(getattr(args, "device", None) or [])
+    deps = list(getattr(args, "deps", None) or [])
+    cxx = getattr(args, "cxx", None) or os.environ.get("CXX", "c++")
+    cc = getattr(args, "cc", None) or os.environ.get("CC", "cc")
+
     codegen = []  # options that matter after preprocessing
     if args.O:
         codegen.append(f"-O{args.O}")
@@ -208,76 +246,128 @@ def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
         common += ["-I", inc]
     for d in args.D:
         common += ["-D", d]
+    common += pre
     common.append(f"-I{HERE}")
+    dirs = header_dirs()
+    ours = [f"-I{d}" for d in dirs]
+
+    # Host-only sources: compiled as nvcc hands them to the host compiler,
+    # with our headers on the include path (same on every target).
+    if lang == "c" and (args.target == "cpu" or not str(out).endswith(".ptx")):
+        return [[cc, *ours, *common, *host, *deps, "-c", str(src), "-o", str(out)]]
+    if lang == "cpp" and (args.target == "cpu" or not str(out).endswith(".ptx")):
+        given = [f"-std={args.std}"] if getattr(args, "std", None) else []
+        return [[cxx, *given, *ours, *common, *host, *deps, "-c", str(src), "-o", str(out)]]
 
     if args.target == "cpu":
-        cxx = os.environ.get("CXX", "c++")
-        dirs = header_dirs()
         rt = dirs[0]
-        ours = [f"-I{d}" for d in dirs]
-        if src.suffix in (".c",):
-            cc = os.environ.get("CC", "cc")
-            return [[cc, *ours, *common, "-c", str(src), "-o", str(out)]]
-        if src.suffix in (".cpp", ".cc", ".cxx", ".C"):
-            return [[cxx, *ours, *common, "-c", str(src), "-o", str(out)]]
-        pre = work / (src.stem + ".ii")
+        pre_out = work / (src.stem + ".ii")
         rewritten = work / (src.stem + ".ocu.ii")
-        shift, src, extra = ptx_shift_step(args, src, work, common, "--cuda-host-only")
+        shift, src, extra = ptx_shift_step(args, src, work, common, std, "--cuda-host-only")
         return [*shift,
-                [cxx, "-std=c++17", "-x", "c++", "-E", "-DOCU_CPU_PATH",
+                [cxx, f"-std={std}", "-x", "c++", "-E", "-DOCU_CPU_PATH",
                  "-DOCU_CPU_PREPROCESS", "-D__CUDACC__", *ours,
                  # nvcc includes cuda_runtime.h in every .cu file
                  "-include", str(rt / "cuda_runtime.h"), *extra,
-                 *common, str(src), "-o", str(pre)],
-                ["<rewrite>", str(pre), str(rewritten)],
-                [cxx, "-std=c++17", "-x", "c++-cpp-output", *codegen,
+                 *common, *host, *deps, str(src), "-o", str(pre_out)],
+                ["<rewrite>", str(pre_out), str(rewritten)],
+                [cxx, f"-std={std}", "-x", "c++-cpp-output", *codegen, *host,
                  "-c", str(rewritten), "-o", str(out)]]
     clang = _llvm_tool("clang++")
-    if args.target == "nvidia" and not str(out).endswith(".ptx") and src.suffix in (".c",):
-        cc = os.environ.get("CC", "cc")
-        return [[cc, *[f"-I{d}" for d in header_dirs()], *common, "-c", str(src), "-o", str(out)]]
-    if args.target == "nvidia" and not str(out).endswith(".ptx") and src.suffix != ".cu":
-        cxx = os.environ.get("CXX", "c++")
-        return [[cxx, *[f"-I{d}" for d in header_dirs()], *common, "-c", str(src), "-o", str(out)]]
     if args.target == "nvidia" and not str(out).endswith(".ptx"):
         # Whole program: device code as PTX in our container, embedded in
         # the host object Clang compiles; the runtime registers it.
         arch = args.arch or "sm_80"
         path = pinned_cuda_path(work.parent if args.cache is None else Path(args.cache))
-        dirs = header_dirs()
-        ours = [f"-I{d}" for d in dirs]
-        cuda = [clang, "-x", "cuda", "-std=c++17", "-nocudainc", "-nocudalib",
+        cuda = [clang, "-x", "cuda", f"-std={std}", "-nocudainc", "-nocudalib",
                 f"--cuda-path={path}", f"--cuda-gpu-arch={arch}", *ours,
-                "-include", str(dirs[0] / "cuda_runtime.h"),
+                # nvcc defines __CUDACC__ for .cu files; Clang only does in
+                # its own CUDA headers, which -nocudainc leaves out.
+                "-D__CUDACC__", "-include", str(dirs[0] / "cuda_runtime.h"),
                 "-Wno-unknown-cuda-version", *FP_CONTRACT]
         ptx = work / (src.stem + ".ptx")
         fat = work / (src.stem + ".ocufat")
-        # --ptx-shift: the device pass's view of the source decides which
-        # shifts are rewritten (its copies also join spaced chevrons).
-        shift, src, extra = ptx_shift_step(args, src, work, common, "--cuda-device-only")
-        cuda += extra
         # Spaced chevrons ("<< <"), which Clang rejects: compile copies of
         # the source and its local quoted includes with only those
         # characters changed (see normalized_copies).
+        # --ptx-shift: the device pass's view of the source decides which
+        # shifts are rewritten (its copies also join spaced chevrons).
+        shift, src, extra = ptx_shift_step(args, src, work, common, std, "--cuda-device-only")
+        cuda += extra
         copy = None if shift else normalized_copies(src, work / "src")
         if copy is not None:
             cuda += ["-iquote", str(src.parent), "-I", str(src.parent)]
             src = copy
         return [*shift,
-                [*cuda, "--cuda-device-only", "-S", *common, str(src), "-o", str(ptx)],
+                [*cuda, "--cuda-device-only", "-S", *common, *device, str(src), "-o", str(ptx)],
                 ["<container>", str(fat), "nvidia", str(ptx)],
                 [*cuda, "--cuda-host-only", "-Xclang", "-fcuda-include-gpubinary",
-                 "-Xclang", str(fat), *common, "-c", str(src), "-o", str(out)]]
+                 "-Xclang", str(fat), *common, *host, *deps, "-c", str(src), "-o", str(out)]]
     if args.target == "nvidia":
         arch = args.arch or "sm_80"
         path = pinned_cuda_path(work.parent if args.cache is None else Path(args.cache))
         return [[clang, "-x", "cuda", "-nocudainc", "-nocudalib", f"--cuda-path={path}",
-                 f"--cuda-gpu-arch={arch}", "--cuda-device-only", "-S", *FP_CONTRACT, *common,
+                 f"--cuda-gpu-arch={arch}", "--cuda-device-only", "-S", *FP_CONTRACT, *common, *device,
                  str(src), "-o", str(out)]]
     arch = args.arch or "gfx1201"
     return [[clang, "-x", "hip", "-nogpuinc", "-nogpulib", f"--offload-arch={arch}",
              "--cuda-device-only", "--no-gpu-bundle-output", "-c", *common,
              str(src), "-o", str(out)]]
+
+
+def vendor_path(path: str) -> bool:
+    """True for a path inside a vendor SDK (symlinks resolved)."""
+    real = os.path.realpath(path)
+    return any(m in real or m in os.path.abspath(path) for m in VENDOR_MARKERS)
+
+
+def clean_env(env=None) -> dict:
+    """The environment for the compilers: include paths taken from the
+    environment and SDK locations are dropped, so that no vendor file is
+    read whatever the caller's shell has set."""
+    env = {k: v for k, v in (os.environ if env is None else env).items()
+           if k not in ("CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH",
+                        "OBJC_INCLUDE_PATH", "CUDA_PATH", "CUDA_HOME", "HIP_PATH")}
+    return macos_sdk_env(env)
+
+
+def run_commands(commands, env, label: str, print_only: bool = False,
+                 show=None) -> int:
+    """Run what build_commands returned. `show(cmd)` is called for every
+    step (verbose output); with print_only nothing runs."""
+    for cmd in commands:
+        if show is not None:
+            show(cmd)
+        if print_only:
+            continue
+        if cmd[0] == "<container>":
+            write_container(Path(cmd[1]), [(cmd[2], Path(cmd[3]).read_bytes())])
+            continue
+        if cmd[0] == "<ptx-shift>":
+            from ptx_shift import ShiftError, prepare
+            ours = [str(REPO / "runtime"), str(REPO / "backends"), cmd[3],
+                    *[str(d) for d in header_dirs()]]
+            try:
+                prepare(Path(cmd[1]), Path(cmd[2]), cmd[4:], env, ours,
+                        lambda m: print(f"ocu_cc: --ptx-shift: {m}", file=sys.stderr))
+            except ShiftError as error:
+                print(f"{label}: {error}", file=sys.stderr)
+                return 1
+            continue
+        if cmd[0] == "<rewrite>":
+            try:
+                # Bytes that are not UTF-8 (old sources) pass through unchanged.
+                text = Path(cmd[1]).read_text(encoding="utf-8", errors="surrogateescape")
+                text, _stats = rewrite(text, preprocessed=True)
+            except RewriteError as error:
+                print(f"{label}: {error}", file=sys.stderr)
+                return 1
+            Path(cmd[2]).write_text(text, encoding="utf-8", errors="surrogateescape")
+            continue
+        done = subprocess.run(cmd, env=env)
+        if done.returncode != 0:
+            return done.returncode
+    return 0
 
 
 def main(argv: list[str]) -> int:
@@ -302,16 +392,10 @@ def main(argv: list[str]) -> int:
         return 2
 
     for inc in args.I:
-        real = os.path.realpath(inc)  # symlinks resolved
-        if any(m in real or m in os.path.abspath(inc) for m in VENDOR_MARKERS):
+        if vendor_path(inc):
             print(f"ocu_cc: refusing vendor SDK include path {inc}", file=sys.stderr)
             return 2
-    # Compilers also take include paths from the environment; drop them so
-    # that the guarantee holds whatever the caller's shell has set.
-    env = {k: v for k, v in os.environ.items()
-           if k not in ("CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH",
-                        "OBJC_INCLUDE_PATH", "CUDA_PATH", "CUDA_HOME", "HIP_PATH")}
-    env = macos_sdk_env(env)
+    env = clean_env()
 
     src = Path(args.source).resolve()
     out = Path(args.output).resolve()
@@ -319,38 +403,11 @@ def main(argv: list[str]) -> int:
         work = Path(tmp) / "work"
         work.mkdir()
         commands = build_commands(args, src, out, work)
-        for cmd in commands:
-            if args.print_commands:
+        show = None
+        if args.print_commands:
+            def show(cmd):
                 print(" ".join(shlex.quote(c) for c in cmd))
-                continue
-            if cmd[0] == "<container>":
-                write_container(Path(cmd[1]), [(cmd[2], Path(cmd[3]).read_bytes())])
-                continue
-            if cmd[0] == "<ptx-shift>":
-                from ptx_shift import ShiftError, prepare
-                ours = [str(REPO / "runtime"), str(REPO / "backends"), cmd[3],
-                        *[str(d) for d in header_dirs()]]
-                try:
-                    prepare(Path(cmd[1]), Path(cmd[2]), cmd[4:], env, ours,
-                            lambda m: print(f"ocu_cc: --ptx-shift: {m}", file=sys.stderr))
-                except ShiftError as error:
-                    print(f"{args.source}: {error}", file=sys.stderr)
-                    return 1
-                continue
-            if cmd[0] == "<rewrite>":
-                try:
-                    # Bytes that are not UTF-8 (old sources) pass through unchanged.
-                    text = Path(cmd[1]).read_text(encoding="utf-8", errors="surrogateescape")
-                    text, _stats = rewrite(text, preprocessed=True)
-                except RewriteError as error:
-                    print(f"{args.source}: {error}", file=sys.stderr)
-                    return 1
-                Path(cmd[2]).write_text(text, encoding="utf-8", errors="surrogateescape")
-                continue
-            done = subprocess.run(cmd, env=env)
-            if done.returncode != 0:
-                return done.returncode
-    return 0
+        return run_commands(commands, env, args.source, args.print_commands, show)
 
 
 if __name__ == "__main__":
