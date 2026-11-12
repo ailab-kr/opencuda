@@ -212,11 +212,14 @@ OCU_D int __any_sync(unsigned m, int p) { return __nvvm_vote_any_sync(m, p != 0)
 OCU_D int __all_sync(unsigned m, int p) { return __nvvm_vote_all_sync(m, p != 0); }
 OCU_D unsigned __match_any_sync(unsigned m, unsigned v) { return __nvvm_match_any_sync_i32(m, v); }
 
-/* Shuffles of 4- and 8-byte values; `c` is the documented clamp/segment word. */
+/* Shuffles of values of at most 8 bytes; `c` is the documented
+   clamp/segment word. A value narrower than 4 bytes (char, short, __half)
+   moves in one 32-bit word, as the documented overloads take it after
+   promotion. */
 template <typename T>
 OCU_D T __ocu_shfl(int kind, unsigned m, T v, int arg, int c)
 {
-    static_assert(sizeof(T) == 4 || sizeof(T) == 8, "shuffles move 4- or 8-byte values");
+    static_assert(sizeof(T) <= 4 || sizeof(T) == 8, "shuffles move values of at most 8 bytes");
     auto one = [&](int x) -> int {
         switch (kind) {
         case 0: return __nvvm_shfl_sync_idx_i32(m, x, arg, c);
@@ -227,6 +230,13 @@ OCU_D T __ocu_shfl(int kind, unsigned m, T v, int arg, int c)
     };
     if constexpr (sizeof(T) == 4) {
         return __builtin_bit_cast(T, one(__builtin_bit_cast(int, v)));
+    } else if constexpr (sizeof(T) < 4) {
+        int w = 0;
+        __builtin_memcpy(&w, &v, sizeof(T));
+        w = one(w);
+        T r;
+        __builtin_memcpy(&r, &w, sizeof(T));
+        return r;
     } else {
         long long w = __builtin_bit_cast(long long, v);
         int lo = one((int)(w & 0xffffffff)), hi = one((int)(w >> 32));
