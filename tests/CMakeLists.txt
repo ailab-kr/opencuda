@@ -159,6 +159,67 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   add_test(NAME runtime_misc COMMAND rt_misc)
   ocu_add_cpu_cu_executable(rt_fp16 runtime/rt_fp16.cu)
   add_test(NAME runtime_fp16 COMMAND rt_fp16)
+  ocu_add_cpu_cu_executable(rt_bf16 runtime/rt_bf16.cu)
+  add_test(NAME runtime_bf16 COMMAND rt_bf16)
+  # Runtime API gaps (card runtime-llama-gaps): data types, attribute
+  # policy, PCI bus id, peer access, cooperative launch. The compute
+  # capability variants pass the expected value as arguments.
+  # Kernels that stop the process: one process per test, the outcome is
+  # checked by trap_test.cmake. rt_trap_arch is built with the macros the
+  # CPU path needs for a NO_DEVICE_CODE pattern (card: boundary conditions).
+  ocu_add_cpu_cu_executable(rt_trap runtime/rt_trap.cu)
+  set(_trap_arch_obj ${CMAKE_CURRENT_BINARY_DIR}/rt_trap_arch.dir/rt_trap.cu.o)
+  add_custom_command(
+    OUTPUT ${_trap_arch_obj}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/rt_trap_arch.dir
+    COMMAND ${CMAKE_COMMAND} -E env CXX=${CMAKE_CXX_COMPILER}
+            ${Python3_EXECUTABLE} ${OCU_CC} --target cpu -O2 -D __CUDA_ARCH__=500 -D __CUDA_ARCH_LIST__=500
+            -c ${CMAKE_CURRENT_SOURCE_DIR}/runtime/rt_trap.cu -o ${_trap_arch_obj}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/runtime/rt_trap.cu ${OCU_CC} ${PROJECT_SOURCE_DIR}/compiler/probe/cpu_rewrite.py
+    IMPLICIT_DEPENDS CXX ${CMAKE_CURRENT_SOURCE_DIR}/runtime/rt_trap.cu
+    COMMENT "ocu_cc --target cpu -D__CUDA_ARCH__=500 rt_trap.cu")
+  add_executable(rt_trap_arch ${_trap_arch_obj})
+  set_target_properties(rt_trap_arch PROPERTIES LINKER_LANGUAGE CXX)
+  target_link_libraries(rt_trap_arch PRIVATE ${OCU_CUDART_TARGET})
+  foreach(t "trap|rt_trap|trap|__trap\\(\\).*block \\(1,0,0\\) thread \\(2,0,0\\)|before trap block 1 thread 2"
+            "nodevcode|rt_trap_arch|nodevcode|__trap\\(\\).*block \\(1,0,0\\) thread \\(2,0,0\\)|compiled without support"
+            "gridsync|rt_trap|gridsync|__trap\\(\\)|")
+    string(REPLACE "|" ";" t "${t}")
+    list(GET t 0 tname)
+    list(GET t 1 exe)
+    list(GET t 2 mode)
+    list(GET t 3 errre)
+    list(GET t 4 outre)
+    add_test(NAME runtime_trap_${tname}
+      COMMAND ${CMAKE_COMMAND} -DPROG=$<TARGET_FILE:${exe}> -DMODE=${mode} -DKIND=cpu
+              "-DERR_REGEX=${errre}" "-DOUT_REGEX=${outre}"
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/runtime/trap_test.cmake)
+  endforeach()
+  # Compile-time cases: what must and must not compile (runtime/cg_compile_cases.cu).
+  foreach(c "0|ok" "1|fail" "2|fail" "3|fail" "4|fail" "5|fail" "6|fail" "7|fail" "20|ok" "21|ok" "22|ok")
+    string(REPLACE "|" ";" c "${c}")
+    list(GET c 0 cn)
+    list(GET c 1 cx)
+    add_test(NAME runtime_compile_case${cn}_cpu
+      COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DCC=${OCU_CC} -DCXX=${CMAKE_CXX_COMPILER}
+              -DCC_COMPILER=${CMAKE_C_COMPILER}
+              -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/runtime/cg_compile_cases.cu
+              -DOUT=${CMAKE_CURRENT_BINARY_DIR}/cg_case${cn}_cpu.o -DTARGET=cpu -DCASE=${cn} -DEXPECT=${cx}
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/runtime/compile_case.cmake)
+  endforeach()
+  ocu_add_cpu_cu_executable(rt_gaps_intrin runtime/rt_gaps_intrin.cu)
+  add_test(NAME runtime_gaps_intrin COMMAND rt_gaps_intrin)
+  add_test(NAME runtime_gaps_intrin_random COMMAND rt_gaps_intrin)
+  set_tests_properties(runtime_gaps_intrin_random PROPERTIES
+    ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_THREADS=3;OCU_CPU_SEED=9")
+  ocu_add_cpu_cu_executable(rt_gaps_api runtime/rt_gaps_api.cu)
+  add_test(NAME runtime_gaps_api COMMAND rt_gaps_api)
+  add_test(NAME runtime_gaps_api_cc80 COMMAND rt_gaps_api 8 0)
+  set_tests_properties(runtime_gaps_api_cc80 PROPERTIES ENVIRONMENT "OCU_COMPUTE_CAPABILITY=8.0")
+  add_test(NAME runtime_gaps_api_cc_bad_x COMMAND rt_gaps_api 5 0)
+  set_tests_properties(runtime_gaps_api_cc_bad_x PROPERTIES ENVIRONMENT "OCU_COMPUTE_CAPABILITY=x")
+  add_test(NAME runtime_gaps_api_cc_bad_50 COMMAND rt_gaps_api 5 0)
+  set_tests_properties(runtime_gaps_api_cc_bad_50 PROPERTIES ENVIRONMENT "OCU_COMPUTE_CAPABILITY=50")
   ocu_add_cpu_cu_executable(rt_review2 runtime/rt_review2.cu)
   add_test(NAME runtime_review2 COMMAND rt_review2)
   ocu_add_cpu_cu_executable(rt_launch_api runtime/rt_launch_api.cu)
@@ -277,6 +338,19 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
       -P ${CMAKE_CURRENT_SOURCE_DIR}/metal/msl_check_test.cmake)
   endif()
   if(OCU_CLANG_GPU_TARGETS)
+    # The same compile-time cases for the NVIDIA path (case 8 is only
+    # enforceable there: device-only functions called from host code).
+    foreach(c "0|ok" "1|fail" "2|fail" "3|fail" "4|fail" "5|fail" "6|fail" "7|fail" "8|fail" "20|ok" "21|ok" "22|ok")
+      string(REPLACE "|" ";" c "${c}")
+      list(GET c 0 cn)
+      list(GET c 1 cx)
+      add_test(NAME runtime_compile_case${cn}_nvidia
+        COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DCC=${OCU_CC} -DCXX=${CMAKE_CXX_COMPILER}
+                -DCC_COMPILER=${CMAKE_C_COMPILER}
+                -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/runtime/cg_compile_cases.cu
+                -DOUT=${CMAKE_CURRENT_BINARY_DIR}/cg_case${cn}_nvidia.o -DTARGET=nvidia -DCASE=${cn} -DEXPECT=${cx}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/runtime/compile_case.cmake)
+    endforeach()
     foreach(t "nvidia;sm_80;ptx" "amd;gfx1100;co" "amd;gfx1201;co")
       list(GET t 0 target)
       list(GET t 1 arch)
@@ -309,11 +383,35 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
     # sources, on the installed NVIDIA GPU (skipped without one).
     add_executable(run_if_nvidia runtime/run_if_nvidia.c)
     target_link_libraries(run_if_nvidia PRIVATE ocu_backend_nvidia)
-    foreach(t rt_api rt_lang rt_mem rt_misc rt_launch_api rt_review rt_review2 rt_fp16)
+    foreach(t rt_api rt_lang rt_mem rt_misc rt_launch_api rt_review rt_review2 rt_fp16 rt_bf16)
       ocu_add_nvidia_cu_executable(${t}_nv runtime/${t}.cu)
       add_test(NAME gpu_${t} COMMAND run_if_nvidia $<TARGET_FILE:${t}_nv>)
       set_tests_properties(gpu_${t} PROPERTIES SKIP_RETURN_CODE 77
         ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+    endforeach()
+    ocu_add_nvidia_cu_executable(rt_trap_nv runtime/rt_trap.cu)
+    foreach(mode trap nodevcode gridsync)
+      add_test(NAME gpu_runtime_trap_${mode}
+        COMMAND ${CMAKE_COMMAND} -DPROG=$<TARGET_FILE:rt_trap_nv> -DMODE=${mode} -DKIND=nvidia
+                -DWRAPPER=$<TARGET_FILE:run_if_nvidia>
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/runtime/trap_test.cmake)
+      set_tests_properties(gpu_runtime_trap_${mode} PROPERTIES SKIP_REGULAR_EXPRESSION "OCU_SKIP"
+        ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+    endforeach()
+    ocu_add_nvidia_cu_executable(rt_gaps_intrin_nv runtime/rt_gaps_intrin.cu)
+    add_test(NAME gpu_rt_gaps_intrin COMMAND run_if_nvidia $<TARGET_FILE:rt_gaps_intrin_nv>)
+    set_tests_properties(gpu_rt_gaps_intrin PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+    ocu_add_nvidia_cu_executable(rt_gaps_api_nv runtime/rt_gaps_api.cu)
+    foreach(v "default||5 0" "cc80|OCU_COMPUTE_CAPABILITY=8.0|8 0"
+              "cc_bad_x|OCU_COMPUTE_CAPABILITY=x|5 0" "cc_bad_50|OCU_COMPUTE_CAPABILITY=50|5 0")
+      string(REPLACE "|" ";" v "${v}")
+      list(GET v 0 tag)
+      list(GET v 1 venv)
+      list(GET v 2 vargs)
+      separate_arguments(vargs)
+      add_test(NAME gpu_rt_gaps_api_${tag} COMMAND run_if_nvidia $<TARGET_FILE:rt_gaps_api_nv> ${vargs})
+      set_tests_properties(gpu_rt_gaps_api_${tag} PROPERTIES SKIP_RETURN_CODE 77
+        ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0;${venv}")
     endforeach()
     # The float math functions on the GPU: same bits as on the host, and
     # kernel times against the double-based versions.
