@@ -70,6 +70,19 @@ def _llvm_tool(name: str) -> str:
     return name
 
 
+def sdk_flags() -> list[str]:
+    """On macOS, a compiler called by full path (not through xcrun) does not
+    find the SDK by itself; pass it explicitly unless SDKROOT is set."""
+    if sys.platform != "darwin" or os.environ.get("SDKROOT"):
+        return []
+    try:
+        path = subprocess.run(["xcrun", "--show-sdk-path"], capture_output=True, text=True,
+                              check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    return ["-isysroot", path] if path else []
+
+
 def write_container(path: Path, images: list[tuple[str, bytes]]) -> None:
     """Device-code container read by runtime/cudart/fatbin.c:
     "OCUFAT1\\0", count, header size, then per image a 16-byte backend
@@ -152,6 +165,7 @@ def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
     for d in args.D:
         common += ["-D", d]
     common.append(f"-I{HERE}")
+    common += sdk_flags()
 
     if args.target == "cpu":
         cxx = os.environ.get("CXX", "c++")

@@ -292,14 +292,24 @@ inline T atomic_update_fp(T *addr, Op op)
 #define OCU_STR2_(x) #x
 #define OCU_STR_(x) OCU_STR2_(x)
 #define OCU_CPU_TLS_(name) __asm__(OCU_STR_(__USER_LABEL_PREFIX__) #name)
+/* The definitions (C, zero-initialised) need no dynamic initialisation:
+   saying so lets the compiler read them directly instead of through a C++
+   thread-local wrapper function, which macOS would otherwise require. */
+#if defined(__clang__)
+#define OCU_CPU_CONSTINIT [[clang::require_constant_initialization]]
+#elif defined(__GNUC__) && __GNUC__ >= 10
+#define OCU_CPU_CONSTINIT __constinit
+#else
+#define OCU_CPU_CONSTINIT
+#endif
 static_assert(sizeof(dim3) == sizeof(ocu_cpu_dim3) && sizeof(uint3) == sizeof(ocu_cpu_dim3),
               "built-in variable layout");
 extern "C" {
-extern thread_local const uint3 threadIdx OCU_CPU_TLS_(ocu_cpu_tls_thread_idx);
-extern thread_local const uint3 blockIdx OCU_CPU_TLS_(ocu_cpu_tls_block_idx);
-extern thread_local const dim3 blockDim OCU_CPU_TLS_(ocu_cpu_tls_block_dim);
-extern thread_local const dim3 gridDim OCU_CPU_TLS_(ocu_cpu_tls_grid_dim);
-extern thread_local const int warpSize OCU_CPU_TLS_(ocu_cpu_tls_warp_size);
+OCU_CPU_CONSTINIT extern thread_local const uint3 threadIdx OCU_CPU_TLS_(ocu_cpu_tls_thread_idx);
+OCU_CPU_CONSTINIT extern thread_local const uint3 blockIdx OCU_CPU_TLS_(ocu_cpu_tls_block_idx);
+OCU_CPU_CONSTINIT extern thread_local const dim3 blockDim OCU_CPU_TLS_(ocu_cpu_tls_block_dim);
+OCU_CPU_CONSTINIT extern thread_local const dim3 gridDim OCU_CPU_TLS_(ocu_cpu_tls_grid_dim);
+OCU_CPU_CONSTINIT extern thread_local const int warpSize OCU_CPU_TLS_(ocu_cpu_tls_warp_size);
 }
 #undef OCU_CPU_TLS_
 
