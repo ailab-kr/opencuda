@@ -124,5 +124,44 @@ class ExternSharedTests(unittest.TestCase):
         self.assertEqual(rw(src), src)
 
 
+class PreprocessedTests(unittest.TestCase):
+    """Whole preprocessed translation units, as ocu_cc.py rewrites them."""
+
+    def test_spaced_chevrons(self):
+        self.assertEqual(rw("k << < g, b >> > (x);"), launch(" g, b ", "k", "x") + ";")
+        self.assertEqual(rw("k<< <1,1>> >();"), launch("1,1", "k") + ";")
+
+    def test_shift_is_not_a_launch(self):
+        src = "int a = b << c; v<v<int>> w; f(a >> b > c);"
+        self.assertEqual(rw(src), src)
+
+    def test_literal_zero_argument(self):
+        self.assertEqual(rw("k<<<1,1>>>(p, 0);"),
+                         launch("1,1", "k", "p, ::ocu_cpu::literal_zero{}") + ";")
+        self.assertEqual(rw("k<<<1,1>>>(10, x0);"), launch("1,1", "k", "10, x0") + ";")
+
+    def test_null_between_line_markers(self):
+        src = 'k<<<1,1>>>(\n# 3 "a.cu" 3 4\n  __null\n# 3 "a.cu"\n  , 0);'
+        out = rewrite(src, preprocessed=True)[0]
+        self.assertIn("nullptr", out)
+        self.assertIn("::ocu_cpu::literal_zero{}", out)
+        self.assertIn('# 3 "a.cu" 3 4', out)  # markers kept
+        self.assertEqual(out.count("\n"), src.count("\n"))
+
+    def test_shared_marker(self):
+        src = "__global__ void f() { extern __ocu_shared__ float s[]; __ocu_shared__ int t[4]; }"
+        out = rewrite(src, preprocessed=True)[0]
+        self.assertIn("static ::ocu_cpu::dyn_shared<float> s;", out)
+        self.assertIn("static thread_local int t[4];", out)
+        self.assertNotIn("__ocu_shared__", out)
+
+    def test_many_launches_in_a_large_unit(self):
+        body = "".join(f"k{i}<<<1, {i}>>>(p);\n" for i in range(200))
+        filler = "// filler line with 'quotes' and \"strings\"\n" * 20000
+        out = rw(filler + body)
+        self.assertNotIn("<<<", out)
+        self.assertEqual(out.count("::ocu_cpu::launch("), 200)
+
+
 if __name__ == "__main__":
     unittest.main()

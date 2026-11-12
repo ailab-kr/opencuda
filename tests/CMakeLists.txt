@@ -132,6 +132,11 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   add_test(NAME runtime_api_random COMMAND rt_api)
   set_tests_properties(runtime_api_random PROPERTIES
     ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_THREADS=3")
+  ocu_add_cpu_cu_executable(rt_lang runtime/rt_lang.cu)
+  add_test(NAME runtime_lang COMMAND rt_lang)
+  add_test(NAME runtime_lang_random COMMAND rt_lang)
+  set_tests_properties(runtime_lang_random PROPERTIES
+    ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_THREADS=3;OCU_CPU_WARP=64")
   ocu_add_cpu_cu_executable(ocu_cc_saxpy probe/main_saxpy.cu
     ${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu)
   add_test(NAME ocu_cc_cpu_saxpy COMMAND ocu_cc_saxpy)
