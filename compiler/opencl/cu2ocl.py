@@ -95,6 +95,26 @@ class OclTranslator(cu2msl.Translator):
     def prelude(self) -> str:
         return (HERE / "ocl_prelude.h").read_text(encoding="utf-8")
 
+    def shared_decl(self, inst, st, n, b: int, e: int, m) -> None:
+        """OpenCL allows local-memory variables only in the outermost scope
+        of a kernel: one declared in an inner block moves to the top of the
+        kernel (CUDA __shared__ variables have no initializer, and live for
+        the whole block anyway)."""
+        if not hasattr(inst, "ocl_nested"):
+            body = next(c for c in cu2msl.kids(inst.fn) if c.get("kind") == "CompoundStmt")
+            inst.ocl_nested = [self.span(c) for c in cu2msl.walk(body)
+                               if c.get("kind") == "CompoundStmt" and c is not body and self.span(c)]
+            inst.ocl_hoisted = set()
+        if not any(self.same(f, st["file"]) and lo < b < hi for f, lo, hi in inst.ocl_nested):
+            return super().shared_decl(inst, st, n, b, e, m)
+        name = n.get("name")
+        if name in inst.ocl_hoisted:
+            raise TranslateError(f"'{st['fname']}': two inner-block __shared__ variables named '{name}'")
+        inst.ocl_hoisted.add(name)
+        decl = st["text"][b:e]
+        inst.tmpl.append(decl[:m.start()] + "threadgroup" + decl[m.end():] + ";")
+        st["edits"].append((b, e, ""))
+
     def run(self, keep_going: bool = False, report=None) -> str:
         try:
             image = super().run(keep_going, report)
@@ -105,6 +125,11 @@ class OclTranslator(cu2msl.Translator):
                 return self.MAGIC + "\n---\n"
             raise
         head, source = image[len(self.MAGIC) + 1:].split("\n---\n", 1)
+        # OpenCL reserves `long long` for a 128-bit type; CUDA's is 64 bits,
+        # which is OpenCL's `long`. (After the prelude: the user's code and
+        # what the translation wrote for it.)
+        cut = source.index("// ---- macros")
+        source = source[:cut] + re.sub(r"\blong(\s+)long\b", r"long", source[cut:])
         spirv = self.compile(source)
         meta = [l for l in head.splitlines() if l.strip()] + [f"source {len(source)}"]
         if spirv is not None:

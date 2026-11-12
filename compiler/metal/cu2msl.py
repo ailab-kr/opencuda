@@ -278,6 +278,10 @@ class Translator:
     def vec3_read(self, t: str, base: str, name: str, i: int) -> str:
         return f"    {t} {name} = {base}(ocu_arg<packed_{base}>(ocu_args, ocu_offs, {i}));"
 
+    def shared_decl(self, inst, st, n, b: int, e: int, m) -> None:
+        """A __shared__ declaration [b, e) in a kernel body (m: its __shared__ word)."""
+        st["edits"].append((b + m.start(), b + m.end(), "threadgroup"))
+
     def prelude(self) -> str:
         return (HERE / "msl_prelude.h").read_text(encoding="utf-8")
 
@@ -911,7 +915,7 @@ class Translator:
                 m = re.search(r"\b__shared__\b", text[b:e])
                 if not m:
                     raise TranslateError(f"'{fname}': __shared__ through a macro is not handled yet")
-                st["edits"].append((b + m.start(), b + m.end(), "threadgroup"))
+                self.shared_decl(inst, st, n, b, e, m)
             return
         if n.get("storageClass") == "static":
             raise TranslateError(f"'{fname}': static local variables are not handled yet")

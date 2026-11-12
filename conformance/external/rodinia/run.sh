@@ -134,7 +134,7 @@ else report hotspot3D BUILD-FAIL "$(head -c 200 $C/hotspot3D/.ocu/build.log)"; f
 # nn: nearest records against an independent computation (nn_check.py
 # reproduces the program's own selection, including its record swap)
 if (cd $C/nn && build nn nn_cuda.cu); then
-    (cd $C/nn && gcc -O2 hurricane_gen.c -o hgen -lm 2>/dev/null && ./hgen 20000 4 > /dev/null 2>&1 \
+    (cd $C/nn && mkdir -p data && gcc -O2 hurricane_gen.c -o hgen -lm 2>/dev/null && ./hgen 20000 4 > /dev/null 2>&1 \
         && printf 'data/cane4_%s.db\n' 0 1 2 3 > flist && ./nn flist -r 10 -lat 30 -lng 90 | grep -- '-->' > ocu.txt)
     r=$(cd $C/nn && python3 "$HERE/nn_check.py" flist 10 30 90 ocu.txt); report nn "$(verdict "$r")" "$r"
 else report nn BUILD-FAIL "$(head -c 200 $C/nn/.ocu/build.log)"; fi
