@@ -1,68 +1,383 @@
-# ocu (가칭)
+<div align="center">
 
-CUDA용으로 짠 소스를 고치지 않고 다른 GPU에서 빌드해 실행하게 하는 호환 층과, 그 호환 수준을 재는 적합성 시험.
+# OpenCuda
 
-## 지금 되는 것
+**Run unmodified CUDA C++ source on any chip, and measure how well it really works.**
 
-- **CPU 기준 백엔드**: 연결 층 규격의 함수 26개 전부. 메모리, 대기열, 표식, 커널 실행(블록 동기화, 워프 셔플·투표 포함), 작업 스레드 묶음. x86-64와 ARM64.
-- **BLAS 20개 함수**(내부 이름 `ocu_blas_*`): CPU 백엔드에서 기준 사례 537건을 모두 통과한다.
-- **적합성 시험의 바탕**: BLAS의 정확한 기준 답, 오차 한계, 결과 기록 형식, 시험 묶음 자체의 검증(정상 구현은 통과, 일부러 망가뜨린 구현 15종은 모두 검출).
-- **실행 API와 헤더**(`runtime/`): 장치·오류·메모리(통합 메모리·포인터 조회 포함)·기호 복사·스트림·사건·실행·점유율 등 80여 개 함수, 벡터 형, 반정밀도(`cuda_fp16.h`), 장치 쪽 내장 변수·원자 연산·워프 함수. 공개 문서만 보고 새로 썼다. 실행 API 호출 기준(이름) llama.cpp의 87%, Rodinia의 90%.
-- **보통의 CUDA 프로그램을 CPU에서**: 공개 벤치마크 Rodinia의 CUDA 프로그램 18개 중 17개가 소스 수정 없이 빌드되고, 8개는 독립 기준(같은 프로그램의 OpenMP판, 계산식을 옮긴 직렬 구현, 프로그램 자체 검사)과 결과가 같다(`conformance/external/rodinia/`).
-- **엔비디아 GPU에서 실행**(`backends/nvidia/`): 설치된 드라이버의 공개 API만 실행 중에 불러 쓴다(빌드에 엔비디아 파일 불필요). 장치 코드는 공개 컴파일러(Clang)가 만든 PTX, 수학 함수는 직접 구현(`ocu_device_math.h`). RTX 5070 Ti에서 같은 CUDA 시험 프로그램 9개가 모두 통과하고, Rodinia는 CPU 경로와 같이 17개 빌드·9개 독립 기준과 일치.
-- **컴파일러 실험**: 고치지 않은 `.cu` 파일이 엔비디아(sm_80)·AMD(gfx1100, gfx1201)용으로 컴파일된다. CPU 경로는 전처리 뒤 실행 구문을 바꿔 C++로 컴파일한다(`compiler/probe/`, 배포 전 실험 단계).
+An open reference, an open conformance suite, and a thin contract that any chip can plug into.
 
-아직 없는 것: AMD·인텔·Apple GPU 백엔드, nvcc와 같은 명령줄 드라이버, 텍스처·그래프 API, 커널 시간 측정 대조.
+[한국어](README.ko.md) · [Interactive overview](docs/site/index.html) · [Architecture](ARCHITECTURE.md) · [Add a chip](docs/public/BACKEND_GUIDE.md)
 
-## 읽을 순서
+<img src="docs/img/overview.svg" alt="Overview: applications, compatibility layer, the three core parts, and chips" width="900">
 
-1. `ARCHITECTURE.md`: 부품, 경계, 규칙, 측정값
-2. `ALLOWLIST.md`, `CONTRIBUTING.md`: 볼 수 있는 자료, 커밋 규칙
-3. `backends/interface/ocu_backend.h`: 장치 연결 층 규격
-4. `docs/compiler-probe.md`: 컴파일러 실험 결과
-5. `backends/amd/README.md`: AMD 백엔드 설계
+</div>
 
-## 빌드와 시험
+> OpenCuda is an independent open-source project. In code, it uses the short prefix `ocu`.
+> CUDA is a trademark of NVIDIA Corporation. This project is not affiliated with or endorsed by NVIDIA.
+> "CUDA C++" and "CUDA Runtime API" appear here only to say what the software accepts.
+> Every header and every line of the implementation was written from publicly available documentation.
 
-리눅스(또는 WSL)에서:
+---
+
+## At a glance
+
+| | |
+|---|---|
+| **Real application** | llama.cpp (about 150 CUDA source files) builds **unmodified**. Its operator test passes **15,894 / 15,894** on the CPU path and on the GPU path. |
+| **Libraries** | BLAS-compatible library **1,395 / 1,395**; CUB subset **5,500** independent checks; fp32 GEMM **14.0 TFLOP/s** with portable C++ kernels |
+| **Chips** | CPU (x86-64, ARM64) · NVIDIA GPU · Apple GPU (Metal) · OpenCL · NPU simulator |
+| **Operating systems** | Linux 204 / 204 · macOS 116 / 116 (M3, M1 Pro) · Windows 10 37 / 38 (1 skipped) |
+| **Clean room** | public documentation only; no vendor headers, SDK files, sources or binaries |
+
+---
+
+## Why this project exists
+
+GPU software is mostly written in CUDA C++. To run it on other hardware,
+people rewrite it, run it through a translator, or use a compatibility
+layer. In every case the same question is left open:
+
+> **Does the program still behave the same way, and how would anyone know?**
+
+Nobody has a public, executable answer to that question. Today the closest
+thing to a definition of "CUDA behaviour" is one vendor's implementation.
+That leaves every other chip maker and every portability tool to guess, and
+leaves users without a way to check what they are told.
+
+### Mission
+
+**Make CUDA-compatibility a public, measurable property instead of a claim.**
+Give every chip, large or small, the same open path to run the software the
+world has already written.
+
+### Goals
+
+| Goal | How we will know it is reached |
+|---|---|
+| A complete, executable definition of documented CUDA behaviour | every documented runtime call and language feature has a reference implementation and a test |
+| A neutral yardstick anyone can run | other implementations, including ones we did not write, submit result records to a public scoreboard |
+| A short path for new chips | a new GPU backend reaches level B1 in weeks, and an NPU runs an LLM through a handful of operators |
+| Real software, unmodified | widely used applications build and pass their own tests on several non-NVIDIA chips |
+
+---
+
+## The idea in one picture
+
+```mermaid
+flowchart TB
+    subgraph APPS["Unmodified CUDA C++ applications"]
+        A1["llama.cpp"]:::app
+        A2["Rodinia"]:::app
+        A3["your project"]:::app
+    end
+    subgraph LAYER["Compatibility layer (what you use today)"]
+        L1["nvcc-compatible driver<br/>+ CMake toolkit"]
+        L2["Runtime API<br/>and headers"]
+        L3["BLAS · CUB<br/>libraries"]
+    end
+    subgraph CORE["The core (what makes it trustworthy)"]
+        R["① Executable reference<br/>public docs → code"]:::core
+        C["② Conformance suite<br/>L1…L5, mutants, scoreboard"]:::core
+        B["③ Backend contract<br/>C interface · operator table"]:::core
+    end
+    subgraph CHIPS["Chips"]
+        H1["CPU"]:::chip
+        H2["NVIDIA"]:::chip
+        H3["Apple Metal"]:::chip
+        H4["OpenCL"]:::chip
+        H5["NPU (operator table)"]:::next
+        H6["AMD · Intel"]:::next
+    end
+    APPS --> LAYER --> B
+    R -. "defines correct" .-> C
+    C -. "measures" .-> LAYER
+    C -. "measures" .-> CHIPS
+    B --> H1 & H2 & H3 & H4 & H5 & H6
+    classDef core fill:#e8f5ee,stroke:#1d6b43,stroke-width:2px;
+    classDef chip fill:#fff8e6,stroke:#b8860b;
+    classDef next fill:#fdf0f0,stroke:#a33,stroke-dasharray:4 3;
+    classDef app fill:#f4f6f8,stroke:#888;
+```
+
+| Part | What it is | Why it matters |
+|---|---|---|
+| **① Executable reference** | The runtime, the language built-ins and the math library, written only from public documentation. It runs deterministically on an ordinary CPU. | Any chip, and any other compatibility tool, can compare against the same answers, bit for bit where the documentation requires it. |
+| **② Conformance suite** | Tests from "does it compile" up to "does a real program give the same answer". Each test has an exact answer or a stated tolerance. | "Compatible" becomes a number. The suite proves it works by catching deliberately broken implementations. |
+| **③ Thin backend contract** | One C interface (26 functions) for chips with GPU-style threads, and an operator table for accelerators without them | Supporting a new chip means implementing the contract and nothing else |
+
+The **compatibility layer** is how we show that ①–③ hold up on real
+software. It is the vehicle, not the destination.
+
+---
+
+## Where it sits
+
+There are several ways to run CUDA software elsewhere. They answer different
+questions, and many of them can be measured by the same suite.
+
+| Approach | Typical examples | Input | Open | Built-in measure of correctness |
+|---|---|---|---|---|
+| Source migration tools | HIPIFY, SYCLomatic | CUDA source, rewritten once | yes | no; you test the result yourself |
+| Portable languages | SYCL, OpenCL, Triton | new code | yes | per language |
+| Binary-level compatibility | ZLUDA | compiled CUDA programs | yes | no |
+| Source compilers for other GPUs | chipStar and commercial compilers | unmodified CUDA source | varies | no public suite |
+| **OpenCuda** | | **unmodified CUDA source** | **yes** | **yes: the reference and the suite are the product** |
+
+What is different here:
+
+1. **The definition is open and executable.** Others implement compatibility.
+   This project also defines it in a form anyone can run, and checks itself
+   against it.
+2. **Neutral by construction.** No chip is privileged. The NVIDIA backend is
+   one backend among several and is used as a check, not as the source of truth.
+3. **Accelerators without threads are first-class.** The operator table gives
+   NPUs a way in that does not pretend they are GPUs.
+4. **Honest failure.** Unsupported features return "not supported". Results
+   are reported with sample outputs and with medians and slow-10 % values.
+
+---
+
+## Results so far
+
+Machines used:
+
+- **Linux:** x86-64 under WSL2, with an NVIDIA RTX 5070 Ti.
+- **Apple:** Apple M3 and Apple M1 Pro.
+- **Windows:** a Windows 10 laptop.
+
+Speed is given as **median / slow 10 %**.
+
+### llama.cpp, unmodified
+
+| Check | CPU path | NVIDIA GPU path |
+|---|---|---|
+| Builds unmodified (about 150 CUDA sources, default settings) | ✅ | ✅ |
+| `test-backend-ops`: every operator compared with llama.cpp's own CPU backend | **15,894 / 15,894** | **15,894 / 15,894** |
+| Generation, 0.5B-parameter model, Q8_0 (tokens/s) | 1.25 / 1.08 | 95.5 / 93.3 |
+| Prompt processing (tokens/s) | 19.8 / 19.5 | 1,373 / 1,350 |
+
+Sample output, prompt *"The city of Paris"*, greedy decoding:
+
+```
+reference (llama.cpp's own CPU backend):
+  The city of Paris has a rich history that dates back to the 6th century.
+  The city was founded by the Romans and was named after ...
+our CPU path:
+  The city of Paris has a rich history that dates back to the 6th century.
+  The city was founded by the Romans, who built a city on the site of ...
+```
+
+The two outputs drift apart after about 20 words:
+
+- **Our CPU path vs. our GPU path:** 63 of 64 tokens agree.
+- **Our paths vs. the reference:** 47–48 of 64 tokens agree.
+
+Different floating-point summation orders are the likely cause, but this is
+not confirmed yet. Deciding what counts as "the same answer" for
+floating-point programs is the next step for the suite.
+
+### Libraries and math
+
+| Area | Result |
+|---|---|
+| BLAS-compatible library (`cublas_v2.h`) | 1,395 / 1,395 cases on CPU and GPU. On the RTX 5070 Ti at n = 4096: fp32 14.0 TFLOP/s, fp16 17.3 TFLOP/s, without tensor cores. |
+| CUB subset: reductions, scans, radix and segmented sorts, block primitives | 5,500 independent checks pass on CPU and GPU |
+| Device math library | Written from scratch. fma and fmaf are exact on every host, including hosts whose C library is not. Examples: powf at most 0.75 ulp, erff at most 0.76 ulp. |
+
+### Backends
+
+| Backend | State | Evidence |
+|---|---|---|
+| **CPU** (x86-64, ARM64) | reference | GPU threads run as fibers in deterministic or randomised order; warps of 32 or 64 lanes |
+| **NVIDIA GPU** | working | Uses the driver's public API, loaded when the program runs, so no vendor files are needed to build. PTX comes from an open-source compiler. |
+| **Apple GPU (Metal)** | first cut | Backend tests 53 / 53 on M3 and M1 Pro. The CUDA → Metal Shading Language translator handles 35 of 79 Rodinia kernels. |
+| **OpenCL** | working on PoCL | 103 / 103 tests. Rodinia: 17 build, 14 match. Kernels go through SPIR-V. |
+| **NPU simulator** | design target | No kernel launches, device memory the host cannot touch, a scratchpad limit, counted DMA traffic |
+| AMD, Intel GPUs | device code compiles | no runtime backend yet |
+
+### Benchmarks and platforms
+
+| Check | Result |
+|---|---|
+| Rodinia (18 CUDA programs, unmodified) | 17 build. 14 match an independent reference (OpenMP version, serial reference, or the program's own check). 15 match with the opt-in PTX shift semantics. |
+| Linux · Windows under Wine | 204 / 204 · 143 / 143 |
+| Windows 10 laptop · macOS M3 and M1 Pro | 37 / 38 (1 skipped) · 116 / 116 on each |
+
+---
+
+## For chip makers: how to join, and what we learned
+
+This project is meant to be **a shared school as much as a shared tool**. We
+publish everything we learned along the way, so that every chip team, large
+or small, starts from the same knowledge.
+
+### Two ways in
+
+```mermaid
+flowchart LR
+    Q{"Does your chip run<br/>many GPU-style threads<br/>(SIMT)?"}
+    Q -- yes --> G1["Implement the backend C interface<br/>(26 functions: memory, queues,<br/>markers, launch)"]
+    G1 --> G2["Compile device code<br/>with an open compiler (LLVM)"]
+    G2 --> G3["B0 interface → B1 runtime →<br/>B2 language → B3 libraries"]
+    Q -- "no (NPU, dataflow,<br/>matrix engine)" --> N1["Implement the operator table<br/>GEMM · ADD · MUL · RMS_NORM ·<br/>SOFTMAX · ROPE"]
+    N1 --> N2["Plan once per shape,<br/>execute many times"]
+    N2 --> N3["B3 libraries without B2;<br/>run LLMs through the library layer"]
+```
+
+| Level | What it shows |
+|---|---|
+| **B0 interface** | Backend tests pass: memory, queues, markers, launch, error cases |
+| **B1 runtime** | Ordinary CUDA C++ test programs build unmodified and pass |
+| **B2 language** | Device-code semantics: barriers, shared memory, atomics, warp operations, math within tolerance |
+| **B3 libraries** | Library-level suites within tolerance, such as BLAS and the operator table |
+
+### Ten lessons from making real software run
+
+These are the things that cost the most time. Each one is a trap a new chip
+or toolchain is likely to hit.
+
+| # | Lesson | What we saw |
+|---|---|---|
+| 1 | **Breadth of the API is the easy part.** Adding runtime functions was fast. Matching their *meaning* took most of the time. | 80+ runtime functions in days; weeks of work on semantics |
+| 2 | **Fused multiply-add must be exact, everywhere.** One inexact `fma` in a host C library spreads into every function built on it. | powf error 3.84 → 0.75 ulp once fma was made exact in software |
+| 3 | **Rounding twice is a silent bug.** Computing in a wider type and then rounding again gives wrong answers in rare cases. | bf16 fma: 1,715 wrong results found by an independent test |
+| 4 | **Signed zero, NaN and out-of-range conversions are part of the contract.** | half-precision max/min returned the wrong zero; NaN → int differed by path |
+| 5 | **Shift counts at or above the bit width differ between languages.** | C++ leaves them undefined; PTX defines them. One benchmark depends on the PTX meaning. |
+| 6 | **For LLMs, a few operators carry almost all the time.** | Matrix multiplication 86–95 %; the top 5 operator groups 98–100 %; only 9–17 tensor shapes |
+| 7 | **Fixed shapes are an opportunity.** With so few shapes, plan-once / run-many execution suits accelerators with compile-ahead toolchains. | the operator table's plan / execute split |
+| 8 | **Per-thread work in GPU code is tiny.** Any per-thread overhead on a non-GPU target dominates. | about 7 multiplies per thread in llama.cpp's matrix-vector kernel; fiber switch cost was 60 ns |
+| 9 | **The toolchain is half the product.** Build systems identify compilers by their `--version` text. Linkers differ in option forms. Default language standards differ by platform. | CMake, Apple linker and C++98 defaults each broke the build on real machines before any kernel ran |
+| 10 | **Tests must be written by someone other than the implementer, and must prove they can fail.** | independent tests found real defects; deliberately broken implementations must be caught |
+
+### Knowledge we share
+
+- **Specifications:** the backend interface (`backends/interface/ocu_backend.h`)
+  and the operator table ([`docs/spec/op-table.md`](docs/spec/op-table.md)),
+  with tolerance classes EXACT, ULP, ROW and DOT.
+- **Feature cards** (`cards/`): for each feature, its scope, the public
+  sources used, its tests and its open questions. They work as a reading
+  list for anyone implementing the same feature.
+- **Workload analysis:** where real LLM inference spends its time, broken
+  down by operator and by shape.
+- **A neutral reference:** run your implementation and ours side by side and
+  compare, bit for bit where the documentation requires it.
+
+---
+
+## How conformance is measured
+
+```mermaid
+flowchart LR
+    D["Public documentation"] --> R["Reference answer<br/>(exact or high-precision)"]
+    M["Mathematics"] --> R
+    R --> T["Test with a stated tolerance"]
+    T --> X["Run on chip X"]
+    X --> REC["JSON result record"]
+    REC --> S["Scoreboard"]
+    MU["Mutants:<br/>deliberately broken implementations"] --> T
+    T -. "must fail them" .-> MU
+```
+
+| Level | Question |
+|---|---|
+| L1 build | Does the source compile unmodified? |
+| L2 runtime | Does each API call behave as documented? |
+| L3 language | Do device-code semantics match: arithmetic, atomics, warps, synchronisation? |
+| L4 libraries | Are numerical results within the stated tolerance of an exact reference? |
+| L5 applications | Does a real program give the same result as an independent reference? |
+
+Rules:
+
+- **Exactness.** Integers and control flow must match exactly.
+  Floating-point results must fall within a per-operation tolerance. NaN and
+  infinity must match position by position.
+- **Where reference answers come from.** Documented behaviour first, then
+  mathematics computed in high precision. Reviewed observations are used
+  only where neither decides.
+- **Speed.** Reported as median and slow-10 %, never as a mean alone.
+
+---
+
+## Quick start
+
+Requirements: CMake 3.20 or newer, a C11/C++17 compiler, Python 3.9 or
+newer, and LLVM Clang for the compiler paths.
 
 ```sh
 cmake -S . -B build
-cmake --build build
+cmake --build build -j4
 ctest --test-dir build --output-on-failure
 ```
 
-한 번에 전부 검증(gcc·clang, 주소·스레드 검사기, ARM64 에뮬레이터, 채점기, 컴파일러 실험, 클린룸 점검):
+Choose a backend at run time with `OCU_BACKEND=cpu|nvidia|metal|opencl`.
+Tests that need a missing device are skipped, not failed.
+
+**Build an existing CUDA project.** The build tree contains a toolkit folder
+with an `nvcc`-compatible driver, the headers and the libraries.
 
 ```sh
-sh tools/check.sh
+# Makefile projects that read NVCC
+make NVCC=build/toolkit/bin/ocu-nvcc
+
+# CMake projects (enable_language(CUDA), find_package(CUDAToolkit))
+cmake -S your-project -B your-build \
+      -DCMAKE_TOOLCHAIN_FILE=build/toolkit/cmake/OcuCUDA.cmake -DOCU_TARGET=cpu   # or nvidia
+cmake --build your-build
 ```
 
-보통의 CUDA 프로그램(Rodinia)을 CPU 경로로 빌드해 결과 대조(소스는 저장소 밖에 내려받는다):
+**Other platforms.**
 
-```sh
-conformance/external/rodinia/run.sh build                      # CPU 경로
-OCU_TARGET=nvidia conformance/external/rodinia/run.sh build    # 엔비디아 GPU
-```
+- **Windows:** cross-build the CPU path with MinGW-w64 using
+  `-DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/x86_64-w64-mingw32.cmake`, then
+  run on Windows or under Wine. MSVC is not supported yet.
+- **macOS (Apple silicon):** the same commands as on Linux. The Metal
+  backend is on by default.
 
-BLAS 기준 사례를 CPU 백엔드에서 실행하고 채점:
+---
 
-```sh
-cd conformance/harness
-OCU_BACKEND=cpu python3 -m ocu_conf.blas_run ../../build/tests/blas_driver
-```
+## Repository layout
 
-## 폴더
-
-| 폴더 | 내용 |
+| Folder | Contents |
 |---|---|
-| `backends/` | 장치 연결 층 규격(`interface/`), CPU 백엔드(`cpu/`), AMD 설계(`amd/`) |
-| `runtime/` | 백엔드 등록(`core/`), 실행 API(`cudart/`), 헤더(`include/`) |
-| `libs/` | BLAS 층(`blas/`) |
-| `compiler/` | 컴파일러 실험과 드라이버(`probe/`) |
-| `conformance/` | 기준 답, 오차 한계, 채점기, 실행기, 일부러 망가뜨린 구현, 공개 프로그램 대조(`external/`) |
-| `tuning/` | 측정 규칙을 지키는 측정기, BLAS 측정 |
-| `cards/` | 기능 카드 |
-| `docs/` | 실험 기록, 외부 부품 목록 |
-| `tests/` | 백엔드·BLAS·컴파일러 경로 시험 |
-| `tools/` | 전체 검사, git 훅 |
+| `backends/` | the backend contract (`interface/`), CPU, NVIDIA, Metal, OpenCL, NPU simulator, reference operators |
+| `runtime/` | runtime API, headers, device math library |
+| `libs/` | BLAS layer and BLAS-compatible library |
+| `compiler/` | `nvcc`-compatible driver, CPU path, Metal and OpenCL translators |
+| `conformance/` | reference answers, tolerances, harness, mutants, external programs |
+| `tests/` · `tuning/` | tests · benchmarks that follow the reporting rules |
+| `cards/` · `docs/` | one card per feature · specifications and design notes |
+
+---
+
+## Roadmap
+
+```mermaid
+flowchart LR
+    N1["Now<br/>reference + suite + contract<br/>llama.cpp on CPU, NVIDIA"] --> N2["Next<br/>real non-NVIDIA hardware:<br/>Apple GPU, AMD, Intel, NPUs"]
+    N2 --> N3["Then<br/>'same answer' defined for<br/>floating-point applications"]
+    N3 --> N4["Later<br/>public scoreboard with<br/>third-party submissions"]
+```
+
+1. **Results on real non-NVIDIA hardware.** llama.cpp on Apple GPUs, AMD and
+   Intel GPUs, and NPUs through the operator table, each compared with that
+   chip's native backend.
+2. **"The same answer" for floating-point applications.** Measure
+   per-position distribution distance and top-1 agreement. Set thresholds
+   from how much an application's official backends differ from each other.
+3. **A faster CPU path.** Send matrix work through the operator table, and
+   compile whole warps as vector loops.
+4. **Coverage driven by real applications.** ggml-based applications, then
+   cuBLASLt-style matmul, then Thrust on top of the CUB subset.
+
+Exit measures for each item are in [docs/public/ROADMAP.md](docs/public/ROADMAP.md).
+
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) and [ALLOWLIST.md](ALLOWLIST.md)
+first. The clean-room rule is strict: public documentation only, never
+vendor headers, SDK files, sources or binaries. Governance is described in
+[docs/public/GOVERNANCE.md](docs/public/GOVERNANCE.md).
+
+## License
+
+Not chosen yet. See [docs/public/LICENSING-OPTIONS.md](docs/public/LICENSING-OPTIONS.md).

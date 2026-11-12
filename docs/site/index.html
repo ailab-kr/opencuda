@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenCuda: interactive overview</title>
+<style>
+  :root {
+    --bg: #0d1420; --panel: rgba(18, 27, 41, 0.92); --line: #2a3a52;
+    --text: #e6edf6; --muted: #9fb0c6; --core: #4cc38a; --layer: #5aa2e6;
+    --chip: #e8b84a; --next: #e07a7a; --flow: #ffcf6b;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Segoe UI", "Apple SD Gothic Neo", "Malgun Gothic", Helvetica, Arial, sans-serif; }
+  #stage { position: fixed; inset: 0; }
+  header { position: fixed; top: 16px; left: 20px; right: 20px; display: flex; gap: 16px;
+    align-items: flex-start; justify-content: space-between; pointer-events: none; z-index: 2; }
+  header .title { pointer-events: auto; }
+  h1 { margin: 0; font-size: 22px; letter-spacing: 0.2px; }
+  .tag { margin: 4px 0 0; color: var(--muted); font-size: 14px; max-width: 520px; }
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; pointer-events: auto; }
+  button { background: #18243a; color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+    padding: 7px 12px; font-size: 13px; cursor: pointer; }
+  button[aria-pressed="true"] { border-color: var(--flow); color: var(--flow); }
+  button:focus-visible { outline: 2px solid var(--flow); outline-offset: 2px; }
+  #info { position: fixed; right: 20px; bottom: 20px; width: min(380px, calc(100vw - 40px));
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; z-index: 2; }
+  #info h2 { margin: 0 0 6px; font-size: 16px; }
+  #info p { margin: 0 0 8px; font-size: 13.5px; line-height: 1.5; color: var(--text); }
+  #info ul { margin: 0; padding-left: 18px; font-size: 13px; color: var(--muted); line-height: 1.55; }
+  #stats { position: fixed; left: 20px; bottom: 20px; display: grid; grid-template-columns: repeat(2, minmax(140px, 1fr));
+    gap: 8px; z-index: 2; width: min(360px, calc(100vw - 40px)); }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px; }
+  .stat b { display: block; font-size: 18px; }
+  .stat span { font-size: 12px; color: var(--muted); }
+  .label { font-size: 12px; padding: 3px 7px; border-radius: 6px; background: rgba(13, 20, 32, 0.78);
+    border: 1px solid var(--line); color: var(--text); white-space: nowrap; cursor: pointer; user-select: none; }
+  .label.core { border-color: var(--core); }
+  .label.layer { border-color: var(--layer); }
+  .label.chip { border-color: var(--chip); }
+  .label.next { border-color: var(--next); border-style: dashed; color: #f3c4c4; }
+  .label.app { border-color: #8a96a8; }
+  .label.dim { opacity: 0.35; }
+  .legend { position: fixed; top: 92px; left: 20px; font-size: 12px; color: var(--muted); z-index: 2; line-height: 1.8; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
+  #fallback { display: none; position: fixed; inset: 0; align-items: center; justify-content: center; padding: 40px;
+    text-align: center; color: var(--muted); }
+  @media (max-width: 760px) { #stats { display: none; } .legend { display: none; } }
+</style>
+</head>
+<body>
+<div id="stage" aria-label="Three-dimensional diagram of the OpenCuda architecture"></div>
+
+<header>
+  <div class="title">
+    <h1>OpenCuda</h1>
+    <p class="tag" data-i18n="tag">Unmodified CUDA C++ on any chip, with an open reference and an open yardstick. Drag to rotate, click any block.</p>
+  </div>
+  <div class="controls" role="group" aria-label="View">
+    <button data-mode="all" aria-pressed="true" data-i18n="all">All paths</button>
+    <button data-mode="simt" aria-pressed="false" data-i18n="simt">GPU path (SIMT)</button>
+    <button data-mode="npu" aria-pressed="false" data-i18n="npu">NPU path (operators)</button>
+    <button data-mode="measure" aria-pressed="false" data-i18n="measure">Conformance</button>
+    <button id="lang" aria-label="Switch language">한국어</button>
+  </div>
+</header>
+
+<div class="legend" aria-hidden="true">
+  <div><i style="background:#8a96a8"></i><span data-i18n="lgApp">Applications</span></div>
+  <div><i style="background:var(--layer)"></i><span data-i18n="lgLayer">Compatibility layer</span></div>
+  <div><i style="background:var(--core)"></i><span data-i18n="lgCore">Core: reference · suite · contract</span></div>
+  <div><i style="background:var(--chip)"></i><span data-i18n="lgChip">Chips with working backends</span></div>
+  <div><i style="background:var(--next)"></i><span data-i18n="lgNext">Next</span></div>
+</div>
+
+<section id="info" aria-live="polite">
+  <h2 id="info-title"></h2>
+  <p id="info-body"></p>
+  <ul id="info-list"></ul>
+</section>
+
+<div id="stats">
+  <div class="stat"><b>15,894 / 15,894</b><span data-i18n="s1">llama.cpp operator tests, CPU and GPU</span></div>
+  <div class="stat"><b>1,395 / 1,395</b><span data-i18n="s2">BLAS-compatible cases</span></div>
+  <div class="stat"><b>14.0 TFLOP/s</b><span data-i18n="s3">fp32 GEMM, portable C++ kernels</span></div>
+  <div class="stat"><b>4 OS · 5 backends</b><span data-i18n="s4">Linux, macOS, Windows, Wine</span></div>
+</div>
+
+<div id="fallback"><p data-i18n="fallback">This page needs WebGL and access to the three.js module from a CDN. The README shows the same structure as a static diagram.</p></div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+
+// ---------------------------------------------------------------- text
+const T = {
+  en: {
+    tag: 'Unmodified CUDA C++ on any chip, with an open reference and an open yardstick. Drag to rotate, click any block.',
+    all: 'All paths', simt: 'GPU path (SIMT)', npu: 'NPU path (operators)', measure: 'Conformance',
+    lgApp: 'Applications', lgLayer: 'Compatibility layer', lgCore: 'Core: reference · suite · contract',
+    lgChip: 'Chips with working backends', lgNext: 'Next',
+    s1: 'llama.cpp operator tests, CPU and GPU', s2: 'BLAS-compatible cases', s3: 'fp32 GEMM, portable C++ kernels', s4: 'Linux, macOS, Windows, Wine',
+    fallback: 'This page needs WebGL and access to the three.js module from a CDN. The README shows the same structure as a static diagram.',
+    langBtn: '한국어'
+  },
+  ko: {
+    tag: '고치지 않은 CUDA C++을 어떤 칩에서든. 공개 기준 구현과 공개 잣대. 끌어서 돌리고, 블록을 눌러 보세요.',
+    all: '전체 경로', simt: 'GPU 경로 (SIMT)', npu: 'NPU 경로 (연산)', measure: '적합성 측정',
+    lgApp: '응용 프로그램', lgLayer: '호환 층', lgCore: '핵심: 기준 구현 · 시험 · 규격',
+    lgChip: '백엔드가 동작하는 칩', lgNext: '다음 목표',
+    s1: 'llama.cpp 연산 시험, CPU와 GPU', s2: 'BLAS 호환 사례', s3: 'fp32 GEMM, 칩 중립 C++ 커널', s4: 'Linux, macOS, Windows, Wine',
+    fallback: '이 페이지는 WebGL과 CDN의 three.js 모듈이 필요합니다. README에 같은 구조가 정적 그림으로 있습니다.',
+    langBtn: 'English'
+  }
+};
+
+// Every block: id, group, position, size, names and descriptions in both languages.
+const BLOCKS = [
+  // applications
+  { id: 'llama', kind: 'app', pos: [-3.2, 4.4, 0], size: [2.2, 0.5, 1.2],
+    en: ['llama.cpp', 'A widely used LLM inference engine, about 150 CUDA source files, built unmodified with its default settings.',
+         ['test-backend-ops 15,894 / 15,894 on CPU and GPU', 'GPU path: 1,373 / 1,350 tok/s prompt, 95.5 / 93.3 tok/s generation (median / slow 10 %)']],
+    ko: ['llama.cpp', '널리 쓰이는 LLM 추론 엔진. CUDA 소스 약 150개를 기본 설정 그대로, 수정 없이 빌드한다.',
+         ['test-backend-ops: CPU와 GPU 모두 15,894 / 15,894', 'GPU 경로: 프롬프트 1,373 / 1,350, 생성 95.5 / 93.3 토큰/초 (중앙값 / 느린 10%)']] },
+  { id: 'rodinia', kind: 'app', pos: [0, 4.4, 0], size: [2.2, 0.5, 1.2],
+    en: ['Rodinia', 'A public benchmark suite of 18 CUDA programs.', ['17 build unmodified', '14 match an independent reference; 15 with opt-in PTX shift semantics']],
+    ko: ['Rodinia', 'CUDA 프로그램 18개로 된 공개 벤치마크 모음.', ['17개 수정 없이 빌드', '14개 독립 기준과 일치, PTX 시프트 의미 옵션을 켜면 15개']] },
+  { id: 'yours', kind: 'app', pos: [3.2, 4.4, 0], size: [2.2, 0.5, 1.2],
+    en: ['Your project', 'Makefile or CMake projects build with the nvcc-compatible driver and toolkit, without changes.', ['make NVCC=…/ocu-nvcc', 'CMake: enable_language(CUDA), find_package(CUDAToolkit)']],
+    ko: ['여러분의 프로젝트', 'Makefile이나 CMake 프로젝트를 nvcc 호환 드라이버와 툴킷으로 고치지 않고 빌드한다.', ['make NVCC=…/ocu-nvcc', 'CMake: enable_language(CUDA), find_package(CUDAToolkit)']] },
+
+  // compatibility layer
+  { id: 'driver', kind: 'layer', pos: [-3.2, 2.9, 0], size: [2.6, 0.35, 1.6],
+    en: ['Compiler driver', 'Accepts nvcc\'s documented command line. CMake recognises it as a CUDA compiler, and a toolkit folder satisfies find_package(CUDAToolkit).', ['CPU path: preprocess, rewrite launches, compile as C++', 'GPU path: open-source Clang → PTX']],
+    ko: ['컴파일러 드라이버', 'nvcc의 공개된 명령줄을 받는다. CMake가 CUDA 컴파일러로 인식하고, 툴킷 폴더가 find_package(CUDAToolkit)를 만족시킨다.', ['CPU 경로: 전처리 → 실행 구문 변환 → C++ 컴파일', 'GPU 경로: 오픈소스 Clang → PTX']] },
+  { id: 'runtime', kind: 'layer', pos: [0, 2.9, 0], size: [2.6, 0.35, 1.6],
+    en: ['Runtime API and headers', 'More than 80 runtime functions, vector types, half and bfloat16, cooperative groups, programmatic dependent launch. All written from public documentation.', ['Unsupported features return "not supported"', 'Headers compile as C++98 and later']],
+    ko: ['실행 API와 헤더', '실행 API 80여 개, 벡터 형, 반정밀도와 bfloat16, 협력 그룹, 의존 실행(PDL). 모두 공개 문서만 보고 작성했다.', ['지원하지 않는 기능은 "지원 안 함"을 돌려준다', '헤더는 C++98 이상에서 컴파일된다']] },
+  { id: 'libs', kind: 'layer', pos: [3.2, 2.9, 0], size: [2.6, 0.35, 1.6],
+    en: ['Libraries', 'A BLAS-compatible library and a CUB subset.', ['BLAS: 1,395 / 1,395 cases; fp32 14.0, fp16 17.3 TFLOP/s on an RTX 5070 Ti', 'CUB: 5,500 independent checks']],
+    ko: ['라이브러리', 'BLAS 호환 라이브러리와 CUB 부분집합.', ['BLAS: 1,395 / 1,395 사례, RTX 5070 Ti에서 fp32 14.0, fp16 17.3 TFLOP/s', 'CUB: 독립 확인 5,500건']] },
+
+  // core
+  { id: 'reference', kind: 'core', pos: [-3.2, 1.2, 0], size: [2.4, 1.2, 1.4],
+    en: ['① Executable reference', 'The runtime, the built-ins and the math library, implemented from public documentation and run deterministically on any CPU. It defines what "correct" means, as code.', ['Exact fma on every host', 'powf at most 0.75 ulp, erff at most 0.76 ulp', 'Deterministic and randomised thread orders']],
+    ko: ['① 실행 가능한 기준 구현', '실행 API, 내장 기능, 수학 라이브러리를 공개 문서만으로 구현했고, 어떤 CPU에서든 결정적으로 돈다. "맞는 동작"이 무엇인지를 코드로 정의한다.', ['모든 호스트에서 정확한 fma', 'powf 최대 0.75 ulp, erff 최대 0.76 ulp', '결정적 순서와 무작위 순서의 스레드 실행']] },
+  { id: 'suite', kind: 'core', pos: [0, 1.2, 0], size: [2.4, 1.2, 1.4],
+    en: ['② Conformance suite', 'Levels L1 build, L2 runtime, L3 language, L4 libraries and L5 applications. Each test has an exact answer or a stated tolerance, and every run writes a result record for the scoreboard.', ['Mutants: deliberately broken implementations must be caught', 'Tests are written separately from the implementation', 'Speed reported as median and slow 10 %']],
+    ko: ['② 적합성 시험', 'L1 빌드, L2 실행 API, L3 언어, L4 라이브러리, L5 실제 프로그램 단계로 나뉜다. 시험마다 정확한 답이나 명시한 허용 오차가 있고, 실행할 때마다 성적표용 결과 기록이 남는다.', ['돌연변이: 일부러 망가뜨린 구현은 반드시 잡혀야 한다', '시험은 구현과 따로 작성한다', '속도는 중앙값과 느린 10%로 보고한다']] },
+  { id: 'contract', kind: 'core', pos: [3.2, 1.2, 0], size: [2.4, 1.2, 1.4],
+    en: ['③ Backend contract', 'One small C interface for chips with GPU-style threads, and an operator table for accelerators without them. A chip implements the contract and nothing above it changes.', ['C interface: 26 functions', 'Operator table: GEMM, ADD, MUL, RMS_NORM, SOFTMAX, ROPE', 'Tolerance classes: EXACT, ULP, ROW, DOT']],
+    ko: ['③ 백엔드 규격', 'GPU식 스레드를 쓰는 칩을 위한 작은 C 인터페이스 하나와, 그렇지 않은 가속기를 위한 연산 표. 칩은 이 규격만 구현하면 되고, 그 위는 바뀌지 않는다.', ['C 인터페이스: 함수 26개', '연산 표: GEMM, ADD, MUL, RMS_NORM, SOFTMAX, ROPE', '허용 오차 등급: EXACT, ULP, ROW, DOT']] },
+
+  // ports
+  { id: 'port-simt', kind: 'core', pos: [-2.2, -0.45, 0], size: [3.6, 0.18, 1.2], port: true,
+    en: ['C interface (SIMT)', 'For chips that run many GPU-style threads: memory, queues, markers and kernel launch.', ['Levels B0 interface → B1 runtime → B2 language → B3 libraries']],
+    ko: ['C 인터페이스 (SIMT)', 'GPU식 스레드를 많이 돌리는 칩용. 메모리, 대기열, 표식, 커널 실행.', ['B0 인터페이스 → B1 실행 API → B2 언어 → B3 라이브러리']] },
+  { id: 'port-npu', kind: 'core', pos: [3.6, -0.45, 0], size: [3.0, 0.18, 1.2], port: true,
+    en: ['Operator table (NPU)', 'For accelerators without SIMT threads. In llama.cpp, matrix multiplication takes 86–95 % of the time, the top five operator groups cover 98–100 %, and there are only 9–17 shapes, so planning once per shape and executing many times is enough.', ['Query → plan (fixed shape) → execute → destroy', 'Reaches B3 libraries without B2']],
+    ko: ['연산 표 (NPU)', 'SIMT 스레드가 없는 가속기용. llama.cpp에서 행렬곱이 시간의 86~95%, 상위 5개 연산 묶음이 98~100%를 차지하고 모양은 9~17개뿐이라, 모양마다 한 번 계획하고 여러 번 실행하면 충분하다.', ['질의 → 계획(모양 고정) → 실행 → 해제', 'B2 없이 B3 라이브러리 단계에 이른다']] },
+
+  // chips
+  { id: 'cpu', kind: 'chip', path: 'simt', pos: [-5.4, -2.2, 0], size: [1.5, 0.7, 1.2],
+    en: ['CPU', 'The reference backend on x86-64 and ARM64. GPU threads run as fibers, with warps of 32 or 64 lanes.', ['Linux 204 / 204, Windows under Wine 143 / 143', 'macOS 116 / 116, Windows 10 laptop 37 / 38']],
+    ko: ['CPU', 'x86-64과 ARM64용 기준 백엔드. GPU 스레드를 파이버로 돌리며, 워프 폭은 32 또는 64.', ['Linux 204 / 204, Wine의 Windows 143 / 143', 'macOS 116 / 116, Windows 10 노트북 37 / 38']] },
+  { id: 'nvidia', kind: 'chip', path: 'simt', pos: [-3.6, -2.2, 0], size: [1.5, 0.7, 1.2],
+    en: ['NVIDIA GPU', 'Loads the installed driver\'s public API when the program runs, so building needs no vendor files. Used as one backend among several, as a check rather than as the source of truth.', ['PTX from an open-source compiler', 'llama.cpp 15,894 / 15,894']],
+    ko: ['NVIDIA GPU', '설치된 드라이버의 공개 API를 실행할 때 불러오므로 빌드에 칩 회사 파일이 필요 없다. 여러 백엔드 중 하나로, 정답의 원천이 아니라 대조용으로 쓴다.', ['PTX는 오픈소스 컴파일러가 만든다', 'llama.cpp 15,894 / 15,894']] },
+  { id: 'apple', kind: 'chip', path: 'simt', pos: [-1.8, -2.2, 0], size: [1.5, 0.7, 1.2],
+    en: ['Apple GPU', 'A Metal backend and a CUDA C++ → Metal Shading Language translator.', ['Backend tests 53 / 53 on M3 and M1 Pro', '35 of 79 Rodinia kernels translate today']],
+    ko: ['Apple GPU', 'Metal 백엔드와 CUDA C++ → Metal Shading Language 번역기.', ['M3와 M1 Pro에서 백엔드 시험 53 / 53', 'Rodinia 커널 79개 중 35개를 현재 변환']] },
+  { id: 'opencl', kind: 'chip', path: 'simt', pos: [0, -2.2, 0], size: [1.5, 0.7, 1.2],
+    en: ['OpenCL', 'Kernels are translated and compiled through SPIR-V. Tested on an open implementation (PoCL).', ['103 / 103 tests', 'Rodinia: 17 build, 14 match']],
+    ko: ['OpenCL', '커널을 변환해 SPIR-V로 컴파일한다. 공개 구현(PoCL)에서 시험했다.', ['시험 103 / 103', 'Rodinia 17개 빌드, 14개 일치']] },
+  { id: 'amdintel', kind: 'next', path: 'simt', pos: [1.8, -2.2, 0], size: [1.5, 0.7, 1.2],
+    en: ['AMD · Intel GPUs', 'Device code already compiles for these GPUs with open compilers. Runtime backends are next.', ['Next: llama.cpp compared with each chip\'s native backend']],
+    ko: ['AMD · Intel GPU', '장치 코드는 이미 공개 컴파일러로 이 GPU들용으로 컴파일된다. 실행 백엔드가 다음 순서다.', ['다음: 각 칩 고유 백엔드와 llama.cpp 비교']] },
+  { id: 'npusim', kind: 'chip', path: 'npu', pos: [3.6, -2.2, 0], size: [1.5, 0.7, 1.2],
+    en: ['NPU simulator', 'Models an accelerator without SIMT threads: no kernel launches, device memory the host cannot touch, a scratchpad limit, and counted DMA traffic.', ['Shows the operator table can be met under NPU constraints']],
+    ko: ['NPU 시뮬레이터', 'SIMT 스레드가 없는 가속기를 흉내 낸다. 커널 실행 없음, 호스트가 만질 수 없는 장치 메모리, 스크래치패드 제한, DMA 전송량 집계.', ['NPU 제약 아래에서도 연산 표를 지킬 수 있음을 보인다']] },
+  { id: 'npu', kind: 'next', path: 'npu', pos: [5.4, -2.2, 0], size: [1.5, 0.7, 1.2],
+    en: ['NPUs', 'Real accelerators connect through the operator table and their own SDKs.', ['Next: an LLM running through a handful of operators']],
+    ko: ['NPU', '실제 가속기는 연산 표와 각자의 SDK로 연결된다.', ['다음: 연산 몇 개로 LLM 실행']] },
+];
+
+const COLORS = { app: 0x8a96a8, layer: 0x5aa2e6, core: 0x4cc38a, chip: 0xe8b84a, next: 0xe07a7a };
+
+// ---------------------------------------------------------------- scene
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+} catch (e) {
+  document.getElementById('fallback').style.display = 'flex';
+  throw e;
+}
+const stage = document.getElementById('stage');
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+stage.appendChild(renderer.domElement);
+
+const labelRenderer = new CSS2DRenderer();
+labelRenderer.setSize(window.innerWidth, window.innerHeight);
+Object.assign(labelRenderer.domElement.style, { position: 'absolute', top: '0', left: '0', pointerEvents: 'none' });
+stage.appendChild(labelRenderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0d1420);
+scene.fog = new THREE.Fog(0x0d1420, 18, 34);
+
+const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(9.5, 6.5, 15.5);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(1.2, 0.9, 0);
+controls.enableDamping = true;
+controls.autoRotate = true;
+controls.autoRotateSpeed = 0.45;
+controls.minDistance = 6; controls.maxDistance = 26;
+
+scene.add(new THREE.HemisphereLight(0xcfe3ff, 0x1a2333, 0.9));
+const sun = new THREE.DirectionalLight(0xffffff, 1.1);
+sun.position.set(6, 10, 8);
+scene.add(sun);
+
+const grid = new THREE.GridHelper(20, 20, 0x22324a, 0x182436);
+grid.position.y = -2.7;
+scene.add(grid);
+
+// translucent layer plates
+function plate(y, w, d, color, opacity) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, 0.04, d),
+    new THREE.MeshStandardMaterial({ color, transparent: true, opacity, depthWrite: false }));
+  m.position.y = y; scene.add(m); return m;
+}
+plate(2.68, 10.4, 2.4, 0x5aa2e6, 0.10);
+plate(0.5, 10.4, 2.4, 0x4cc38a, 0.08);
+
+// blocks
+const meshes = [];
+const byId = {};
+for (const b of BLOCKS) {
+  const color = COLORS[b.kind];
+  const geo = new THREE.BoxGeometry(...b.size);
+  const isNext = b.kind === 'next';
+  const mat = new THREE.MeshStandardMaterial({
+    color, roughness: 0.55, metalness: 0.08,
+    transparent: true, opacity: isNext ? 0.28 : (b.port ? 0.55 : 0.9),
+    emissive: color, emissiveIntensity: 0.06
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.set(...b.pos);
+  mesh.userData.block = b;
+  scene.add(mesh);
+  const edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo),
+    isNext ? new THREE.LineDashedMaterial({ color, dashSize: 0.12, gapSize: 0.08 })
+           : new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.9 }));
+  if (isNext) edges.computeLineDistances();
+  mesh.add(edges);
+
+  const el = document.createElement('div');
+  el.className = 'label ' + b.kind;
+  el.style.pointerEvents = 'auto';
+  el.addEventListener('click', () => select(b.id));
+  const label = new CSS2DObject(el);
+  label.position.set(0, b.size[1] / 2 + 0.28, 0);
+  mesh.add(label);
+
+  byId[b.id] = { b, mesh, mat, el, baseOpacity: mat.opacity };
+  meshes.push(mesh);
+}
+
+// ---------------------------------------------------------------- flows
+// Calls flow downwards: application → layer → contract port → chip.
+const flowRoutes = [];
+const apps = ['llama', 'rodinia', 'yours'];
+const layerOf = { llama: 'runtime', rodinia: 'driver', yours: 'libs' };
+const simtChips = ['cpu', 'nvidia', 'apple', 'opencl', 'amdintel'];
+const npuChips = ['npusim', 'npu'];
+const P = id => new THREE.Vector3(...byId[id].b.pos);
+for (const a of apps) {
+  for (const c of [...simtChips, ...npuChips]) {
+    const port = npuChips.includes(c) ? 'port-npu' : 'port-simt';
+    const pts = [P(a), P(layerOf[a]), P('contract').add(new THREE.Vector3(0, 0, 0.9)), P(port), P(c)];
+    pts[2].x = (pts[1].x + pts[3].x) / 2;
+    flowRoutes.push({ curve: new THREE.CatmullRomCurve3(pts), path: npuChips.includes(c) ? 'npu' : 'simt', chip: c });
+  }
+}
+
+const N = 260;
+const dotGeo = new THREE.SphereGeometry(0.045, 8, 8);
+const dotMat = new THREE.MeshBasicMaterial({ color: 0xffcf6b, transparent: true, opacity: 0.95 });
+const dots = new THREE.InstancedMesh(dotGeo, dotMat, N);
+scene.add(dots);
+const particles = Array.from({ length: N }, () => ({ r: Math.floor(Math.random() * flowRoutes.length), t: Math.random(), v: 0.08 + Math.random() * 0.08 }));
+
+// Measurement pulses: rings from the conformance suite to every layer and chip.
+const rings = [];
+const ringMat = new THREE.MeshBasicMaterial({ color: 0x4cc38a, transparent: true, opacity: 0.0, side: THREE.DoubleSide, depthWrite: false });
+for (let i = 0; i < 3; i++) {
+  const ring = new THREE.Mesh(new THREE.RingGeometry(0.95, 1.0, 64), ringMat.clone());
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.copy(P('suite'));
+  ring.userData.phase = i / 3;
+  scene.add(ring); rings.push(ring);
+}
+const beams = new THREE.Group(); scene.add(beams);
+for (const id of ['driver', 'runtime', 'libs', ...simtChips, ...npuChips]) {
+  const g = new THREE.BufferGeometry().setFromPoints([P('suite'), P(id)]);
+  const l = new THREE.Line(g, new THREE.LineDashedMaterial({ color: 0x4cc38a, dashSize: 0.15, gapSize: 0.1, transparent: true, opacity: 0.0 }));
+  l.computeLineDistances(); beams.add(l);
+}
+
+// ---------------------------------------------------------------- state
+let lang = (navigator.language || '').startsWith('ko') ? 'ko' : 'en';
+let mode = 'all';
+let selected = 'suite';
+
+function applyText() {
+  document.documentElement.lang = lang;
+  for (const el of document.querySelectorAll('[data-i18n]')) el.textContent = T[lang][el.dataset.i18n];
+  document.getElementById('lang').textContent = T[lang].langBtn;
+  for (const { b, el } of Object.values(byId)) el.textContent = b[lang][0];
+  select(selected);
+}
+
+function select(id) {
+  selected = id;
+  const b = byId[id].b;
+  const [title, body, list] = b[lang];
+  document.getElementById('info-title').textContent = title;
+  document.getElementById('info-body').textContent = body;
+  const ul = document.getElementById('info-list');
+  ul.replaceChildren(...list.map(s => { const li = document.createElement('li'); li.textContent = s; return li; }));
+  for (const v of Object.values(byId)) v.mat.emissiveIntensity = v.b.id === id ? 0.55 : 0.06;
+}
+
+function inMode(b) {
+  if (mode === 'all' || mode === 'measure') return true;
+  if (b.kind === 'chip' || b.kind === 'next') return b.path === mode;
+  if (b.id === 'port-simt') return mode === 'simt';
+  if (b.id === 'port-npu') return mode === 'npu';
+  if (mode === 'npu' && (b.id === 'driver')) return false;
+  return true;
+}
+
+function applyMode() {
+  for (const btn of document.querySelectorAll('[data-mode]')) btn.setAttribute('aria-pressed', String(btn.dataset.mode === mode));
+  for (const v of Object.values(byId)) {
+    const on = inMode(v.b);
+    v.mat.opacity = on ? v.baseOpacity : 0.07;
+    v.el.classList.toggle('dim', !on);
+  }
+  if (mode === 'simt') select('port-simt');
+  else if (mode === 'npu') select('port-npu');
+  else if (mode === 'measure') select('suite');
+}
+
+document.querySelectorAll('[data-mode]').forEach(btn => btn.addEventListener('click', () => { mode = btn.dataset.mode; applyMode(); }));
+document.getElementById('lang').addEventListener('click', () => { lang = lang === 'en' ? 'ko' : 'en'; applyText(); });
+
+// picking
+const ray = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+let downAt = null;
+renderer.domElement.addEventListener('pointerdown', e => { downAt = [e.clientX, e.clientY]; controls.autoRotate = false; });
+renderer.domElement.addEventListener('pointerup', e => {
+  if (!downAt || Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 5) return;
+  ndc.set((e.clientX / window.innerWidth) * 2 - 1, -(e.clientY / window.innerHeight) * 2 + 1);
+  ray.setFromCamera(ndc, camera);
+  const hit = ray.intersectObjects(meshes, false)[0];
+  if (hit) select(hit.object.userData.block.id);
+});
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  labelRenderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ---------------------------------------------------------------- loop
+const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+if (reduceMotion) controls.autoRotate = false;
+const m4 = new THREE.Matrix4();
+const clock = new THREE.Clock();
+function frame() {
+  const dt = Math.min(clock.getDelta(), 0.05) * (reduceMotion ? 0.25 : 1);
+  const time = clock.elapsedTime;
+  const showFlow = mode !== 'measure';
+  for (let i = 0; i < N; i++) {
+    const p = particles[i];
+    p.t += p.v * dt;
+    if (p.t > 1) {
+      p.t = 0;
+      let r; let tries = 0;
+      do { r = Math.floor(Math.random() * flowRoutes.length); tries++; }
+      while (tries < 20 && mode !== 'all' && flowRoutes[r].path !== mode);
+      p.r = r;
+    }
+    const route = flowRoutes[p.r];
+    const visible = showFlow && (mode === 'all' || route.path === mode);
+    const pos = route.curve.getPointAt(p.t);
+    const s = visible ? 1 : 0;
+    m4.makeScale(s, s, s).setPosition(pos);
+    dots.setMatrixAt(i, m4);
+  }
+  dots.instanceMatrix.needsUpdate = true;
+
+  const measuring = mode === 'measure' || mode === 'all';
+  for (const ring of rings) {
+    const ph = (time * 0.35 + ring.userData.phase) % 1;
+    const sc = 0.6 + ph * 5.5;
+    ring.scale.set(sc, sc, sc);
+    ring.position.y = 1.2 - ph * 3.4;
+    ring.material.opacity = measuring ? (1 - ph) * (mode === 'measure' ? 0.55 : 0.22) : 0;
+  }
+  for (const l of beams.children) l.material.opacity = mode === 'measure' ? 0.55 + 0.25 * Math.sin(time * 3) : 0;
+
+  controls.update();
+  renderer.render(scene, camera);
+  labelRenderer.render(scene, camera);
+  requestAnimationFrame(frame);
+}
+
+applyText();
+applyMode();
+frame();
+</script>
+</body>
+</html>
