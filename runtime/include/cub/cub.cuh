@@ -472,6 +472,8 @@ constexpr int kThreads = 256;           /* threads per block of every device-wid
 constexpr int kScanItems = 8;           /* items per thread in a scan tile */
 constexpr int kScanTile = kThreads * kScanItems;
 constexpr int kReduceMaxBlocks = 256;
+constexpr int kReduceSingleItems = 32;  /* up to 256*32 items: one block, one launch */
+constexpr int kScanSingleTiles = 4;     /* up to 4 tiles: one block walks them in order */
 constexpr int kSortItems = 4;           /* items per thread in a sort tile */
 constexpr int kSortTile = kThreads * kSortItems;
 constexpr int kRadixBits = 4;
@@ -541,8 +543,10 @@ __global__ void reduce_blocks(InIt in, long long n, Acc *partial, Op op)
     if (t == 0) partial[blockIdx.x] = v[0];
 }
 
-template <typename OutIt, typename Acc, typename Op, typename Init>
-__global__ void reduce_final(const Acc *partial, int count, OutIt out, Op op, Init init)
+/* One block combines `count` values (block partials, or the whole input
+   when it is small) and writes op(init, result), or init when empty. */
+template <typename InIt, typename OutIt, typename Acc, typename Op, typename Init>
+__global__ void reduce_final(InIt partial, long long count, OutIt out, Op op, Init init)
 {
     __shared__ raw_array<Acc, kThreads> vs;
     __shared__ int fs[kThreads];
@@ -550,8 +554,9 @@ __global__ void reduce_final(const Acc *partial, int count, OutIt out, Op op, In
     const int t = threadIdx.x;
     Acc acc{};
     int have = 0;
-    for (int i = t; i < count; i += kThreads) {
-        acc = have ? (Acc)op(acc, partial[i]) : partial[i];
+    for (long long i = t; i < count; i += kThreads) {
+        Acc x = (Acc)partial[i];
+        acc = have ? (Acc)op(acc, x) : x;
         have = 1;
     }
     v[t] = acc;
@@ -666,6 +671,52 @@ __global__ void scan_tiles(InIt in, OutIt out, long long n, const Acc *tile_incl
     }
 }
 
+/* Small scans: one block walks the tiles in order, carrying the prefix. */
+template <bool EXCLUSIVE, typename InIt, typename OutIt, typename Acc, typename Op,
+          typename Init>
+__global__ void scan_single(InIt in, OutIt out, long long n, Op op, Init init)
+{
+    __shared__ raw_array<Acc, 2 * kThreads> sb;
+    __shared__ raw_array<Acc, 1> carry_s;
+    const int t = threadIdx.x;
+    for (long long base = 0; base < n; base += kScanTile) {
+        Acc x[kScanItems];
+        int valid = load_tile<Acc>(in, n, base, t, x);
+        Acc local = valid ? x[0] : (Acc)in[base];
+        for (int j = 1; j < valid; ++j) local = op(local, x[j]);
+        Acc *last;
+        block_inclusive<Acc>(sb.data(), sb.data() + kThreads, kThreads, t, local, op, last);
+        bool have = false;
+        Acc before{};
+        if (base > 0) {
+            before = carry_s.data()[0];
+            have = true;
+        }
+        if (t > 0) {
+            before = have ? (Acc)op(before, last[t - 1]) : last[t - 1];
+            have = true;
+        }
+        for (int j = 0; j < valid; ++j) {
+            long long k = base + (long long)t * kScanItems + j;
+            if (EXCLUSIVE) {
+                out[k] = have ? (Acc)op((Acc)init, before) : (Acc)init;
+                before = have ? (Acc)op(before, x[j]) : x[j];
+            } else {
+                before = have ? (Acc)op(before, x[j]) : x[j];
+                out[k] = before;
+            }
+            have = true;
+        }
+        long long rem = n - base;
+        int used = (int)((rem + kScanItems - 1) / kScanItems);
+        if (used > kThreads) used = kThreads;
+        Acc tile_total = last[used - 1];
+        __syncthreads();
+        if (t == 0) carry_s.data()[0] = base > 0 ? (Acc)op(carry_s.data()[0], tile_total) : tile_total;
+        __syncthreads();
+    }
+}
+
 } // namespace
 
 /* Temporary storage of a scan over n items of Acc. */
@@ -683,6 +734,11 @@ inline cudaError_t scan_run(void *temp, InIt in, OutIt out, long long n, Op op, 
 {
     if (n <= 0) return cudaSuccess;
     long long tiles = (n + kScanTile - 1) / kScanTile;
+    if (tiles <= kScanSingleTiles) {
+        scan_single<EXCLUSIVE, InIt, OutIt, Acc, Op, Init><<<1, kThreads, 0, stream>>>(
+            in, out, n, op, init);
+        return cudaPeekAtLastError();
+    }
     carve c{static_cast<unsigned char *>(temp), 0};
     Acc *agg = c.take<Acc>((size_t)tiles);
     Acc *incl = c.take<Acc>((size_t)tiles);
@@ -1033,20 +1089,27 @@ struct DeviceReduce {
         using namespace ocu_detail;
         using Acc = value_of<InputIteratorT>;
         const long long n = (long long)num_items;
-        long long blocks = (n + kThreads - 1) / kThreads;
+        /* Small inputs: one block, one launch. */
+        const bool single = n <= (long long)kThreads * kReduceSingleItems;
+        long long blocks = single ? 0 : (n + kThreads - 1) / kThreads;
         if (blocks > kReduceMaxBlocks) blocks = kReduceMaxBlocks;
         const size_t need = align_bytes((size_t)blocks * sizeof(Acc));
         if (d_temp_storage == nullptr) return finish_query(temp_storage_bytes, need);
         cudaError_t e = check_space(temp_storage_bytes, need);
         if (e != cudaSuccess) return e;
-        Acc *partial = static_cast<Acc *>(d_temp_storage);
-        if (blocks > 0) {
-            reduce_blocks<InputIteratorT, Acc, ReductionOpT><<<(unsigned)blocks, kThreads, 0,
-                                                               stream>>>(d_in, n, partial,
-                                                                         reduction_op);
+        if (single) {
+            reduce_final<InputIteratorT, OutputIteratorT, Acc, ReductionOpT, T><<<1, kThreads, 0,
+                                                                              stream>>>(
+                d_in, n, d_out, reduction_op, init);
+            return cudaPeekAtLastError();
         }
-        reduce_final<OutputIteratorT, Acc, ReductionOpT, T><<<1, kThreads, 0, stream>>>(
-            partial, (int)blocks, d_out, reduction_op, init);
+        Acc *partial = static_cast<Acc *>(d_temp_storage);
+        reduce_blocks<InputIteratorT, Acc, ReductionOpT><<<(unsigned)blocks, kThreads, 0,
+                                                           stream>>>(d_in, n, partial,
+                                                                     reduction_op);
+        reduce_final<const Acc *, OutputIteratorT, Acc, ReductionOpT, T><<<1, kThreads, 0,
+                                                                         stream>>>(
+            partial, blocks, d_out, reduction_op, init);
         return cudaPeekAtLastError();
     }
 
