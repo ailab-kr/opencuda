@@ -30,6 +30,12 @@ gcc -O2 "$HERE/hotspot_ref.c" -o "$TOOLS/hotspot_ref" || exit 2
 
 # OCU_TARGET=nvidia builds the same programs for the NVIDIA GPU.
 TARGET=${OCU_TARGET:-cpu}
+# OCU_PTX_SHIFT=1 builds every program with ocu_cc --ptx-shift (shifts in
+# device code as PTX shl/shr define them; see README.md, "compat"). The
+# default is standard C++.
+SHIFT=
+MODE=standard
+if [ "${OCU_PTX_SHIFT:-0}" = 1 ]; then SHIFT=--ptx-shift; MODE=ptx-shift; fi
 LIBS="$BUILD/runtime/libocu_cudart.a $BUILD/runtime/libocu_core.a $BUILD/backends/cpu/libocu_backend_cpu.a"
 [ -f "$BUILD/backends/nvidia/libocu_backend_nvidia.a" ] && LIBS="$LIBS $BUILD/backends/nvidia/libocu_backend_nvidia.a -ldl"
 [ -f "$BUILD/backends/opencl/libocu_backend_opencl.a" ] && LIBS="$LIBS $BUILD/backends/opencl/libocu_backend_opencl.a -ldl"
@@ -49,7 +55,7 @@ build() {
     local objs=() s o
     for s in "${srcs[@]}"; do
         o=.ocu/$(echo "$s" | tr / _).o
-        python3 "$REPO/compiler/probe/ocu_cc.py" --target "$TARGET" -O2 "${flags[@]}" -c "$s" -o "$o" \
+        python3 "$REPO/compiler/probe/ocu_cc.py" --target "$TARGET" -O2 $SHIFT "${flags[@]}" -c "$s" -o "$o" \
             2> .ocu/build.log || return 1
         objs+=("$o")
     done
@@ -212,9 +218,9 @@ else report b+tree BUILD-FAIL "$(head -c 200 $C/b+tree/.ocu/build.log)"; fi
 
 # huffman: the program's own check (its GPU bitstream against cpuencode.cpp,
 # the program's CPU encoder). Reported as the program reports it. On the CPU
-# path it FAILS because the program shifts 32-bit values by 32 (undefined in
-# C++; see README.md, "huffman"), and below 16 blocks the program launches
-# Pack2 with a grid of 0 blocks.
+# path it FAILS by default because the program shifts 32-bit values by 32
+# (undefined in C++; see README.md, "huffman"); with OCU_PTX_SHIFT=1 it
+# passes. Below 16 blocks the program launches Pack2 with a grid of 0 blocks.
 if (cd $C/huffman && build huff main_test_cu.cu vlc_kernel_sm64huff.cu scan.cu pack_kernels.cu cpuencode.cpp -- -I.); then
     python3 "$HERE/huffman_gen.py" 1048576 $C/huffman/data.bin
     (cd $C/huffman && ./huff data.bin > ocu.txt 2>&1)
@@ -233,4 +239,4 @@ build_only srad_v1 $C/srad/srad_v1 -- main.cu
 build_only myocyte $C/myocyte -- main.cu
 build_only kmeans $C/kmeans -- kmeans_cuda.cu cluster.c getopt.c kmeans.c kmeans_clustering.c rmse.c
 
-echo "summary: $total programs, $built built, $pass checked equal, $fail failed or not built"
+echo "summary: $total programs, $built built, $pass checked equal, $fail failed or not built ($TARGET, $MODE shifts)"

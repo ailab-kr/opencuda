@@ -50,7 +50,7 @@ include(OcuToolkit)
 # other projects can `find_package(Ocu)` and use ocu::cudart and
 # ocu_add_cpu_cu_executable().
 install(PROGRAMS compiler/probe/ocu_cc.py DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/ocu)
-install(FILES compiler/probe/cpu_rewrite.py DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/ocu)
+install(FILES compiler/probe/cpu_rewrite.py compiler/probe/ptx_shift.py DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/ocu)
 install(EXPORT OcuTargets NAMESPACE ocu:: DESTINATION ${OCU_INSTALL_CMAKEDIR})
 include(CMakePackageConfigHelpers)
 configure_package_config_file(cmake/OcuConfig.cmake.in

@@ -1,10 +1,15 @@
 # CMake functions that build CUDA sources with the project's toolchain
 # (compiler/probe/ocu_cc.py), one function per kind of output and target:
 #
-#   ocu_add_cpu_cu_executable(<target> <sources>... [LIBRARIES <libs>...])
-#   ocu_add_nvidia_cu_executable(<target> <sources>... [LIBRARIES <libs>...])
+#   ocu_add_cpu_cu_executable(<target> <sources>... [LIBRARIES <libs>...] [PTX_SHIFT])
+#   ocu_add_nvidia_cu_executable(<target> <sources>... [LIBRARIES <libs>...] [PTX_SHIFT])
 #   ocu_add_cu_library(<target> <cpu|nvidia> SOURCES <sources>...
-#                      [INCLUDES <dirs>...] [DEFINES <NAME[=V]>...])
+#                      [INCLUDES <dirs>...] [DEFINES <NAME[=V]>...] [PTX_SHIFT])
+#
+# PTX_SHIFT (any of the three; or the variable OCU_PTX_SHIFT set true before
+# the call) passes --ptx-shift: shifts in device code get the PTX shl/shr
+# semantics (amounts clamped to the width) instead of standard C++
+# (compiler/probe/ptx_shift.py). Off by default.
 #
 # Works in this source tree and from an installed package (OcuConfig.cmake):
 # both set OCU_CC_SCRIPT (the driver), OCU_CUDART_TARGET (the runtime
@@ -51,7 +56,8 @@ function(_ocu_cu_objects objs_var others_var target kind incflags defflags)
       COMMAND ${CMAKE_COMMAND} -E env CXX=${CMAKE_CXX_COMPILER} CC=${CMAKE_C_COMPILER}
               ${Python3_EXECUTABLE} ${OCU_CC_SCRIPT}
               --target ${kind} -O2 ${incflags} ${defflags} -c ${abs} -o ${obj}
-      DEPENDS ${abs} ${OCU_CC_SCRIPT} ${_cc_dir}/cpu_rewrite.py ${OCU_CC_DEPENDS}
+      DEPENDS ${abs} ${OCU_CC_SCRIPT} ${_cc_dir}/cpu_rewrite.py ${_cc_dir}/ptx_shift.py
+              ${OCU_CC_DEPENDS}
       IMPLICIT_DEPENDS CXX ${abs}
       COMMAND_EXPAND_LISTS
       COMMENT "ocu_cc --target ${kind} ${src}")
@@ -71,10 +77,21 @@ function(_ocu_lib_incflags out_var)
   set(${out_var} ${flags} PARENT_SCOPE)
 endfunction()
 
+# --ptx-shift when PTX_SHIFT was given or OCU_PTX_SHIFT is true.
+macro(_ocu_shift_flags out given)
+  if(${given} OR OCU_PTX_SHIFT)
+    set(${out} --ptx-shift)
+  else()
+    set(${out})
+  endif()
+endmacro()
+
 function(_ocu_add_cu_executable target kind)
-  cmake_parse_arguments(PARSE_ARGV 2 ARG "" "" "LIBRARIES")
+  cmake_parse_arguments(PARSE_ARGV 2 ARG "PTX_SHIFT" "" "LIBRARIES")
   _ocu_lib_incflags(incflags ${ARG_LIBRARIES})
-  _ocu_cu_objects(objs others ${target} ${kind} "${incflags}" "" ${ARG_UNPARSED_ARGUMENTS})
+  _ocu_shift_flags(shiftflags ARG_PTX_SHIFT)
+  _ocu_cu_objects(objs others ${target} ${kind} "${incflags}" "${shiftflags}"
+                  ${ARG_UNPARSED_ARGUMENTS})
   add_executable(${target} ${others} ${objs})
   set_target_properties(${target} PROPERTIES LINKER_LANGUAGE CXX)
   target_link_libraries(${target} PRIVATE ${ARG_LIBRARIES} ${OCU_CUDART_TARGET})
@@ -100,7 +117,7 @@ endfunction()
 # nvidia program links (see libs/cublas). INCLUDES are passed to ocu_cc for
 # its own sources and published as the library's include directories.
 function(ocu_add_cu_library target kind)
-  cmake_parse_arguments(PARSE_ARGV 2 ARG "" "" "SOURCES;INCLUDES;DEFINES")
+  cmake_parse_arguments(PARSE_ARGV 2 ARG "PTX_SHIFT" "" "SOURCES;INCLUDES;DEFINES")
   if(NOT kind MATCHES "^(cpu|nvidia)$")
     message(FATAL_ERROR "ocu_add_cu_library: target kind must be cpu or nvidia, not ${kind}")
   endif()
@@ -109,7 +126,7 @@ function(ocu_add_cu_library target kind)
     get_filename_component(d ${d} ABSOLUTE)
     list(APPEND incflags -I ${d})
   endforeach()
-  set(defflags)
+  _ocu_shift_flags(defflags ARG_PTX_SHIFT)
   foreach(d IN LISTS ARG_DEFINES)
     list(APPEND defflags -D ${d})
   endforeach()
