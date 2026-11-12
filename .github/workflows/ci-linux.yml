@@ -1,0 +1,88 @@
+# Linux CI: gcc and clang builds with warnings as errors, address+undefined
+# and thread sanitizer builds (the same flags as tools/check.sh), harness and
+# scoreboard unit tests, and a scoreboard artifact.
+#
+# MANUAL ONLY (workflow_dispatch). No push or pull_request trigger on purpose:
+# the repository is private and runner minutes count against the
+# organisation's quota. Enabling automatic triggers is the maintainers'
+# decision; add them under `on:` when it is made.
+name: ci-linux
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build and test (${{ matrix.cc }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { cc: gcc, cxx: g++ }
+          - { cc: clang, cxx: clang++ }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build python3 clang
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+      - name: Build (warnings are failures)
+        run: |
+          cmake --build build -j4 2>&1 | tee build.log
+          if grep -E 'warning:' build.log; then exit 1; fi
+      - name: Test
+        run: ctest --test-dir build --output-on-failure | tee ctest.txt
+      - name: Harness and scoreboard tests
+        run: |
+          (cd conformance/harness && python3 -m unittest discover -s tests)
+          python3 -m unittest discover -s tools/tests
+      - name: Scoreboard
+        if: matrix.cc == 'gcc'
+        run: |
+          python3 tools/scoreboard.py build/tests/blas_cpu_result.json \
+            --ctest cpu=ctest.txt --out-dir scoreboard
+      - name: Upload scoreboard
+        if: matrix.cc == 'gcc'
+        uses: actions/upload-artifact@v4
+        with:
+          name: scoreboard
+          path: scoreboard/
+
+  sanitizers:
+    name: sanitizer (${{ matrix.san }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        san: ["address,undefined", "thread"]
+    env:
+      ASAN_OPTIONS: detect_leaks=1
+      TSAN_OPTIONS: halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build python3 clang
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            "-DCMAKE_C_FLAGS=-fsanitize=${{ matrix.san }} -fno-omit-frame-pointer -fno-sanitize-recover=all" \
+            "-DCMAKE_CXX_FLAGS=-fsanitize=${{ matrix.san }} -fno-omit-frame-pointer -fno-sanitize-recover=all" \
+            "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=${{ matrix.san }}"
+      - name: Build
+        run: cmake --build build -j4
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

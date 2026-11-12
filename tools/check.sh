@@ -98,6 +98,9 @@ fi
 # 4. Conformance harness unit tests.
 step harness sh -c "cd '$repo/conformance/harness' && python3 -m unittest discover -s tests"
 
+# 4b. Scoreboard generator tests.
+step scoreboard sh -c "cd '$repo' && python3 -m unittest discover -s tools/tests"
+
 # 5. Compiler probe: every target must compile (needs an LLVM clang with the
 #    NVPTX and AMDGPU back ends; skipped, and said so, when there is none).
 if command -v clang++ >/dev/null 2>&1 &&
