@@ -98,11 +98,16 @@ typedef enum ocu_op {
 
 #define OCU_OP_COUNT 8u /* op values are below this */
 
+/* Descriptor flags (spec 4.7). VAR_ROWS: the planned row count (M of a
+ * GEMM, shape[0] of a row or element-wise output) is the largest; execute
+ * may pass fewer rows. */
+#define OCU_OP_FLAG_VAR_ROWS 0x1u
+
 typedef struct ocu_op_desc {
     uint32_t        struct_size; /* sizeof(ocu_op_desc) of the caller */
     ocu_op          op;
     uint32_t        num_tensors; /* inputs, then the output (last slot) */
-    uint32_t        flags;       /* 0 in version 1 */
+    uint32_t        flags;       /* OCU_OP_FLAG_* bits */
     ocu_tensor_desc tensors[OCU_OPS_MAX_TENSORS];
     union {
         struct { uint32_t trans_a, trans_b; float alpha, beta; } gemm;
@@ -132,6 +137,7 @@ typedef struct ocu_op_support {
     ocu_dtype accum_dtype;
     uint32_t  out_dtypes;    /* bit (1u << dtype) per accepted output dtype */
     uint32_t  needs_plan_ms; /* typical plan time in ms, 0 = negligible */
+    uint32_t  var_rows;      /* 1 when OCU_OP_FLAG_VAR_ROWS plans are accepted */
 } ocu_op_support;
 
 typedef struct ocu_op_caps {

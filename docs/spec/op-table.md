@@ -103,14 +103,15 @@ typedef struct ocu_op_desc {
     uint32_t        struct_size;   /* sizeof(ocu_op_desc) of the caller */
     ocu_op          op;
     uint32_t        num_tensors;   /* inputs, then the output (last) */
-    uint32_t        flags;         /* 0 in version 1 */
+    uint32_t        flags;         /* OCU_OP_FLAG_* bits (4.7) */
     ocu_tensor_desc tensors[OCU_OPS_MAX_TENSORS];  /* 4 */
     union { ... } p;               /* per-operator parameters */
 } ocu_op_desc;
 ```
 
-The output is always the last slot. `flags` must be 0 and `struct_size`
-must be at least the version 1 size, else `OCU_ERR_INVALID_VALUE`. Every
+The output is always the last slot. `flags` may hold only the bits of
+section 4.7, and `struct_size` must be at least the version 1 size, else
+`OCU_ERR_INVALID_VALUE`. Every
 tensor slot must be well formed (section 3).
 
 Shapes below are written outermost first. "Rows" of a row operator are all
@@ -137,8 +138,7 @@ Parameters `p.gemm`: `uint32_t trans_a, trans_b` (0 or 1), `float alpha, beta`.
   tensors have the same rank.
 - Types: A and B have the same dtype, one of f32, f16, bf16. C is f32, or
   the same dtype as A and B. (f16 or bf16 inputs with an f32 C is "mixed".)
-  int8 inputs are reserved for a later version (`NOT_SUPPORTED` or
-  `NOT_IMPLEMENTED`).
+  int8 inputs are reserved for a later version (`NOT_SUPPORTED`).
 - The products are accumulated in the backend's accumulation type
   (`caps.accum_dtype`, see 5.2), then `alpha * acc + beta * C_old` is
   formed in at least that precision and rounded once to C's dtype.
@@ -180,6 +180,13 @@ rows are unaffected.
   offset; the whole span of every tensor lies inside one allocation.
 - `num_tensors` other than listed for the operator: `OCU_ERR_INVALID_VALUE`.
 - An operator value the header does not list: `OCU_ERR_INVALID_VALUE`.
+- Slots whose dtypes break the operator's matching rule (for example A f32
+  and B f16): `OCU_ERR_INVALID_VALUE`.
+- A dtype the operator is not defined for in this version (int8 GEMM, ADD
+  on i32, any block-quantised tensor): `OCU_ERR_NOT_SUPPORTED`. The reserved
+  operator `OCU_OP_QMATMUL`: `OCU_ERR_NOT_SUPPORTED`.
+- Order of checks: a malformed tensor or descriptor (`INVALID_VALUE`) is
+  reported before `NOT_SUPPORTED` / `NOT_IMPLEMENTED`.
 
 ### 4.6 ROPE (defined, optional to implement in version 1)
 
@@ -194,6 +201,35 @@ of `OCU_DT_I32`; `y` has the shape and dtype of `x`. For token `t` with
 each row are copied. Tolerance class ULP(8) on f32 (6.1), measured against
 the reference evaluated in binary64. Backends that do not implement it yet
 return `OCU_ERR_NOT_IMPLEMENTED` from `support`, `query` and `plan`.
+
+### 4.7 Variable row count (`OCU_OP_FLAG_VAR_ROWS`, value 1)
+
+Fixed-shape plans are what accelerators compile, but the number of rows
+often changes between calls while everything else stays (prompt length
+in a language model, a last-token step with one row). Model workloads have
+few distinct weight shapes `(K, N)` and a small set of row counts, so one
+plan per `(K, N, dtype)` with a variable row count keeps the plan count
+small. With this flag, the planned descriptor gives the **largest** row
+count, and `execute` may pass any row count `m'` with `1 <= m' <=` planned:
+
+- GEMM: the varying dimension is M (in A: `shape[rank-2]`, or
+  `shape[rank-1]` when `trans_a`; in C: `shape[rank-2]`). B does not vary.
+- ADD, MUL, RMS_NORM, SOFTMAX: the varying dimension is `shape[0]` of the
+  output, and `shape[0]` of every input that has the output's rank and the
+  output's planned `shape[0]` (a broadcast input with 1 there, and the
+  rank-1 RMS weight, do not vary). The output must have rank 2 or more,
+  else `OCU_ERR_INVALID_VALUE`.
+- Every varying dimension takes the same `m'` in one call. Strides and all
+  other dimensions must equal the planned ones.
+- `query` and `plan` judge the planned (largest) shape; `caps` describe it.
+- Backends that cannot run a smaller row count with a plan made for a
+  larger one return `OCU_ERR_NOT_SUPPORTED` for descriptors with the flag,
+  and report `var_rows = 0` in `support`. Callers then plan per row count,
+  or pad rows up to a planned bucket.
+
+Shapes that grow in steps (an attention length padded to a multiple of a
+block) should be padded by the caller to a bucket and planned once per
+bucket; a later version may add a dynamic inner length with a mask.
 
 ## 5. Table entries
 
@@ -237,6 +273,7 @@ typedef struct ocu_op_support {
     uint32_t  out_dtypes;    /* bit (1u << dtype) per accepted output dtype
                                 (plain dtypes only, values below 32) */
     uint32_t  needs_plan_ms; /* typical plan time in ms (0 = negligible) */
+    uint32_t  var_rows;      /* 1 when OCU_OP_FLAG_VAR_ROWS plans are accepted */
 } ocu_op_support;
 ```
 
@@ -276,9 +313,10 @@ own `destroy`.
 
 Runs a plan on `queue` (`NULL`: run and wait). `tensors` has
 `num_tensors` entries in slot order; their descriptors must be identical to
-the planned ones (dtype, rank, and `shape` and `stride` up to `rank`) and
+the planned ones (dtype, rank, and `shape` and `stride` up to `rank`;
+with `OCU_OP_FLAG_VAR_ROWS` the row count may be smaller, 4.7) and
 `num_tensors` must match, else `OCU_ERR_INVALID_VALUE`: **shapes are fixed
-at plan time**. A data pointer that is not device memory of this backend,
+at plan time**. The overlap rules apply to the tensors as passed. A data pointer that is not device memory of this backend,
 whose tensor span leaves its allocation, or that breaks `align_bytes`,
 gives `OCU_ERR_INVALID_VALUE`. A `NULL` or destroyed plan gives
 `OCU_ERR_INVALID_HANDLE`. These checks happen before `execute` returns;
@@ -400,6 +438,8 @@ limits without the hardware. The rules it enforces:
 10. **Memory size.** `OCU_NPUSIM_MEM_MB` (default 256) is the size of the
     device memory space.
 11. Accumulation is f32 for every operator (`accum_dtype = OCU_DT_F32`).
+12. Variable row count (4.7) is accepted (`var_rows = 1`); scratchpad and
+    tile numbers are those of the planned (largest) shape.
 
 ## 8. Using the table from a library layer
 
@@ -413,7 +453,10 @@ this (no chip names):
    provider) when the backend has kernels; otherwise report
    `NOT_SUPPORTED` to the user.
 3. Cache plans keyed by the whole descriptor (shapes, strides, dtypes,
-   parameters, including alpha and beta).
+   parameters, including alpha and beta). Where the row count varies
+   (M of a GEMM), plan once with `OCU_OP_FLAG_VAR_ROWS` and the largest M
+   expected, when `support` reports `var_rows`; otherwise key the cache by
+   M as well, using a few row buckets.
 4. `execute` on the stream's queue.
 
 Column-major GEMM (the BLAS convention) maps to this row-major table
@@ -435,4 +478,4 @@ when `opa = N` (`trans_b' = 0`), and `[m, k]` with stride `lda` when
 
 | Version | Change |
 |---|---|
-| 1 | First version: GEMM, ADD, MUL, RMS_NORM, SOFTMAX; ROPE defined, optional; QMATMUL and block types reserved. |
+| 1 | First version: GEMM, ADD, MUL, RMS_NORM, SOFTMAX, variable row count; ROPE defined, optional; QMATMUL and block types reserved. |
