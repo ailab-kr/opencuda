@@ -245,13 +245,23 @@ OCU_F16_FN __half __hmul_sat(__half a, __half b)
     float r = __half2float(__hmul(a, b));
     return __float2half(__builtin_isnan(r) ? 0.0f : __builtin_fminf(1.0f, __builtin_fmaxf(0.0f, r)));
 }
+/* As documented: a NaN operand is ignored when the other is a number (both
+   NaN: a quiet NaN); if both are zero, max gives +0.0 and min gives -0.0. */
 OCU_F16_FN __half __hmax(__half a, __half b)
 {
-    return __float2half(__builtin_fmaxf(__half2float(a), __half2float(b)));
+    bool na = (a.__x & 0x7fffu) > 0x7c00u, nb = (b.__x & 0x7fffu) > 0x7c00u;
+    if (na) return nb ? __ushort_as_half(0x7e00) : b;
+    if (nb) return a;
+    if (((a.__x | b.__x) & 0x7fffu) == 0) return __ushort_as_half(static_cast<unsigned short>(a.__x & b.__x));
+    return __half2float(a) > __half2float(b) ? a : b;
 }
 OCU_F16_FN __half __hmin(__half a, __half b)
 {
-    return __float2half(__builtin_fminf(__half2float(a), __half2float(b)));
+    bool na = (a.__x & 0x7fffu) > 0x7c00u, nb = (b.__x & 0x7fffu) > 0x7c00u;
+    if (na) return nb ? __ushort_as_half(0x7e00) : b;
+    if (nb) return a;
+    if (((a.__x | b.__x) & 0x7fffu) == 0) return __ushort_as_half(static_cast<unsigned short>(a.__x | b.__x));
+    return __half2float(a) < __half2float(b) ? a : b;
 }
 
 /* ---- comparisons ---------------------------------------------------------------

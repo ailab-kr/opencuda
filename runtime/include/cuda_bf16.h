@@ -92,6 +92,33 @@ OCU_BF16 inline std::uint16_t from_double(double d)
     return from_float(f, round::nearest_even);
 }
 
+/*
+ * a*b + c rounded once to bfloat16. The product of two bfloat16 is exact in
+ * double; the double sum is made round-to-odd (an inexact sum takes the
+ * neighbouring double with an odd last bit), which keeps all that matters for
+ * the final round-to-nearest-even (53 >= 8 + 2). Non-finite and zero results
+ * follow the plain double sum.
+ */
+OCU_BF16 inline std::uint16_t fma_bits(float a, float b, float c)
+{
+    double p = static_cast<double>(a) * static_cast<double>(b);
+    double cc = static_cast<double>(c);
+    double s = p + cc;
+    if (s == s && !__builtin_isinf(s) && s != 0.0) {
+        double bb = s - p;                                  /* TwoSum error */
+        double err = (p - (s - bb)) + (cc - bb);
+        if (err != 0.0) {
+            std::uint64_t u = __builtin_bit_cast(std::uint64_t, s);
+            if ((u & 1u) == 0) {                            /* step toward the exact value */
+                bool away = (err > 0) == (s > 0);
+                u = away ? u + 1u : u - 1u;
+                s = __builtin_bit_cast(double, u);
+            }
+        }
+    }
+    return from_double(s);
+}
+
 } // namespace ocu_bf16
 
 struct __nv_bfloat16_raw {
@@ -179,14 +206,16 @@ OCU_BF16_FN int __bfloat162int_rz(__nv_bfloat16 h)
     if (f <= -2147483648.0f) return -2147483647 - 1;
     return static_cast<int>(f);
 }
-OCU_BF16_FN int __bfloat162int_rn(__nv_bfloat16 h)
+OCU_BF16_FN int ocu_bf16_to_int_sat(float f)
 {
-    float f = __builtin_rintf(__bfloat162float(h));
     if (f != f) return 0;
     if (f >= 2147483648.0f) return 2147483647;
     if (f <= -2147483648.0f) return -2147483647 - 1;
     return static_cast<int>(f);
 }
+OCU_BF16_FN int __bfloat162int_rn(__nv_bfloat16 h) { return ocu_bf16_to_int_sat(__builtin_rintf(__bfloat162float(h))); }
+OCU_BF16_FN int __bfloat162int_rd(__nv_bfloat16 h) { return ocu_bf16_to_int_sat(__builtin_floorf(__bfloat162float(h))); }
+OCU_BF16_FN int __bfloat162int_ru(__nv_bfloat16 h) { return ocu_bf16_to_int_sat(__builtin_ceilf(__bfloat162float(h))); }
 
 /* ---- arithmetic (correctly rounded) ----------------------------------------- */
 
@@ -208,7 +237,7 @@ OCU_BF16_FN __nv_bfloat16 __hdiv(__nv_bfloat16 a, __nv_bfloat16 b)
 }
 OCU_BF16_FN __nv_bfloat16 __hfma(__nv_bfloat16 a, __nv_bfloat16 b, __nv_bfloat16 c)
 {
-    return __float2bfloat16(__builtin_fmaf(__bfloat162float(a), __bfloat162float(b), __bfloat162float(c)));
+    return __ushort_as_bfloat16(ocu_bf16::fma_bits(__bfloat162float(a), __bfloat162float(b), __bfloat162float(c)));
 }
 OCU_BF16_FN __nv_bfloat16 __hneg(__nv_bfloat16 a) { return __ushort_as_bfloat16(static_cast<unsigned short>(a.__x ^ 0x8000u)); }
 OCU_BF16_FN __nv_bfloat16 __habs(__nv_bfloat16 a) { return __ushort_as_bfloat16(static_cast<unsigned short>(a.__x & 0x7fffu)); }
@@ -222,14 +251,23 @@ OCU_BF16_FN __nv_bfloat16 __hmul_sat(__nv_bfloat16 a, __nv_bfloat16 b)
     float r = __bfloat162float(__hmul(a, b));
     return __float2bfloat16(r != r ? 0.0f : __builtin_fminf(1.0f, __builtin_fmaxf(0.0f, r)));
 }
-/* A NaN operand is ignored if the other is a number (like fmaxf). */
+/* As documented: a NaN operand is ignored when the other is a number (both
+   NaN: a quiet NaN); if both are zero, max gives +0.0 and min gives -0.0. */
 OCU_BF16_FN __nv_bfloat16 __hmax(__nv_bfloat16 a, __nv_bfloat16 b)
 {
-    return __float2bfloat16(__builtin_fmaxf(__bfloat162float(a), __bfloat162float(b)));
+    bool na = (a.__x & 0x7fffu) > 0x7f80u, nb = (b.__x & 0x7fffu) > 0x7f80u;
+    if (na) return nb ? __ushort_as_bfloat16(0x7fc0) : b;
+    if (nb) return a;
+    if (((a.__x | b.__x) & 0x7fffu) == 0) return __ushort_as_bfloat16(static_cast<unsigned short>(a.__x & b.__x));
+    return __bfloat162float(a) > __bfloat162float(b) ? a : b;
 }
 OCU_BF16_FN __nv_bfloat16 __hmin(__nv_bfloat16 a, __nv_bfloat16 b)
 {
-    return __float2bfloat16(__builtin_fminf(__bfloat162float(a), __bfloat162float(b)));
+    bool na = (a.__x & 0x7fffu) > 0x7f80u, nb = (b.__x & 0x7fffu) > 0x7f80u;
+    if (na) return nb ? __ushort_as_bfloat16(0x7fc0) : b;
+    if (nb) return a;
+    if (((a.__x | b.__x) & 0x7fffu) == 0) return __ushort_as_bfloat16(static_cast<unsigned short>(a.__x | b.__x));
+    return __bfloat162float(a) < __bfloat162float(b) ? a : b;
 }
 
 /* ---- comparisons ---------------------------------------------------------------

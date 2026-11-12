@@ -276,8 +276,12 @@ OCU_D int __float2int_rz(float x) { return __nvvm_f2i_rz(x); }
 OCU_D int __float2int_rd(float x) { return __nvvm_f2i_rm(x); }
 OCU_D int __float2int_ru(float x) { return __nvvm_f2i_rp(x); }
 OCU_D float __int2float_rn(int x) { return __nvvm_i2f_rn(x); }
-OCU_D int __double2int_rn(double x) { return __nvvm_d2i_rn(x); }
-OCU_D int __double2int_rz(double x) { return __nvvm_d2i_rz(x); }
+/* cvt to an integer saturates (PTX ISA, cvt); NaN is forced to 0 explicitly because the
+   GPU gives INT_MIN for a double NaN (observed), unlike the float forms. */
+OCU_D int __double2int_rn(double x) { int r; asm("cvt.rni.s32.f64 %0, %1;" : "=r"(r) : "d"(x)); return x != x ? 0 : r; }
+OCU_D int __double2int_rz(double x) { int r; asm("cvt.rzi.s32.f64 %0, %1;" : "=r"(r) : "d"(x)); return x != x ? 0 : r; }
+OCU_D int __double2int_rd(double x) { int r; asm("cvt.rmi.s32.f64 %0, %1;" : "=r"(r) : "d"(x)); return x != x ? 0 : r; }
+OCU_D int __double2int_ru(double x) { int r; asm("cvt.rpi.s32.f64 %0, %1;" : "=r"(r) : "d"(x)); return x != x ? 0 : r; }
 
 /* ---- min / max (host and device, as in the documented math API) ------------------------ */
 
