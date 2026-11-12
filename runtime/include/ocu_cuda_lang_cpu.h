@@ -170,22 +170,22 @@ using zero_as_int = std::conditional_t<std::is_same_v<std::decay_t<A>, literal_z
                                        std::decay_t<A>>;
 
 template <typename F, typename... V, typename... A>
-void launch_values(const config &c, F f, A &&...a);
+cudaError_t launch_values(const config &c, F f, A &&...a);
 
 template <typename F, typename... A>
-void launch(const config &c, F f, A &&...a)
+cudaError_t launch(const config &c, F f, A &&...a)
 {
     static_assert(std::is_empty_v<F>, "launch lambda must not capture");
     if constexpr ((std::is_same_v<std::decay_t<A>, literal_zero> || ...) &&
                   std::is_invocable_v<F &, zero_as_int<A> &...>) {
-        launch_values<F, zero_as_int<A>...>(c, f, std::forward<A>(a)...);
+        return launch_values<F, zero_as_int<A>...>(c, f, std::forward<A>(a)...);
     } else {
-        launch_values<F, std::decay_t<A>...>(c, f, std::forward<A>(a)...);
+        return launch_values<F, std::decay_t<A>...>(c, f, std::forward<A>(a)...);
     }
 }
 
 template <typename F, typename... V, typename... A>
-void launch_values(const config &c, F f, A &&...a)
+cudaError_t launch_values(const config &c, F f, A &&...a)
 {
     std::tuple<V...> values(static_cast<V>(std::forward<A>(a))...);
     constexpr std::size_t n_args = sizeof...(V);
@@ -206,8 +206,47 @@ void launch_values(const config &c, F f, A &&...a)
     p.args = ptrs;
     p.arg_sizes = sizes;
     p.num_args = n_args + 1;
-    (void)ocu_rt_launch(thunk<F, V...>::kernel(), &p, c.stream);
+    return ocu_rt_launch(thunk<F, V...>::kernel(), &p, c.stream);
 }
+
+/* Calls the kernel through a pointer carried as the first argument. */
+struct call_through {
+    template <typename K, typename... A>
+    auto operator()(K k, A &...a) const -> decltype(k(a...))
+    {
+        k(a...);
+    }
+};
+
+template <typename... P, std::size_t... I>
+cudaError_t launch_from_array(const config &c, void (*k)(P...), void **args,
+                              std::index_sequence<I...>)
+{
+    return launch(c, call_through{}, k,
+                  *static_cast<std::remove_cv_t<std::remove_reference_t<P>> *>(args[I])...);
+}
+
+} // namespace ocu_cpu
+
+/*
+ * cudaLaunchKernel(func, grid, block, args, shared, stream): args[i] points
+ * at the value of the kernel's i-th parameter. On the CPU path the kernel's
+ * parameter types come from its function type, so the values are copied
+ * with their real types. (A plain `const void *` kernel cannot be launched
+ * here: there is no table from addresses to kernels yet.)
+ */
+template <typename... P>
+inline cudaError_t cudaLaunchKernel(void (*func)(P...), dim3 grid, dim3 block, void **args,
+                                    size_t shared = 0, cudaStream_t stream = nullptr)
+{
+    if (func == nullptr || (sizeof...(P) > 0 && args == nullptr)) {
+        return ocu_rt_launch(nullptr, nullptr, stream); /* records the error */
+    }
+    return ::ocu_cpu::launch_from_array(::ocu_cpu::cfg(grid, block, shared, stream), func, args,
+                                        std::index_sequence_for<P...>{});
+}
+
+namespace ocu_cpu {
 
 /* ---- atomics: blocks run on different OS threads ------------------------ */
 
