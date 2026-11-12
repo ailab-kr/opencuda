@@ -268,6 +268,55 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
       -DWORK=${CMAKE_CURRENT_BINARY_DIR}/msl_check
       -P ${CMAKE_CURRENT_SOURCE_DIR}/metal/msl_check_test.cmake)
   endif()
+
+  # The OpenCL backend. Hand-written OpenCL C kernels need only a device;
+  # CUDA translated by cu2ocl.py needs the Clang found above, and SPIR-V
+  # (for devices that take only SPIR-V, such as PoCL) needs llvm-spirv.
+  # Device tests exit 77 (skipped) without a usable device.
+  # OCU_OPENCL_TEST_LIBRARY names the OpenCL library the tests load.
+  if(OCU_BACKEND_OPENCL)
+    set(OCU_OPENCL_TEST_LIBRARY "" CACHE FILEPATH
+        "OpenCL library (ICD loader or driver) the tests load; empty: libOpenCL.so.1")
+    find_program(OCU_LLVM_SPIRV NAMES llvm-spirv llvm-spirv-20 llvm-spirv-19 llvm-spirv-18
+                 DOC "SPIR-V translator used by cu2ocl.py")
+    set(_ocu_ocl_env "")
+    if(OCU_OPENCL_TEST_LIBRARY)
+      set(_ocu_ocl_env "OCU_OPENCL_LIBRARY=${OCU_OPENCL_TEST_LIBRARY}")
+    endif()
+    set(_ocu_spirv none)
+    if(OCU_LLVM_SPIRV)
+      set(_ocu_spirv ${OCU_LLVM_SPIRV})
+    endif()
+    add_executable(test_opencl_backend backend/test_opencl_backend.c)
+    target_link_libraries(test_opencl_backend PRIVATE ocu_backend_opencl)
+    add_test(NAME opencl_backend COMMAND test_opencl_backend)
+    set_tests_properties(opencl_backend PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "${_ocu_ocl_env}")
+    if(_ocu_msl_clang)
+      add_test(NAME opencl_cu2ocl_host
+        COMMAND ${CMAKE_COMMAND} -E env OCU_CLANG=${_ocu_msl_clang} OCU_LLVM_SPIRV=${_ocu_spirv}
+                ${Python3_EXECUTABLE} -m unittest test_cu2ocl
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/opencl)
+      file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/ocl_img)
+      foreach(_t "probe_kernel|${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu|test_opencl_cu2ocl"
+                 "cu2msl_features|${CMAKE_CURRENT_SOURCE_DIR}/metal/cu2msl_features.cu|test_opencl_features")
+        string(REPLACE "|" ";" _t "${_t}")
+        list(GET _t 0 _name)
+        list(GET _t 1 _src)
+        list(GET _t 2 _exe)
+        set(_img ${CMAKE_CURRENT_BINARY_DIR}/ocl_img/${_name}.ocl.img)
+        add_test(NAME opencl_translate_${_name}
+          COMMAND ${CMAKE_COMMAND} -E env OCU_LLVM_SPIRV=${_ocu_spirv}
+                  ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/compiler/opencl/cu2ocl.py
+                  --clang ${_ocu_msl_clang} ${_src} -o ${_img})
+        set_tests_properties(opencl_translate_${_name} PROPERTIES FIXTURES_SETUP ocl_${_name})
+        add_executable(${_exe} opencl/${_exe}.c)
+        target_link_libraries(${_exe} PRIVATE ocu_backend_opencl)
+        add_test(NAME opencl_run_${_name} COMMAND ${_exe} ${_img})
+        set_tests_properties(opencl_run_${_name} PROPERTIES FIXTURES_REQUIRED ocl_${_name}
+          SKIP_RETURN_CODE 77 ENVIRONMENT "${_ocu_ocl_env}")
+      endforeach()
+    endif()
+  endif()
   if(OCU_CLANG_GPU_TARGETS)
     foreach(t "nvidia;sm_80;ptx" "amd;gfx1100;co" "amd;gfx1201;co")
       list(GET t 0 target)
