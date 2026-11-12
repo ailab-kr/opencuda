@@ -44,6 +44,17 @@ inline idx3 to_idx3(ocu_cpu_dim3 d) { return idx3{d.x, d.y, d.z}; }
 
 inline void *dynamic_shared() { return ocu_cpu_dynamic_shared(); }
 
+/*
+ * `extern __shared__ T name[];` becomes `static dyn_shared<T> name;`. The
+ * address is looked up at each use, so this works at file scope and inside
+ * functions, and every block sees its own memory.
+ */
+template <typename T>
+struct dyn_shared {
+    operator T *() const { return static_cast<T *>(ocu_cpu_dynamic_shared()); }
+    T &operator[](std::size_t i) const { return static_cast<T *>(*this)[i]; }
+};
+
 /* The calling program supplies the device to launch on. */
 const ocu_backend *backend();
 ocu_device *device();
@@ -59,22 +70,32 @@ inline config cfg(dim3 grid, dim3 block, std::size_t shared = 0,
     return config{grid, block, shared, stream};
 }
 
-template <typename... P>
-struct signature {
-    using fn = void (*)(P...);
+/* Last launch status, so a probe test can check it. */
+inline ocu_status &last_status()
+{
+    static thread_local ocu_status s = OCU_OK;
+    return s;
+}
 
+/*
+ * One module per (launch site, argument types): the rewriter turns
+ * K<<<cfg>>>(args) into launch(cfg, [](auto &&...a) { K(a...); }, args), so
+ * the kernel call inside the lambda is an ordinary C++ call and the compiler
+ * deduces template arguments, picks overloads and converts arguments the
+ * same way it would for any call.
+ */
+template <typename F, typename... A>
+struct thunk {
     template <std::size_t... I>
     static void call(void **a, std::index_sequence<I...>)
     {
-        fn k = *static_cast<fn *>(a[0]);
-        k(*static_cast<std::decay_t<P> *>(a[I + 1])...);
+        F &f = *static_cast<F *>(a[0]);
+        f(*static_cast<A *>(a[I + 1])...);
     }
     static void trampoline(void **a)
     {
-        call(a, std::index_sequence_for<P...>{});
+        call(a, std::index_sequence_for<A...>{});
     }
-
-    /* One module per signature, loaded on first use. */
     static ocu_kernel *kernel()
     {
         static ocu_kernel *k = [] {
@@ -94,22 +115,15 @@ struct signature {
     }
 };
 
-/* Last launch status, so a probe test can check it. */
-inline ocu_status &last_status()
+template <typename F, typename... A>
+void launch(const config &c, F f, A &&...a)
 {
-    static thread_local ocu_status s = OCU_OK;
-    return s;
-}
-
-template <typename... P, typename... A>
-void launch(void (*k)(P...), const config &c, A &&...a)
-{
-    static_assert(sizeof...(P) == sizeof...(A), "kernel argument count");
-    std::tuple<std::decay_t<P>...> values(std::forward<A>(a)...);
-    void *ptrs[sizeof...(P) + 1];
-    std::size_t sizes[sizeof...(P) + 1];
-    ptrs[0] = &k;
-    sizes[0] = sizeof(k);
+    static_assert(std::is_empty_v<F>, "launch lambda must not capture");
+    std::tuple<std::decay_t<A>...> values(std::forward<A>(a)...);
+    void *ptrs[sizeof...(A) + 1];
+    std::size_t sizes[sizeof...(A) + 1];
+    ptrs[0] = &f;
+    sizes[0] = sizeof(f);
     std::apply(
         [&](auto &...v) {
             std::size_t i = 1;
@@ -122,8 +136,9 @@ void launch(void (*k)(P...), const config &c, A &&...a)
     p.shared_memory_bytes = c.shared;
     p.args = ptrs;
     p.arg_sizes = sizes;
-    p.num_args = sizeof...(P) + 1;
-    last_status() = backend()->kernel_launch(nullptr, signature<P...>::kernel(), &p);
+    p.num_args = sizeof...(A) + 1;
+    last_status() = backend()->kernel_launch(
+        nullptr, thunk<F, std::decay_t<A>...>::kernel(), &p);
 }
 
 /* ---- atomics: blocks run on different OS threads ----------------------- */

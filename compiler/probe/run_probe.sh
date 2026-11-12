@@ -23,6 +23,7 @@ rm -rf "$out"
 mkdir -p "$out" "$empty"
 src="$here/probe_kernel.cu"
 features="$here/probe_features.cu"
+review="$here/probe_review.cu"
 clean="-nocudainc -nocudalib --cuda-path=$empty -Wno-unknown-cuda-version"
 hipclean="-nogpuinc -nogpulib"
 
@@ -81,6 +82,16 @@ for arch in gfx1100 gfx1201; do
 done
 run feat_host clang++ -x cuda $clean --cuda-gpu-arch=sm_80 \
     --cuda-host-only -c -o "$out/f_host.o" "$features"
+
+step "8. probe_review.cu (file-scope extern shared, macros, deduction) for every target"
+if run rev_nv clang++ -x cuda $clean --cuda-gpu-arch=sm_80 \
+        --cuda-device-only -S -o "$out/r_nv.ptx" "$review"; then
+    echo "  NVIDIA kernels: $(grep -cE '\.entry' "$out/r_nv.ptx")"
+fi
+if run rev_amd clang++ -x hip $hipclean --offload-arch=gfx1201 \
+        --cuda-device-only --no-gpu-bundle-output -c -o "$out/r_amd.o" "$review"; then
+    echo "  gfx1201 kernels: $(llvm-nm "$out/r_amd.o" | grep -c ' T ')"
+fi
 
 step "5. Plain C++ for the CPU backend: is the launch syntax accepted?"
 clang++ -x c++ -std=c++17 -fdeclspec -fsyntax-only "$src" 2>&1 \
