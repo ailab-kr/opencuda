@@ -92,7 +92,11 @@ void cpu_ctx_switch(cpu_ctx *from, cpu_ctx *to)
     ocu_cpu_ctx_switch(&from->sp, to->sp);
 }
 
-void cpu_ctx_finish(cpu_ctx *from, cpu_ctx *to) { cpu_ctx_switch(from, to); }
+/* The same switch, not a call to cpu_ctx_switch: see cpu_fiber.h. */
+void cpu_ctx_finish(cpu_ctx *from, cpu_ctx *to)
+{
+    ocu_cpu_ctx_switch(&from->sp, to->sp);
+}
 void cpu_ctx_destroy(cpu_ctx *ctx) { (void)ctx; }
 
 #if defined(__x86_64__)
@@ -175,7 +179,11 @@ void cpu_ctx_switch(cpu_ctx *from, cpu_ctx *to)
     swapcontext(&from->uc, &to->uc);
 }
 
-void cpu_ctx_finish(cpu_ctx *from, cpu_ctx *to) { cpu_ctx_switch(from, to); }
+/* The same switch, not a call to cpu_ctx_switch: see cpu_fiber.h. */
+void cpu_ctx_finish(cpu_ctx *from, cpu_ctx *to)
+{
+    swapcontext(&from->uc, &to->uc);
+}
 void cpu_ctx_destroy(cpu_ctx *ctx) { (void)ctx; }
 
 #endif
