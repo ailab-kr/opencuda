@@ -46,7 +46,7 @@ compiler/         runtime/         libs/
 | `backends/npusim/` | NPU 제약 흉내 백엔드: 커널 없음, 연산 표만, 호스트가 못 읽는 장치 메모리, 온칩 메모리 한도 | 연산 5종 |
 | `backends/ops_ref/` | 연산 표의 공통 검사와 기준 계산(백엔드 아님, 연산 표를 내놓는 백엔드가 링크) | 있음 |
 | `runtime/core/` | 백엔드 등록과 선택 | 있음 |
-| `runtime/include/` | 사용자 프로그램이 보는 헤더: `cuda_runtime_api.h`·`cuda_runtime.h`·`cuda.h`·`cuda_fp16.h`, 벡터 형, CPU 경로 언어 지원 `ocu_cuda_lang_cpu.h` | 함수 80여 개 |
+| `runtime/include/` | 사용자 프로그램이 보는 헤더: `cuda_runtime_api.h`·`cuda_runtime.h`·`cuda.h`·`cuda_fp16.h`, 벡터 형, CPU 경로 언어 지원 `ocu_cuda_lang_cpu.h`, 헤더만으로 된 병렬 기본 연산 부분집합 `cub/cub.cuh`(프로그램과 함께 대상마다 컴파일, `cards/libs/cub-subset.md`) | 함수 80여 개 |
 | `runtime/cudart/` | 실행 API 구현(`ocu_cudart`): 장치·오류·메모리·스트림·사건·실행. 백엔드 규격만 부른다 | 있음 |
 | `libs/` | 라이브러리별 호환 층 | `libs/cublas`: `cublas_v2.h` 부분집합(핸들·스트림·GEMM 계열·1·2단계 일부·strsm 배치), CUDA C 소스 하나로 CPU·NVIDIA 모두 통과. `libs/blas`: 20개 함수(내부 이름), CPU에서 기준 사례 526건 통과 |
 | `compiler/` | 명령 호환, 빌드 도구 연동, 장치용 수학 함수 | 실험 단계 드라이버 `compiler/probe/ocu_cc.py`(CPU 경로는 실제 프로그램 빌드에 씀), CMake 함수 `ocu_add_cpu_cu_executable`, nvcc 명령 호환 드라이버 `compiler/driver/ocu-nvcc`와 툴킷 폴더(CMake 도구 사슬 파일 `OcuCUDA.cmake`, `docs/compiler-driver.md`) |
