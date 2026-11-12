@@ -1,271 +1,274 @@
-# 구조 설계
+# Architecture
 
-이 문서는 저장소의 부품, 부품 사이의 경계, 그 경계를 지키는 규칙을 정한다.
-작업 순서와 일정은 저장소 밖의 계획 파일(`../PLAN.md`)에 있다.
+**English** · [한국어](ARCHITECTURE.ko.md)
 
-현재 상태(2026-11-12 밤): 장치 연결 층 규격, 백엔드 등록, CPU 백엔드 전체, BLAS 20개 함수의 기준 답과 채점, CUDA 이름의 실행 API와 헤더(공개 문서만 보고 작성), CPU 경로 컴파일(전처리 → 변환 → C++ 컴파일)이 동작한다. 공개 벤치마크 Rodinia의 CUDA 프로그램 18개 중 17개가 소스 수정 없이 CPU에서 빌드되고, 9개는 독립 기준과 결과가 같다. 엔비디아·AMD용은 장치 코드 컴파일까지만 확인했다(실행은 장비 도착 뒤).
+This document defines the parts of the repository, the boundaries between them, and the rules that protect those boundaries.
+The work order and schedule are in a plan file outside the repository (`../PLAN.md`).
 
-## 1. 목표와 설계 원칙
+Current state (night of 2026-11-12): the device interface layer spec, backend registration, the whole CPU backend, reference answers and scoring for 20 BLAS functions, the execution API and headers with CUDA names (written from public documents only), and CPU-path compilation (preprocess, rewrite, C++ compile) all work. Of the 18 CUDA programs in the public Rodinia benchmark, 17 build on the CPU without source changes, and 9 give the same results as an independent reference. For NVIDIA and AMD, only device code compilation is confirmed (execution comes after the hardware arrives).
 
-CUDA용으로 짠 소스를 고치지 않고 다른 GPU에서 빌드해 실행하게 하고, 그 호환 수준을 같은 시험으로 잰다.
+## 1. Goal and design principles
 
-1. **칩 차이는 한 곳에만 둔다.** 칩마다 다른 것은 전부 장치 연결 층 아래에 있다.
-2. **시험이 기준이다.** 구현은 적합성 시험을 통과하는 것으로 완성을 판단한다.
-3. **있는 것을 쓴다.** 컴파일러와 칩별 기반은 공개된 것을 쓰고, 그 사이를 잇는 층만 만든다.
-4. **거짓 성공을 하지 않는다.** 안 되는 기능은 "지원 안 함" 오류를 낸다.
-5. **GPU 없이도 검증한다.** CPU 백엔드에서 같은 코드가 돈다.
+Build and run source written for CUDA on other GPUs without changing it, and measure the level of compatibility with the same tests.
 
-## 2. 층과 부품
+1. **Keep chip differences in one place.** Everything that differs between chips lives below the device interface layer.
+2. **Tests are the standard.** An implementation is complete when it passes the conformance tests.
+3. **Use what exists.** Use public compilers and per-chip foundations. Build only the layer that connects them.
+4. **No false success.** A feature that does not work returns a "not supported" error.
+5. **Verify without a GPU.** The same code runs on the CPU backend.
+
+## 2. Layers and parts
 
 ```
-사용자의 CUDA 소스와 빌드 설정 (수정 없음)
+User's CUDA source and build settings (unchanged)
         │
    ┌────┴─────────┬──────────────┐
 compiler/         runtime/         libs/
-명령 호환,         실행 API,        행렬·FFT·난수·
-코드 생성          헤더             신경망 연산 API
+command compat,   execution API,   matrix, FFT, random,
+code generation   headers          neural-network op APIs
    └────┬─────────┴──────────────┘
         │
-   runtime/core        백엔드 등록, 칩과 무관한 공통 기능
+   runtime/core        backend registration, chip-independent common functions
         │
-   backends/interface  장치 연결 층 규격 (헤더 하나)
+   backends/interface  device interface layer spec (one header)
         │
    ┌────┼──────────┬──────────┐
  backends/cpu  backends/amd  backends/intel  ...
 
- conformance/  모든 층과 모든 칩을 같은 시험으로 검사
- tuning/       속도 측정과 칩별 설정
+ conformance/  checks every layer and every chip with the same tests
+ tuning/       speed measurement and per-chip settings
 ```
 
-| 폴더 | 역할 | 상태 |
+| Folder | Role | Status |
 |---|---|---|
-| `backends/interface/` | 장치 연결 층 규격 `ocu_backend.h` | 초안 있음 |
-| `backends/cpu/` | CPU 기준 구현 | 규격 함수 26개 전부 |
-| `backends/amd/`, `backends/intel/` | 칩별 구현 | 없음 |
-| `backends/opencl/` | OpenCL 2.0 이상 장치(공유 가상 메모리, SPIR-V 또는 C++ for OpenCL). 장치 코드는 `compiler/opencl/cu2ocl.py` | 1차 구현, CPU용 OpenCL(PoCL)에서 시험 통과 |
-| `backends/npusim/` | NPU 제약 흉내 백엔드: 커널 없음, 연산 표만, 호스트가 못 읽는 장치 메모리, 온칩 메모리 한도 | 연산 5종 |
-| `backends/ops_ref/` | 연산 표의 공통 검사와 기준 계산(백엔드 아님, 연산 표를 내놓는 백엔드가 링크) | 있음 |
-| `runtime/core/` | 백엔드 등록과 선택 | 있음 |
-| `runtime/include/` | 사용자 프로그램이 보는 헤더: `cuda_runtime_api.h`·`cuda_runtime.h`·`cuda.h`·`cuda_fp16.h`, 벡터 형, CPU 경로 언어 지원 `ocu_cuda_lang_cpu.h`, 헤더만으로 된 병렬 기본 연산 부분집합 `cub/cub.cuh`(프로그램과 함께 대상마다 컴파일, `cards/libs/cub-subset.md`) | 함수 80여 개 |
-| `runtime/cudart/` | 실행 API 구현(`ocu_cudart`): 장치·오류·메모리·스트림·사건·실행. 백엔드 규격만 부른다 | 있음 |
-| `libs/` | 라이브러리별 호환 층 | `libs/cublas`: `cublas_v2.h` 부분집합(핸들·스트림·GEMM 계열·1·2단계 일부·strsm 배치), CUDA C 소스 하나로 CPU·NVIDIA 모두 통과. `libs/blas`: 20개 함수(내부 이름), CPU에서 기준 사례 526건 통과 |
-| `compiler/` | 명령 호환, 빌드 도구 연동, 장치용 수학 함수 | 실험 단계 드라이버 `compiler/probe/ocu_cc.py`(CPU 경로는 실제 프로그램 빌드에 씀), CMake 함수 `ocu_add_cpu_cu_executable`, nvcc 명령 호환 드라이버 `compiler/driver/ocu-nvcc`와 툴킷 폴더(CMake 도구 사슬 파일 `OcuCUDA.cmake`, `docs/compiler-driver.md`) |
-| `conformance/` | 적합성 시험, 채점기, 결과 형식 | BLAS 20개 함수의 기준 답 526건, 오차 한계, 자체 검증 |
-| `tuning/` | 속도 측정, 자동 튜닝, 칩별 설정 표 | 측정 규칙(PLAN 6.4)을 지키는 측정기 `ocu_bench`와 BLAS 측정 `bench_blas` |
-| `cards/` | 기능 카드 | 양식, 부품 카드 2장, BLAS 카드 20장 |
-| `tests/` | 뼈대 자체의 기본 동작 시험 | 있음 |
+| `backends/interface/` | Device interface layer spec `ocu_backend.h` | Draft exists |
+| `backends/cpu/` | CPU reference implementation | All 26 spec functions |
+| `backends/amd/`, `backends/intel/` | Per-chip implementations | None |
+| `backends/opencl/` | Devices with OpenCL 2.0 or later (shared virtual memory, SPIR-V or C++ for OpenCL). Device code goes through `compiler/opencl/cu2ocl.py` | First implementation; tests pass on OpenCL for CPU (PoCL) |
+| `backends/npusim/` | Backend that imitates NPU constraints: no kernels, op table only, device memory the host cannot read, on-chip memory limit | 5 ops |
+| `backends/ops_ref/` | Shared checks and reference computation for the op table (not a backend; backends that provide an op table link it) | Exists |
+| `runtime/core/` | Backend registration and selection | Exists |
+| `runtime/include/` | Headers that user programs see: `cuda_runtime_api.h`, `cuda_runtime.h`, `cuda.h`, `cuda_fp16.h`, vector types, CPU-path language support `ocu_cuda_lang_cpu.h`, and a header-only subset of parallel primitives `cub/cub.cuh` (compiled per target together with the program, `cards/libs/cub-subset.md`) | About 80 functions |
+| `runtime/cudart/` | Execution API implementation (`ocu_cudart`): device, error, memory, stream, event, launch. Calls only the backend spec | Exists |
+| `libs/` | Per-library compatibility layers | `libs/cublas`: a subset of `cublas_v2.h` (handle, stream, GEMM family, part of levels 1 and 2, batched strsm). A single CUDA C source passes on both CPU and NVIDIA. `libs/blas`: 20 functions (internal names); 526 reference cases pass on the CPU |
+| `compiler/` | Command compatibility, build tool integration, device math functions | Experimental driver `compiler/probe/ocu_cc.py` (the CPU path uses it to build real programs), CMake function `ocu_add_cpu_cu_executable`, nvcc-compatible command driver `compiler/driver/ocu-nvcc` and toolkit folder (CMake toolchain file `OcuCUDA.cmake`, `docs/compiler-driver.md`) |
+| `conformance/` | Conformance tests, scorer, result format | 526 reference answers for the 20 BLAS functions, error bounds, self-verification |
+| `tuning/` | Speed measurement, auto-tuning, per-chip setting tables | Benchmark tool `ocu_bench`, which follows the measurement rules (PLAN 6.4), and BLAS benchmark `bench_blas` |
+| `cards/` | Feature cards | Template, 2 part cards, 20 BLAS cards |
+| `tests/` | Basic behavior tests of the skeleton itself | Exists |
 
-## 3. 의존 규칙
+## 3. Dependency rules
 
-화살표는 "가져다 쓸 수 있다"는 뜻이다. 표에 없는 방향은 금지다.
+An arrow means "may use." Any direction not in the table is forbidden.
 
-| 부품 | 쓸 수 있는 것 |
+| Part | May use |
 |---|---|
-| 사용자 프로그램 | `runtime/include`, `libs`의 공개 헤더 |
+| User program | Public headers of `runtime/include` and `libs` |
 | `libs/*` | `runtime/core`, `backends/interface` |
-| `runtime` (실행 API) | `runtime/core`, `backends/interface` |
-| `runtime/core` | `backends/interface`. 빌드에 포함된 백엔드의 등록 함수 |
-| `backends/*` | `backends/interface`, 그 칩의 외부 라이브러리 |
-| `conformance` | 사용자 프로그램과 같은 것만 |
+| `runtime` (execution API) | `runtime/core`, `backends/interface` |
+| `runtime/core` | `backends/interface`. Registration functions of the backends included in the build |
+| `backends/*` | `backends/interface`, and the external libraries of that chip |
+| `conformance` | Only what a user program also uses |
 
-지켜야 할 것
+Rules to keep
 
-- `runtime`과 `libs` 안에 칩 이름으로 갈리는 코드를 두지 않는다. 칩 이름을 아는 곳은 `runtime/core/registry.c` 하나다.
-- 백엔드끼리 서로 가져다 쓰지 않는다.
-- `conformance`는 내부 헤더를 쓰지 않는다. 사용자와 같은 표면만 본다. 그래야 다른 호환 방식도 같은 시험으로 잴 수 있다.
+- Do not put code that branches on chip name in `runtime` or `libs`. The only place that knows chip names is `runtime/core/registry.c`.
+- Backends do not use each other.
+- `conformance` does not use internal headers. It sees only the same surface as the user. This lets other compatibility approaches be measured with the same tests.
 
-## 4. 장치 연결 층
+## 4. Device interface layer
 
-규격은 `backends/interface/ocu_backend.h` 하나다. 백엔드는 함수 표(`ocu_backend`) 하나를 채워 내놓는다.
+The spec is one file, `backends/interface/ocu_backend.h`. A backend fills in and exports one function table (`ocu_backend`).
 
-| 묶음 | 함수 |
+| Group | Functions |
 |---|---|
-| 장치 | `dev_count`, `dev_info`, `dev_open`, `dev_close` |
-| 메모리 | `mem_alloc`, `mem_free`, `mem_copy`, `mem_set`, `mem_info`, `host_alloc_pinned`, `host_free_pinned` |
-| 대기열 | `queue_create`, `queue_destroy`, `queue_sync`, `queue_query` |
-| 코드 | `module_load`, `module_unload`, `module_get_kernel` |
-| 실행 | `kernel_launch` |
-| 표식 | `marker_create`, `marker_destroy`, `marker_record`, `marker_wait`, `marker_query`, `marker_elapsed_ms` |
-| 선택 | `get_provider` |
+| Device | `dev_count`, `dev_info`, `dev_open`, `dev_close` |
+| Memory | `mem_alloc`, `mem_free`, `mem_copy`, `mem_set`, `mem_info`, `host_alloc_pinned`, `host_free_pinned` |
+| Queue | `queue_create`, `queue_destroy`, `queue_sync`, `queue_query` |
+| Code | `module_load`, `module_unload`, `module_get_kernel` |
+| Launch | `kernel_launch` |
+| Marker | `marker_create`, `marker_destroy`, `marker_record`, `marker_wait`, `marker_query`, `marker_elapsed_ms` |
+| Selection | `get_provider` |
 
-약속
+Contract
 
-- **장치 포인터는 덧셈이 되는 주소다.** 사용자 코드가 포인터에 값을 더해 쓰므로, 할당 안에서 `ptr + n`이 유효해야 한다.
-- **대기열 하나에 넣은 일은 넣은 순서대로 실행된다.** 대기열이 다르면 순서를 보장하지 않는다. 대기열 자리에 `NULL`을 주면 끝날 때까지 기다린다.
-- **묶음 단위 크기는 실제 값을 알린다.** 32로 속이지 않는다.
-- **해제는 대기열의 남은 일을 먼저 기다린다.** `mem_free`와 `host_free_pinned`는 대기 중인 작업이 그 메모리를 다 쓸 때까지 기다린다.
-- **실행 인자 합계는 `OCU_MAX_ARG_BYTES`(32768바이트) 이하다.**
-- **커널 안에서 백엔드를 다시 부르면 "지원 안 함"이다.** 실행, 대기열 동기화·해제, 표식 대기, 메모리 해제가 해당한다.
-- **표식 대기는 부른 시점의 기록만 기다린다.** 기다리는 사이 다시 기록해도 기다림이 늘어나지 않는다.
-- **오류는 `ocu_status` 하나로 돌려준다.** 사용자에게 보이는 오류 코드로 바꾸는 일은 `runtime`이 한다.
-- **`NOT_SUPPORTED`와 `NOT_IMPLEMENTED`를 구분한다.** 앞은 칩이 못 하는 것, 뒤는 아직 안 만든 것이다. 성적표에 다르게 표시된다.
-- **규격을 바꾸면 `OCU_BACKEND_ABI`를 올린다.** 등록할 때 번호가 다르면 거부한다.
+- **A device pointer is an address that supports addition.** User code adds values to pointers, so `ptr + n` must be valid inside an allocation.
+- **Work put in one queue runs in the order it was put in.** Order across different queues is not guaranteed. If `NULL` is given in place of a queue, the call waits until the work is done.
+- **Report the real warp size.** Do not fake 32.
+- **A free first waits for the remaining work in the queues.** `mem_free` and `host_free_pinned` wait until pending work has finished using that memory.
+- **The total of launch arguments is at most `OCU_MAX_ARG_BYTES` (32768 bytes).**
+- **Calling the backend again from inside a kernel returns "not supported."** This covers launch, queue sync and destroy, marker wait, and memory free.
+- **A marker wait waits only for the record that existed when the wait was called.** Recording again during the wait does not extend it.
+- **Errors are returned as a single `ocu_status`.** Converting it to the error code that users see is the job of `runtime`.
+- **Distinguish `NOT_SUPPORTED` from `NOT_IMPLEMENTED`.** The first means the chip cannot do it; the second means it is not built yet. They are shown differently in the report card.
+- **When the spec changes, raise `OCU_BACKEND_ABI`.** Registration is rejected if the number differs.
 
-### 라이브러리 제공자
+### Library providers
 
-행렬 연산 같은 라이브러리는 칩 회사가 다듬은 것을 쓰는 편이 빠르다. 그런데 `libs`가 칩 회사 라이브러리를 직접 부르면 3장의 규칙이 깨진다. 그래서 백엔드가 "제공자"를 내놓는다.
+For libraries such as matrix operations, using a version tuned by the chip vendor is usually faster. But if `libs` called the vendor library directly, it would break the rules in section 3. So the backend exports a "provider."
 
 ```
-libs/blas  ──(get_provider("blas"))──▶  백엔드
+libs/blas  ──(get_provider("blas"))──▶  backend
    │                                      │
-   │  제공자가 있고 그 함수가 있으면         ▼
-   ├────────────────────────────────▶  칩 회사 라이브러리
+   │  if a provider and the function      ▼
+   │  exist                          vendor library
+   ├────────────────────────────────▶
    │
-   └─ 없으면 ─▶ libs 안의 공통 구현 (kernel_launch로 실행)
+   └─ if not ─▶ common implementation inside libs (runs via kernel_launch)
 ```
 
-- 제공자 표의 모양은 `libs` 쪽이 정하고, 두 쪽이 함께 쓰므로 헤더는 `backends/interface/`에 둔다(라이브러리마다 하나, 예: `ocu_blas_provider.h`).
-- 지금 있는 것: BLAS 제공자 표(14개 연산, f32·f64)와 CPU 백엔드의 구현(`backends/cpu/cpu_blas.c`). `libs/blas`가 그 위에서 20개 함수를 내놓는다.
-- `libs`는 인자 검사, 오류 코드, 색인 기준 같은 CUDA 쪽 동작을 맡고, 실제 계산만 제공자에게 넘긴다.
-- 제공자가 없는 칩에서도 공통 구현으로 동작한다. 느릴 뿐 틀리지 않는다.
+- `libs` decides the shape of the provider table. Both sides use it, so the header goes in `backends/interface/` (one per library, for example `ocu_blas_provider.h`).
+- What exists now: the BLAS provider table (14 operations, f32 and f64) and its CPU backend implementation (`backends/cpu/cpu_blas.c`). `libs/blas` exports 20 functions on top of it.
+- `libs` handles CUDA-side behavior such as argument checks, error codes, and indexing conventions. It hands only the actual computation to the provider.
+- A chip without a provider still works through the common implementation. It is slower, not wrong.
 
-### CUDA 이름의 라이브러리 (`libs/cublas`)
+### Libraries with CUDA names (`libs/cublas`)
 
-`cublas_v2.h`의 함수는 제공자 표를 거치지 않는다. 호스트 쪽은 실행 API만 부르는 칩 중립 C++이고, 계산은 같은 파일의 CUDA C 커널(공유 메모리 타일 GEMM, 1·2단계 커널)이 한다. 이 `.cu` 하나를 프로젝트의 컴파일러(`ocu_cc`)가 대상마다 따로 컴파일해 대상별 정적 라이브러리를 만든다.
+Functions in `cublas_v2.h` do not go through the provider table. The host side is chip-neutral C++ that calls only the execution API. The computation is done by CUDA C kernels in the same file (shared-memory tiled GEMM, level 1 and 2 kernels). The project compiler (`ocu_cc`) compiles this one `.cu` separately for each target and builds a static library per target.
 
-| 대상 | 라이브러리 | 만드는 법 |
+| Target | Library | How it is built |
 |---|---|---|
-| CPU 경로 | `ocu_cublas_cpu` | `ocu_add_cu_library(... cpu ...)`: CPU 경로 변환 뒤 C++ 컴파일 |
-| NVIDIA | `ocu_cublas_nvidia` | `ocu_add_cu_library(... nvidia ...)`: 장치 코드는 PTX로 컨테이너에 넣어 호스트 객체에 포함 |
-| Metal | (다음) | 같은 소스를 `cu2msl` 경로로. 배정밀도가 없으므로 `OCU_CUBLAS_NO_FP64`로 빌드해 64F는 "지원 안 함" |
+| CPU path | `ocu_cublas_cpu` | `ocu_add_cu_library(... cpu ...)`: CPU-path rewrite, then C++ compile |
+| NVIDIA | `ocu_cublas_nvidia` | `ocu_add_cu_library(... nvidia ...)`: device code is put into a container as PTX and embedded in the host object |
+| Metal | (next) | Same source through the `cu2msl` path. There is no double precision, so build with `OCU_CUBLAS_NO_FP64` and 64F returns "not supported" |
 
-- 프로그램은 자기가 빌드된 대상의 변형을 링크한다: `ocu-nvcc -lcublas`(대상에 맞는 변형), CMake의 `CUDA::cublas`(툴킷의 FindCUDAToolkit, `OCU_TARGET`에 맞는 변형), 이 저장소 안에서는 `ocu_add_cpu_cu_executable(t a.cu LIBRARIES ocu_cublas_cpu)`·`ocu_add_nvidia_cu_executable(t a.cu LIBRARIES ocu_cublas_nvidia)`.
-- 엔비디아의 라이브러리는 NVIDIA 대상에서도 부르지 않는다. 같은 커널이 모든 대상을 맡는 것이 목적이다.
-- 칩 회사 라이브러리를 쓰는 빠른 길이 필요해지면 위의 제공자 방식으로 더한다(그때도 `libs` 안에서 칩 이름으로 가르지 않는다).
+- A program links the variant for the target it is built for: `ocu-nvcc -lcublas` (the variant that matches the target), `CUDA::cublas` in CMake (the toolkit's FindCUDAToolkit, the variant that matches `OCU_TARGET`), and inside this repository `ocu_add_cpu_cu_executable(t a.cu LIBRARIES ocu_cublas_cpu)` and `ocu_add_nvidia_cu_executable(t a.cu LIBRARIES ocu_cublas_nvidia)`.
+- NVIDIA's own library is not called, even on the NVIDIA target. The point is that the same kernel serves every target.
+- If a fast path that uses a vendor library becomes necessary, add it through the provider mechanism above (even then, `libs` does not branch on chip name).
 
-### 연산 표 (`ocu_ops`)
+### Op table (`ocu_ops`)
 
-SIMT 스레드가 없는 칩(NPU)은 커널을 못 돌리지만 행렬곱·정규화·softmax 같은 연산은 돌린다. 그런 칩을 위한 두 번째 일하는 길이 연산 표다. 규격은 `docs/spec/op-table.md`, 헤더는 `backends/interface/ocu_ops.h`.
+A chip without SIMT threads (an NPU) cannot run kernels, but it can run operations such as matrix multiply, normalization, and softmax. The op table is the second way of working for such chips. The spec is `docs/spec/op-table.md`, and the header is `backends/interface/ocu_ops.h`.
 
-- 백엔드는 `get_provider("ops")`로 표를 내놓는다. `ocu_backend` 표와 `OCU_BACKEND_ABI`는 바뀌지 않는다. 연산 표는 자기 판 번호와 크기를 가진다.
-- 순서: 지원 질의(연산 × 자료형) → 정확한 질의(설명자 하나) → 계획(모양 고정, 미리 컴파일 가능, "지원 안 함" 가능) → 실행(대기열에) → 해제. 행 수만 바뀌는 호출은 `OCU_OP_FLAG_VAR_ROWS`로 계획 하나를 쓴다.
-- 허용 오차는 등급 네 개(정확, ulp, 행 축소, 내적)로 정하고, 누적 순서가 달라도 통과하게 한다.
-- 상위 층(`libs/blas` 등)은 질의 결과로 길을 고른다. 칩 이름을 보지 않는다.
-- `backends/ops_ref`는 백엔드가 아니라 공통 부품이다. 백엔드끼리 가져다 쓰지 않는다는 규칙은 그대로다.
+- A backend exports the table through `get_provider("ops")`. The `ocu_backend` table and `OCU_BACKEND_ABI` do not change. The op table has its own version number and size.
+- Sequence: support query (op × data type) → exact query (one descriptor) → plan (fixed shape, can be precompiled, may return "not supported") → run (in a queue) → release. Calls where only the row count changes use one plan with `OCU_OP_FLAG_VAR_ROWS`.
+- Tolerance is set by four classes (exact, ulp, row reduction, dot product), and passes even when the accumulation order differs.
+- Upper layers (`libs/blas` and others) choose a path from the query result. They do not look at chip names.
+- `backends/ops_ref` is a shared component, not a backend. The rule that backends do not use each other still holds.
 
-## 5. 한 번의 실행이 지나가는 길
+## 5. The path of one run
 
-GPU 코드 하나를 빌드해서 실행할 때의 흐름이다. GPU 칩용 2~4번은 아직 구현되지 않았다. CPU 경로는 아래 "CPU 경로" 대로 동작한다.
+This is the flow when a GPU program is built and run. Steps 2 to 4 for GPU chips are not implemented yet. The CPU path works as described in "CPU path" below.
 
-1. **빌드**: 컴파일러 층이 소스를 두 갈래로 컴파일한다. 호스트 쪽 코드와, 대상 칩마다 하나씩의 장치 코드 묶음이다.
-2. **묶기**: 장치 코드 묶음을 실행 파일 안에 넣고, "어느 칩용인지, 함수 이름이 무엇인지"를 적은 등록 기록을 붙인다. 한 실행 파일에 여러 칩용 묶음을 함께 넣을 수 있다.
-3. **시작**: 프로그램이 뜨면 등록 기록이 `runtime`에 등록된다. `runtime/core`가 백엔드를 고른다.
-4. **실행 요청**: 사용자 코드의 실행 구문은 컴파일러가 `runtime`의 실행 진입점 호출로 바꾼다. `runtime`은 활성 백엔드용 묶음을 `module_load`로 올리고(한 번만), `kernel_launch`를 부른다.
-5. **동기화**: 결과를 읽기 전에 `queue_sync`나 표식으로 기다린다.
+1. **Build**: the compiler layer compiles the source along two branches: the host-side code, and one device code bundle per target chip.
+2. **Bundle**: put the device code bundles into the executable, and attach a registration record that says which chip each bundle is for and what the function names are. One executable can hold bundles for several chips.
+3. **Start**: when the program starts, the registration record is registered with `runtime`. `runtime/core` selects a backend.
+4. **Launch request**: the compiler turns the launch statement in user code into a call to the launch entry point of `runtime`. `runtime` loads the bundle for the active backend with `module_load` (once only) and calls `kernel_launch`.
+5. **Synchronize**: wait with `queue_sync` or a marker before reading results.
 
-CPU 백엔드에서는 "장치 코드 묶음"이 CPU용으로 컴파일된 함수의 표다. 나머지 흐름은 같다.
+On the CPU backend, the "device code bundle" is a table of functions compiled for the CPU. The rest of the flow is the same.
 
-확인할 것: 기반 컴파일러가 실행 구문을 어떤 함수 호출로 바꾸는지를 실제 설치본에서 확인하고(`PLAN.md` P0-W1-11), 4번의 진입점을 거기에 맞춘다.
+To confirm: check on a real installation which function call the base compiler turns a launch statement into (`PLAN.md` P0-W1-11), and match the entry point in step 4 to it.
 
-### CPU 경로 (지금 동작)
+### CPU path (works now)
 
-1. **전처리**: `.cu`를 C++17로 전처리한다. nvcc처럼 `cuda_runtime.h`를 먼저 넣고 `__CUDACC__`를 정의한다. 그래서 포함한 파일과 매크로 안의 실행 구문도 한 덩어리로 보인다.
-2. **변환**(`cpu_rewrite.py`): `K<<<cfg>>>(args)`를 `::ocu_cpu::launch(cfg, 람다, args)`로, 함수 안의 `extern __shared__ T a[]`를 블록별 공유 메모리를 가리키는 포인터로 바꾼다. 나머지는 바이트 그대로 두고 줄 수를 지킨다(오류 위치가 원래 파일을 가리킴).
-3. **컴파일과 실행**: 결과를 C++로 컴파일하고 `ocu_cudart`와 링크한다. `launch`는 인자를 복사해 `ocu_rt_launch`로 넘기고, 실행 API는 스트림 순서 규칙을 적용해 백엔드의 `kernel_launch`를 부른다. 커널 안의 `threadIdx` 등은 백엔드가 GPU 스레드를 바꿀 때마다 채우는 스레드 지역 변수다.
+1. **Preprocess**: preprocess the `.cu` as C++17. As nvcc does, include `cuda_runtime.h` first and define `__CUDACC__`. This way launch statements inside included files and macros are seen as part of the same unit.
+2. **Rewrite** (`cpu_rewrite.py`): turn `K<<<cfg>>>(args)` into `::ocu_cpu::launch(cfg, lambda, args)`, and turn `extern __shared__ T a[]` inside a function into a pointer to per-block shared memory. Everything else stays byte for byte, and the line count is kept (so error locations point to the original file).
+3. **Compile and run**: compile the result as C++ and link it with `ocu_cudart`. `launch` copies the arguments and passes them to `ocu_rt_launch`. The execution API applies stream ordering rules and calls the backend's `kernel_launch`. `threadIdx` and the like inside a kernel are thread-local variables that the backend fills in each time it switches a GPU thread.
 
-자리 옮김: 기본은 표준 C++이다(너비 이상으로 옮기면 정의되지 않음). 선택 옵션 `--ptx-shift`(CMake `PTX_SHIFT`)를 주면 장치 함수의 자리 옮김을 Clang 구문 트리로 찾아 PTX `shl`/`shr`의 정의(양을 너비로 줄임)를 따르는 도우미 호출로 바꾼다. CPU 경로와 엔비디아 경로 모두 해당한다(`compiler/probe/ptx_shift.py`, 카드 `compiler-ptx-shift`).
+Shifts: the default is standard C++ (shifting by the width or more is undefined). With the optional `--ptx-shift` (CMake `PTX_SHIFT`), shifts in device functions are found in the Clang syntax tree and replaced with a helper call that follows the PTX definition of `shl`/`shr` (the amount is clamped to the width). This applies to both the CPU path and the NVIDIA path (`compiler/probe/ptx_shift.py`, card `compiler-ptx-shift`).
 
-실행 API의 규칙(공개 문서의 동작):
-- 예전 기본 스트림: 기본 스트림 작업은 막는 스트림들을 먼저 끝내고, 막는 스트림 작업은 기본 스트림을 먼저 끝낸다. 순서 확인부터 대기열에 넣기까지 장치별 잠금을 쥔다(여러 호스트 스레드에서도 성립).
-- 일반(고정 안 된) 호스트 메모리와의 비동기 복사는 돌아오기 전에 끝난다. 런타임이 할당·등록한 고정 메모리만 나중에 읽힌다. 런타임은 자기가 할당한 범위를 기록해 포인터 종류와 `cudaMemcpyDefault`의 방향을 정한다.
-- 커널 실패는 장치에 남아, `cudaDeviceReset` 전까지 이후의 동기화·제출 호출이 같은 오류를 낸다.
-- 구현하지 않은 기능(그래프, 텍스처, 피어 접근, 장치가 호스트 메모리를 공유하지 않을 때의 통합 메모리 등)은 선언하지 않거나 "지원 안 함"을 돌려준다.
+Execution API rules (behavior from the public documents):
+- Legacy default stream: work on the default stream first finishes the blocking streams, and work on a blocking stream first finishes the default stream. A per-device lock is held from the ordering check until the work is put in the queue (this holds with several host threads too).
+- An asynchronous copy to or from ordinary (unpinned) host memory finishes before the call returns. Only pinned memory that the runtime allocated or registered is read later. The runtime records the ranges it allocated, and uses them to decide the pointer kind and the direction of `cudaMemcpyDefault`.
+- A kernel failure stays on the device. Until `cudaDeviceReset`, later sync and submit calls return the same error.
+- Features that are not implemented (graphs, textures, peer access, unified memory when the device does not share host memory, and so on) are not declared, or return "not supported."
 
-## 6. 상태와 스레드
+## 6. State and threads
 
-- 활성 백엔드는 프로세스에 하나다. 처음 쓸 때 정해지고 그 뒤로 바뀌지 않는 것을 전제로 한다.
-- "현재 장치"와 "마지막 오류"는 스레드마다 따로 가진다. `runtime`이 관리한다.
-- 백엔드 함수는 여러 스레드에서 동시에 불릴 수 있다. 백엔드가 스스로 안전해야 한다.
-- `registry.c`는 내장 백엔드 등록을 한 번만 하고(`pthread_once`), 등록·선택·조회를 잠금 하나로 지킨다. 여러 스레드가 동시에 처음 써도 안전하다.
-- 처음 쓸 때의 선택(`OCU_BACKEND` 또는 첫 등록 백엔드)은 한 번만 한다. 알 수 없는 이름이면 그 뒤로도 `NULL`이다.
+- There is one active backend per process. It is chosen at first use, and the design assumes it does not change after that.
+- The "current device" and the "last error" are kept per thread. `runtime` manages them.
+- Backend functions can be called from several threads at the same time. The backend must be safe by itself.
+- `registry.c` registers the built-in backends once (`pthread_once`) and guards registration, selection, and lookup with one lock. It is safe even when several threads use it for the first time at once.
+- The selection at first use (`OCU_BACKEND`, or the first registered backend) is made only once. If the name is unknown, the result stays `NULL` afterward too.
 
-## 7. CPU 기준 구현
+## 7. CPU reference implementation
 
-GPU 코드를 CPU에서 그대로 실행한다. 속도가 아니라 정확성 확인이 목적이다. 그래도 시험을 대량으로 돌릴 수 있을 만큼은 빨라야 한다.
+It runs GPU code as is on the CPU. The goal is to check correctness, not speed. Even so, it must be fast enough to run the tests in bulk.
 
-- **파이버**: GPU 스레드 하나가 파이버 하나다. 블록 하나의 파이버들은 OS 스레드 하나에서 차례로 돌고, 동기화 지점에서만 전환한다. 그래서 블록 안의 공유 메모리에는 잠금이 필요 없다.
-- **전환**: x86-64와 ARM64는 직접 쓴 레지스터 전환(`cpu_fiber_switch.S`)을 쓴다. 운영체제 호출이 없다. 그 밖의 칩은 `ucontext`를 쓴다. 빌드 옵션 `-DOCU_CPU_UCONTEXT=ON`으로 둘을 비교할 수 있다.
-    - 측정(24코어): 4백만 스레드 saxpy 105ms → 19ms. 스레드마다 동기화 9번인 블록 합 684ms → 76ms. 단순 반복문은 2.6ms이다.
-- **동기화**: 한 라운드에서 준비된 파이버를 모두 돌리고, 모두 동기화 지점에 오거나 끝나면 함께 풀어 준다. 동기화 전에 끝난 스레드는 도착한 것으로 친다. `OCU_CPU_STRICT=1`이면 오류다.
-- **블록 분산**: 블록은 OS 스레드 여러 개에 나눠 돈다. 블록 사이의 공유는 진짜 원자 연산이 필요하다. GPU와 같다.
-- **순서**: 고정 순서(재현용)와 무작위 순서(순서에 기대는 코드 찾기용)가 있다. 무작위 순서는 씨앗값으로 재현된다.
-- **스택**: 작업 스레드마다 큰 매핑 하나를 잡고, 맨 아래에 보호 페이지 하나를 둔다. 각 파이버 스택 바닥에는 카나리를 두고, 블록이 끝날 때 검사해서 넘침을 오류로 알린다. 파이버마다 보호 페이지를 두면 커널 메모리 영역이 GPU 스레드 수의 두 배로 늘어 운영체제 한도(`vm.max_map_count`)에 걸린다.
-- **검사 도구**: 파이버 전환을 주소 검사기와 스레드 검사기에 알려 준다. 두 검사기로 시험 전체가 깨끗하다.
-- **작업 스레드 묶음**: 블록을 나눠 도는 스레드는 처음 한 번 만들어 계속 쓴다. 실행한 스레드(호출한 스레드 또는 대기열 스레드)도 직접 블록을 돈다. 스레드마다 파이버 스택을 블록 모양이 같은 동안 다시 쓰고, 스레드가 끝나면 풀어 준다. 매 실행마다 스레드를 만들던 때보다 작은 실행이 5~9배 빠르다(6만 원소 saxpy 3.3→0.66ms, 64³ sgemm 1.5→0.17ms). 스택을 잡지 못한 도우미 스레드는 그 실행에서 빠진다(다시 붙지 않음). `fork()` 뒤 자식은 빈 묶음으로 시작해 다음 실행에서 다시 만든다. 대기열은 `fork()`를 넘어가지 않는다: 자식은 부모의 대기열을 잊고(해제가 그 대기열을 기다리지 않음), 물려받은 대기열 핸들에는 "지원 안 함"을 돌려준다. 자식이 새로 만든 대기열은 정상 동작한다.
-- **남겨 둔 것**: 묶음 스레드는 마지막으로 쓴 블록 모양의 스택을 계속 쥔다(1024 스레드 블록이면 스레드당 약 8MB).
-- **한계**: 블록 안의 진짜 동시 실행에서만 나는 경쟁 상태는 무작위 순서로도 다 잡지 못한다. 동기화 없이 다른 스레드를 기다리며 도는 코드는 끝나지 않는다.
-- **워프 연산**: 워프 단위 동기화와 값 모으기(`ocu_cpu_warp_gather`)가 있고, 셔플·투표는 그 위에 만든다. 한 워프의 일부는 워프 연산에서, 일부는 블록 동기화에서 서로를 기다리면 멈추지 않고 실행 실패로 알린다. 워프 연산마다 표식(연산·마스크·폭)과 순번을 붙여, 한 워프의 레인들이 서로 다른 호출이나 서로 다른 순번에서 만나면(부분 마스크 코드) 조용히 틀린 값을 내지 않고 실행 실패로 알린다. 마스크가 이름 붙인 레인만 기다리고 검사하므로, 서로 겹치지 않는 마스크(한쪽 절반 `0x0000ffff`, 다른 절반 `0xffff0000`)나 절반만 워프 동기화하고 나머지는 블록 동기화로 가는 코드처럼 CUDA에서 합법인 부분 마스크 코드가 그대로 돈다. 마스크에 이름이 있는 레인이 이미 끝난 경우(CUDA에서는 정의되지 않은 동작)는 블록 동기화처럼 기본은 허용하고, `OCU_CPU_STRICT=1`이면 실패로 알린다. 묶음 단위 크기 32와 64 모두 시험한다.
+- **Fibers**: one GPU thread is one fiber. The fibers of one block run in turn on one OS thread and switch only at synchronization points. So shared memory within a block needs no locks.
+- **Switching**: x86-64 and ARM64 use a hand-written register switch (`cpu_fiber_switch.S`). It makes no operating system calls. Other chips use `ucontext`. The build option `-DOCU_CPU_UCONTEXT=ON` lets you compare the two.
+    - Measured (24 cores): saxpy with 4 million threads 105 ms → 19 ms. Block sum with 9 syncs per thread 684 ms → 76 ms. A simple loop takes 2.6 ms.
+- **Synchronization**: in one round, run all ready fibers. When all of them have reached the sync point or finished, release them together. A thread that finished before the sync counts as arrived. With `OCU_CPU_STRICT=1` it is an error.
+- **Block distribution**: blocks are spread over several OS threads. Sharing between blocks needs real atomic operations, as on a GPU.
+- **Order**: there is a fixed order (for reproduction) and a random order (for finding code that depends on order). The random order is reproducible with a seed value.
+- **Stack**: each worker thread takes one large mapping, with one guard page at the very bottom. At the bottom of each fiber stack there is a canary, which is checked when the block ends, and an overflow is reported as an error. Giving each fiber a guard page would double the kernel memory regions to twice the number of GPU threads and hit the operating system limit (`vm.max_map_count`).
+- **Sanitizers**: fiber switches are reported to the address sanitizer and the thread sanitizer. The whole test suite is clean under both.
+- **Worker thread pool**: the threads that split and run blocks are created once and reused. The launching thread (the caller or the queue thread) also runs blocks itself. Each thread reuses its fiber stacks while the block shape stays the same, and releases them when the thread ends. Small launches are 5 to 9 times faster than when threads were created on every launch (saxpy with 60 thousand elements 3.3 → 0.66 ms, 64³ sgemm 1.5 → 0.17 ms). A helper thread that fails to get a stack drops out of that launch (it does not rejoin). After `fork()`, the child starts with an empty pool and creates threads again at the next launch. Queues do not cross `fork()`: the child forgets the parent's queues (a free does not wait for them), and returns "not supported" for inherited queue handles. Queues the child creates anew work normally.
+- **Left as is**: a pool thread keeps holding the stacks for the block shape it used last (about 8 MB per thread for a block of 1024 threads).
+- **Limits**: race conditions that occur only under truly concurrent execution inside a block are not all caught even by the random order. Code that spins waiting for another thread without synchronization never finishes.
+- **Warp operations**: there are warp-level synchronization and value gathering (`ocu_cpu_warp_gather`), and shuffle and vote are built on top. If part of a warp waits in a warp operation and part waits in a block sync, each waiting for the other, it does not hang but is reported as a launch failure. Each warp operation carries a tag (operation, mask, width) and a sequence number. If the lanes of one warp meet in different calls or at different sequence numbers (partial-mask code), it does not silently give wrong values but is reported as a launch failure. Only the lanes named by the mask are waited for and checked. So partial-mask code that is legal in CUDA runs as is: disjoint masks (one half `0x0000ffff`, the other half `0xffff0000`), or code where only half the warp syncs at warp level and the rest goes to a block sync. If a lane named in the mask has already finished (undefined behavior in CUDA), it is allowed by default, as with block sync, and reported as a failure with `OCU_CPU_STRICT=1`. Warp sizes 32 and 64 are both tested.
 
-## 8. 환경 변수
+## 8. Environment variables
 
-| 이름 | 값 | 뜻 | 상태 |
+| Name | Value | Meaning | Status |
 |---|---|---|---|
-| `OCU_BACKEND` | `cpu`, `amd`, ... | 쓸 백엔드. 없으면 처음 등록된 것 | 동작 |
-| `OCU_CPU_WARP` | `32`, `64` | CPU 백엔드가 알리는 묶음 단위 크기. 기본 32 | 동작 |
-| `OCU_CPU_ORDER` | `fixed`, `random` | CPU 백엔드의 실행 순서 | 동작 |
-| `OCU_CPU_SEED` | 정수 | 무작위 순서의 씨앗값. 기본 1 | 동작 |
-| `OCU_CPU_THREADS` | 정수 | 실행 한 번에 쓰는 OS 스레드 수. 기본 코어 수 | 동작 |
-| `OCU_CPU_STACK_KB` | 정수 | 파이버 스택 크기. 기본 128 | 동작 |
-| `OCU_CPU_STRICT` | `1` | 동기화 전에 끝난 스레드를 오류로 | 동작 |
-| `OCU_OPENCL_LIBRARY` | 파일 경로 | OpenCL 백엔드가 여는 라이브러리. 없으면 `libOpenCL.so.1` | 동작 |
-| `OCU_OPENCL_VERBOSE` | `1` | 빠진 장치의 이유, 빌드 실패 기록 | 동작 |
-| `OCU_NPUSIM_SCRATCH_KB` | 정수 | npusim 온칩 메모리 크기. 기본 256 | 동작 |
-| `OCU_NPUSIM_TILING` | `0`, `1` | npusim 행렬곱 타일 나누기. 기본 1 | 동작 |
-| `OCU_NPUSIM_DTYPES` | `f32,f16,bf16` 부분 | npusim이 받는 입력 자료형. 기본 셋 다 | 동작 |
-| `OCU_NPUSIM_PLAN_MS` | 정수 | npusim 계획마다 기다리는 시간(컴파일 흉내). 기본 0 | 동작 |
-| `OCU_NPUSIM_MEM_MB` | 정수 | npusim 장치 메모리 크기. 기본 256 | 동작 |
-| `OCU_NPUSIM_REPORT` | `1` | 장치를 닫을 때 npusim 집계를 표준 오류로 | 동작 |
-| `OCU_LOG` | `0`~`3` | 기록 수준 | 예정 |
+| `OCU_BACKEND` | `cpu`, `amd`, ... | Backend to use. If unset, the first registered one | Works |
+| `OCU_CPU_WARP` | `32`, `64` | Warp size reported by the CPU backend. Default 32 | Works |
+| `OCU_CPU_ORDER` | `fixed`, `random` | Execution order of the CPU backend | Works |
+| `OCU_CPU_SEED` | integer | Seed value for the random order. Default 1 | Works |
+| `OCU_CPU_THREADS` | integer | Number of OS threads used for one launch. Default is the core count | Works |
+| `OCU_CPU_STACK_KB` | integer | Fiber stack size. Default 128 | Works |
+| `OCU_CPU_STRICT` | `1` | Treat a thread that finished before a sync as an error | Works |
+| `OCU_OPENCL_LIBRARY` | file path | Library the OpenCL backend opens. If unset, `libOpenCL.so.1` | Works |
+| `OCU_OPENCL_VERBOSE` | `1` | Reasons for missing devices, build failure logs | Works |
+| `OCU_NPUSIM_SCRATCH_KB` | integer | npusim on-chip memory size. Default 256 | Works |
+| `OCU_NPUSIM_TILING` | `0`, `1` | npusim matrix multiply tiling. Default 1 | Works |
+| `OCU_NPUSIM_DTYPES` | subset of `f32,f16,bf16` | Input data types npusim accepts. Default all three | Works |
+| `OCU_NPUSIM_PLAN_MS` | integer | Time npusim waits per plan (imitates compilation). Default 0 | Works |
+| `OCU_NPUSIM_MEM_MB` | integer | npusim device memory size. Default 256 | Works |
+| `OCU_NPUSIM_REPORT` | `1` | Print npusim totals to standard error when the device closes | Works |
+| `OCU_LOG` | `0` to `3` | Log level | Planned |
 
-## 9. 빌드 대상
+## 9. Build targets
 
-| 대상 | 종류 | 내용 |
+| Target | Kind | Content |
 |---|---|---|
-| `ocu_backend_interface` | 헤더만 | 장치 연결 층 규격 |
-| `ocu_backend_cpu` | 정적 라이브러리 | CPU 백엔드 |
-| `ocu_core` | 정적 라이브러리 | 백엔드 등록과 선택 |
-| `smoke_registry` | 시험 | 등록 |
-| `test_cpu_backend` | 시험 | CPU 백엔드 동작. 기본·무작위·엄격·64스레드 네 가지로 실행 |
-| `test_cpu_regressions` | 시험 | 검토에서 나온 문제의 회귀 시험 |
-| `test_probe_cpu` | 시험 | 고치지 않은 `.cu` 세 파일을 CPU에서 실행 |
-| `ocu_cudart` | 정적 라이브러리 | 실행 API |
-| `rt_api`, `rt_lang`, `rt_mem`, `rt_misc`, `rt_fp16`, `rt_review` | 시험 | 보통의 CUDA 프로그램으로 쓴 실행 API·언어·반정밀도 시험 |
-| `install_package` | 시험 | 설치한 패키지로 바깥 프로젝트를 빌드·실행 |
-| `ocu_cublas_cpu`, `ocu_cublas_nvidia` | 정적 라이브러리 | `cublas_v2.h` 구현, 대상별 변형(4장) |
-| `cublas_cpu*`, `gpu_cublas_*`, `conformance_cublas_cpu*`, `gpu_conformance_cublas` | 시험 | `cublas_v2.h`의 정확도(고정밀 기준)와 기준 사례, CPU와 NVIDIA GPU(장치가 없으면 건너뜀) |
-| `bench_cublas` | 측정 | NVIDIA GPU의 GEMM 처리량(중앙값·90% 구간) |
+| `ocu_backend_interface` | Header only | Device interface layer spec |
+| `ocu_backend_cpu` | Static library | CPU backend |
+| `ocu_core` | Static library | Backend registration and selection |
+| `smoke_registry` | Test | Registration |
+| `test_cpu_backend` | Test | CPU backend behavior. Run in four modes: default, random, strict, 64 threads |
+| `test_cpu_regressions` | Test | Regression tests for problems found in review |
+| `test_probe_cpu` | Test | Runs three unmodified `.cu` files on the CPU |
+| `ocu_cudart` | Static library | Execution API |
+| `rt_api`, `rt_lang`, `rt_mem`, `rt_misc`, `rt_fp16`, `rt_review` | Test | Execution API, language, and half-precision tests written as ordinary CUDA programs |
+| `install_package` | Test | Builds and runs an outside project with the installed package |
+| `ocu_cublas_cpu`, `ocu_cublas_nvidia` | Static library | `cublas_v2.h` implementation, per-target variants (section 4) |
+| `cublas_cpu*`, `gpu_cublas_*`, `conformance_cublas_cpu*`, `gpu_conformance_cublas` | Test | Accuracy of `cublas_v2.h` (high-precision reference) and reference cases, on the CPU and on an NVIDIA GPU (skipped if there is no device) |
+| `bench_cublas` | Benchmark | GEMM throughput on an NVIDIA GPU (median and 90% range) |
 
-설치: `cmake --install <빌드 폴더> --prefix <위치>`가 라이브러리, 공개 헤더(한 폴더에 모아 `<cuda_runtime.h>`가 우리 것을 찾게 함), CPU 경로 드라이버, CMake 패키지를 놓는다. 다른 프로젝트는 `find_package(Ocu)` 뒤 `ocu::cudart`와 `ocu_add_cpu_cu_executable()`를 쓴다.
+Install: `cmake --install <build folder> --prefix <location>` places the libraries, the public headers (gathered in one folder so that `<cuda_runtime.h>` finds ours), the CPU-path driver, and the CMake package. Other projects use `ocu::cudart` and `ocu_add_cpu_cu_executable()` after `find_package(Ocu)`.
 
-빌드 옵션: `OCU_BACKEND_CPU`(기본 켬), `OCU_BACKEND_NPUSIM`(기본 켬, 등록 순서가 마지막이라 기본 선택이 되지 않음), `OCU_BACKEND_AMD`, `OCU_BACKEND_INTEL`(아직 없음, 켜면 오류), `OCU_BACKEND_OPENCL`(리눅스에서 기본 켬), `OCU_BUILD_TESTS`(기본 켬), `OCU_CPU_UCONTEXT`(기본 끔).
+Build options: `OCU_BACKEND_CPU` (default on), `OCU_BACKEND_NPUSIM` (default on; it is registered last, so it is never the default choice), `OCU_BACKEND_AMD`, `OCU_BACKEND_INTEL` (do not exist yet; turning them on is an error), `OCU_BACKEND_OPENCL` (default on for Linux), `OCU_BUILD_TESTS` (default on), `OCU_CPU_UCONTEXT` (default off).
 
-전체 검증은 `tools/check.sh` 하나로 한다. gcc·clang 빌드(경고는 실패), 주소·정의되지 않은 동작·스레드 검사, ARM64 교차 빌드와 에뮬레이터(qemu-user) 실행(도구가 있을 때), 채점기 시험, 컴파일러 실험, 클린룸 점검을 돈다.
+Run the full verification with the single script `tools/check.sh`. It runs gcc and clang builds (warnings fail), address, undefined-behavior, and thread sanitizer runs, an ARM64 cross build with emulator (qemu-user) runs (when the tools are present), the scorer tests, the compiler experiments, and a clean-room check.
 
-## 10. 적합성 시험
+## 10. Conformance tests
 
-- `conformance/suites/`는 등급별 폴더다: L1 빌드, L2 실행 API, L3 언어 기능, L4 라이브러리, L5 응용.
-- `conformance/harness/ocu_conf/`는 채점 규칙과 결과 기록 형식이다. 파이썬 표준 라이브러리만 쓴다.
-- 결과 기록은 실행 한 번에 JSON 파일 하나다. 형식은 `conformance/README.md`에 있다.
-- 속도는 중앙값과 느린 10% 구간, 가장 느린 시험의 이름으로 보고한다. 평균만 내지 않는다.
-- 시험은 사용자와 같은 표면만 쓴다(3장).
+- `conformance/suites/` has one folder per level: L1 build, L2 execution API, L3 language features, L4 libraries, L5 applications.
+- `conformance/harness/ocu_conf/` holds the scoring rules and the result record format. It uses only the Python standard library.
+- A result record is one JSON file per run. The format is in `conformance/README.md`.
+- Speed is reported as the median, the slowest-10% range, and the name of the slowest test. We do not report the mean alone.
+- Tests use only the same surface as users (section 3).
 
-## 11. 새 칩을 붙이는 절차
+## 11. Steps to add a new chip
 
-1. `backends/<이름>/`에 `ocu_backend` 표를 채운 구현을 둔다.
-2. `backends/CMakeLists.txt`에 옵션과 폴더를 더한다.
-3. `runtime/core/registry.c`의 등록 목록에 한 줄을 더한다.
-4. 장치 코드를 만드는 방법을 `compiler/`에 더한다.
-5. 적합성 시험을 그 칩에서 돌린다.
+1. Put an implementation that fills in the `ocu_backend` table in `backends/<name>/`.
+2. Add the option and the folder to `backends/CMakeLists.txt`.
+3. Add one line to the registration list in `runtime/core/registry.c`.
+4. Add a way to produce device code in `compiler/`.
+5. Run the conformance tests on that chip.
 
-`runtime`, `libs`, `conformance`를 고쳐야 했다면 규격에 빈 곳이 있다는 뜻이다. 규격을 고치고 `OCU_BACKEND_ABI`를 올린다.
+If you had to change `runtime`, `libs`, or `conformance`, the spec has a gap. Fix the spec and raise `OCU_BACKEND_ABI`.
 
-## 12. 아직 정하지 않은 것
+## 12. Still undecided
 
-| 항목 | 정할 시점 |
+| Item | When to decide |
 |---|---|
-| 접두어 `ocu`와 공개 이름 | 공개 전 |
-| 사용자에게 보이는 헤더의 작성 방식 | 법률 검토 뒤 |
-| 장치 코드 묶음의 형식과 등록 기록의 모양 | 컴파일러 동작 확인 뒤 |
-| 0단계에서 AMD 백엔드를 칩 회사 런타임의 어느 층 위에 올릴지 | 장비 설치 뒤 |
-| CPU 백엔드의 실행 단위 구현 방법 | CPU 백엔드 구현을 시작할 때 |
-| 문서와 주석의 언어 | 공개 전 |
+| The prefix `ocu` and public names | Before release |
+| How to write the headers users see | Before release |
+| The format of the device code bundle and the shape of the registration record | After the compiler behavior is confirmed |
+| In phase 0, on which layer of the chip vendor's runtime to build the AMD backend | After the hardware is installed |
+| How to implement the execution unit of the CPU backend | When work on the CPU backend starts |
+| The language of docs and comments | Before release |

@@ -1,33 +1,35 @@
-# 자료 허용 목록
+# Source Allowlist
 
-이 저장소의 코드는 공개된 자료만 보고 독자적으로 만든다. 사람과 AI 에이전트 모두 이 목록을 따른다.
+**English** · [한국어](ALLOWLIST.ko.md)
 
-상태: 초안. 법률 검토 결과에 따라 확정한다.
+The code in this repository is written independently, using only public material. All contributors follow this list.
 
-## 볼 수 있는 것
+Status: draft.
 
-- 엔비디아가 공개한 문서: 함수 설명, 프로그래밍 안내서, 공개된 규격 문서
-- 허용적 라이선스로 공개된 소스: 기반 컴파일러, 칩 회사의 공개 런타임과 라이브러리
-- 표준 문서, 논문, 교과서
-- 우리가 짠 프로그램을 엔비디아 장비에서 실행해 얻은 입력·출력·시간 (법률 검토 뒤부터)
+## What you may look at
 
-새 자료가 필요하면 이 목록에 먼저 추가하고 쓴다.
+- Documents published by NVIDIA: function descriptions, programming guides, published specification documents
+- Source released under a permissive license: the base compiler, and the public runtimes and libraries of chip vendors
+- Standards documents, papers, textbooks
+- Inputs, outputs, and timings obtained by running programs we wrote on NVIDIA hardware
 
-## 하지 않는 것
+If you need a new source, add it to this list first, then use it.
 
-- 엔비디아가 배포한 프로그램과 라이브러리를 뜯어보는 것: 역어셈블, 역컴파일, 내부 동작 추적
-- 엔비디아의 헤더, 예제, 소스를 복사하거나 옆에 두고 옮겨 적는 것
-- 엔비디아 도구가 만든 결과물을 분석해 다른 칩용으로 바꾸는 것
-- 복제 제한이 강한 라이선스의 코드를 복사하는 것
-- 출처를 알 수 없는 코드를 넣는 것
+## What you must not do
 
-## 기록
+- Take apart programs and libraries distributed by NVIDIA: disassembly, decompilation, tracing internal behavior
+- Copy NVIDIA headers, examples, or source, or transcribe them while looking at them
+- Analyze output produced by NVIDIA tools and convert it for other chips
+- Copy code under a license with strong copying restrictions
+- Add code of unknown origin
 
-- 구현 변경에는 근거가 된 공개 문서를 남긴다. 커밋 메시지의 `Spec-Source:` 줄에 적는다.
-- 가져다 쓰는 외부 부품과 그 라이선스는 `docs/third-party.md`에 적는다.
+## Records
 
-## 허용한 자료
+- For an implementation change, record the public document it is based on. Put it on the `Spec-Source:` line of the commit message.
+- List the external components we use and their licenses in `docs/third-party.md`.
 
-| 자료 | 주소 | 추가한 날 |
+## Allowed sources
+
+| Source | Address | Date added |
 |---|---|---|
-| (법률 검토 뒤 채운다) | | |
+| (none yet) | | |
