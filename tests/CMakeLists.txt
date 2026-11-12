@@ -161,6 +161,18 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
     add_executable(test_metal_backend backend/test_metal_backend.c)
     target_link_libraries(test_metal_backend PRIVATE ocu_backend_metal)
     add_test(NAME metal_backend COMMAND test_metal_backend)
+    # CUDA kernels translated to MSL by cu2msl.py (with the C++ compiler's
+    # CUDA front end), then run on the GPU. Translation happens in the test,
+    # so a compiler without CUDA support fails this test, not the build.
+    add_executable(test_metal_cu2msl backend/test_metal_cu2msl.c)
+    target_link_libraries(test_metal_cu2msl PRIVATE ocu_backend_metal)
+    add_test(NAME metal_cu2msl COMMAND ${CMAKE_COMMAND}
+      -DPY=${Python3_EXECUTABLE} -DCLANG=${CMAKE_CXX_COMPILER}
+      -DTOOL=${PROJECT_SOURCE_DIR}/compiler/metal/cu2msl.py
+      -DSRC=${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu
+      -DIMG=${CMAKE_CURRENT_BINARY_DIR}/probe_kernel.metal.img
+      -DRUN=$<TARGET_FILE:test_metal_cu2msl>
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/backend/metal_cu2msl_test.cmake)
   endif()
 
   # Device math library, compiled for the host, against long double.
