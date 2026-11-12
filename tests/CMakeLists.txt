@@ -141,6 +141,13 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
     ${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu)
   add_test(NAME ocu_cc_cpu_saxpy COMMAND ocu_cc_saxpy)
 
+  # The installed package works for a project outside this tree.
+  add_test(NAME install_package
+    COMMAND ${CMAKE_COMMAND} -DBUILD=${PROJECT_BINARY_DIR}
+            -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/install
+            -DWORK=${CMAKE_CURRENT_BINARY_DIR}/install_test
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/install/install_test.cmake)
+
   # GPU-target compiles need an LLVM clang with the NVPTX and AMDGPU
   # back ends (Apple's clang has neither).
   find_program(OCU_CLANGXX NAMES clang++-18 clang++ PATHS /usr/lib/llvm-18/bin)
