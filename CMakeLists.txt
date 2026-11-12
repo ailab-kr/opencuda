@@ -20,6 +20,7 @@ endif()
 add_subdirectory(backends)
 add_subdirectory(runtime)
 add_subdirectory(libs)
+add_subdirectory(tuning)
 
 if(OCU_BUILD_TESTS)
   enable_testing()
