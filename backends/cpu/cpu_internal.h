@@ -42,6 +42,7 @@ const cpu_config *cpu_get_config(void);
 #define CPU_MAX_GRID_Z            65535u
 #define CPU_MAX_SHARED_BYTES      (48u * 1024u)
 #define CPU_ALLOC_ALIGN           256u
+#define CPU_SHARED_ALIGN          64u
 
 /* ---- objects ---------------------------------------------------------- */
 
@@ -69,12 +70,14 @@ struct ocu_marker {
     pthread_cond_t  done_cv;
     marker_state    state;
     uint64_t        generation; /* bumped by every record */
+    uint64_t        completed;  /* highest generation whose record ran */
     double          time_ms;    /* monotonic clock when it completed */
 };
 
 typedef struct cpu_op cpu_op;
 
 struct ocu_queue {
+    ocu_queue      *next_live;  /* list of live queues, under g_queues_lock */
     pthread_mutex_t lock;
     pthread_cond_t  work_cv;   /* worker waits for ops */
     pthread_cond_t  idle_cv;   /* syncers wait for an empty, idle queue */
@@ -128,5 +131,11 @@ ocu_status cpu_marker_elapsed_ms(ocu_marker *start, ocu_marker *end,
                                  float *milliseconds);
 
 double cpu_now_ms(void);
+
+/* Wait until every live queue is empty and idle (errors stay sticky). */
+void cpu_queues_drain(void);
+
+/* True while the calling thread is running a kernel body. */
+bool cpu_in_kernel(void);
 
 #endif /* OCU_CPU_INTERNAL_H */

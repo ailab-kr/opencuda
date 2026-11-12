@@ -25,6 +25,9 @@ extern "C" {
 
 #define OCU_BACKEND_ABI 1u
 
+/* Largest total size of one launch's argument values, in bytes. */
+#define OCU_MAX_ARG_BYTES 32768u
+
 /* ---- status --------------------------------------------------------- */
 
 typedef enum ocu_status {
@@ -95,6 +98,9 @@ typedef struct ocu_backend {
      * device pointer inside the same allocation, because user code does
      * pointer arithmetic on them.
      * `queue == NULL` means: run synchronously and return when done.
+     * mem_free and host_free_pinned first wait for all queued work on the
+     * device, so memory still used by queued work is never released early
+     * (the same promise as an implicit device synchronize).
      */
     ocu_status (*mem_alloc)(ocu_device *dev, size_t bytes, void **ptr);
     ocu_status (*mem_free)(ocu_device *dev, void *ptr);
@@ -132,7 +138,10 @@ typedef struct ocu_backend {
      * execution
      * Argument values are copied before kernel_launch returns, so the caller
      * may reuse `params->args` storage right away. `queue == NULL` runs the
-     * kernel to completion before returning.
+     * kernel to completion before returning. The argument values may total
+     * at most OCU_MAX_ARG_BYTES. Calling kernel_launch, queue_sync,
+     * queue_destroy or marker_wait from inside a running kernel returns
+     * OCU_ERR_NOT_SUPPORTED.
      */
     ocu_status (*kernel_launch)(ocu_queue *queue, ocu_kernel *kernel,
                                 const ocu_launch_params *params);
@@ -140,7 +149,8 @@ typedef struct ocu_backend {
     /*
      * markers
      * A marker that was never recorded is complete: query returns OCU_OK and
-     * wait returns at once. elapsed_ms needs two recorded, completed markers
+     * wait returns at once. wait waits for the record that was current when
+     * wait was called; recording again meanwhile does not extend the wait. elapsed_ms needs two recorded, completed markers
      * (OCU_ERR_INVALID_HANDLE if either was never recorded, OCU_ERR_NOT_READY
      * if either is still pending).
      */

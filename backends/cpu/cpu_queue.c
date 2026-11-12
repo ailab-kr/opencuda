@@ -48,11 +48,14 @@ static void marker_unref(ocu_marker *m)
 static void marker_complete(ocu_marker *m, uint64_t generation)
 {
     pthread_mutex_lock(&m->lock);
+    if (generation > m->completed) {
+        m->completed = generation;
+    }
     if (m->generation == generation) { /* a later record supersedes this one */
         m->state = MARKER_DONE;
         m->time_ms = cpu_now_ms();
-        pthread_cond_broadcast(&m->done_cv);
     }
+    pthread_cond_broadcast(&m->done_cv);
     pthread_mutex_unlock(&m->lock);
 }
 
@@ -90,8 +93,13 @@ ocu_status cpu_marker_wait(ocu_marker *m)
     if (m == NULL) {
         return OCU_ERR_INVALID_HANDLE;
     }
+    if (cpu_in_kernel()) {
+        return OCU_ERR_NOT_SUPPORTED;
+    }
     pthread_mutex_lock(&m->lock);
-    while (m->state == MARKER_PENDING) {
+    /* Wait for the record current at this call, not later ones. */
+    uint64_t target = m->generation;
+    while (m->state == MARKER_PENDING && m->completed < target) {
         pthread_cond_wait(&m->done_cv, &m->lock);
     }
     pthread_mutex_unlock(&m->lock);
@@ -206,6 +214,27 @@ static void op_free(cpu_op *op)
 
 /* ---- queues --------------------------------------------------------------- */
 
+static pthread_mutex_t g_queues_lock = PTHREAD_MUTEX_INITIALIZER;
+static ocu_queue      *g_queues;
+
+static void wait_idle_locked(ocu_queue *q)
+{
+    while (q->head != NULL || q->running) {
+        pthread_cond_wait(&q->idle_cv, &q->lock);
+    }
+}
+
+void cpu_queues_drain(void)
+{
+    pthread_mutex_lock(&g_queues_lock);
+    for (ocu_queue *q = g_queues; q != NULL; q = q->next_live) {
+        pthread_mutex_lock(&q->lock);
+        wait_idle_locked(q);
+        pthread_mutex_unlock(&q->lock);
+    }
+    pthread_mutex_unlock(&g_queues_lock);
+}
+
 static void *queue_worker(void *arg)
 {
     ocu_queue *q = arg;
@@ -285,6 +314,10 @@ ocu_status cpu_queue_create(ocu_device *dev, ocu_queue **queue)
         free(q);
         return OCU_ERR_OUT_OF_MEMORY;
     }
+    pthread_mutex_lock(&g_queues_lock);
+    q->next_live = g_queues;
+    g_queues = q;
+    pthread_mutex_unlock(&g_queues_lock);
     *queue = q;
     return OCU_OK;
 }
@@ -295,6 +328,17 @@ ocu_status cpu_queue_destroy(ocu_queue *q)
     if (q == NULL) {
         return OCU_ERR_INVALID_HANDLE;
     }
+    if (cpu_in_kernel()) {
+        return OCU_ERR_NOT_SUPPORTED;
+    }
+    pthread_mutex_lock(&g_queues_lock);
+    for (ocu_queue **pp = &g_queues; *pp != NULL; pp = &(*pp)->next_live) {
+        if (*pp == q) {
+            *pp = q->next_live;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_queues_lock);
     pthread_mutex_lock(&q->lock);
     q->stopping = true;
     pthread_cond_signal(&q->work_cv);
@@ -312,10 +356,11 @@ ocu_status cpu_queue_sync(ocu_queue *q)
     if (q == NULL) {
         return OCU_ERR_INVALID_HANDLE;
     }
-    pthread_mutex_lock(&q->lock);
-    while (q->head != NULL || q->running) {
-        pthread_cond_wait(&q->idle_cv, &q->lock);
+    if (cpu_in_kernel()) {
+        return OCU_ERR_NOT_SUPPORTED;
     }
+    pthread_mutex_lock(&q->lock);
+    wait_idle_locked(q);
     ocu_status st = q->sticky;
     q->sticky = OCU_OK;
     pthread_mutex_unlock(&q->lock);
@@ -411,13 +456,16 @@ ocu_status cpu_mem_set(ocu_device *dev, ocu_queue *queue, void *dst,
 
 /* ---- launches ------------------------------------------------------------- */
 
-#define ARG_ALIGN 16u
+#define ARG_ALIGN 64u /* covers alignas(N) arguments up to 64 */
 
 ocu_status cpu_kernel_launch(ocu_queue *queue, ocu_kernel *kernel,
                              const ocu_launch_params *p)
 {
     if (kernel == NULL || kernel->fn == NULL) {
         return OCU_ERR_INVALID_HANDLE;
+    }
+    if (cpu_in_kernel()) {
+        return OCU_ERR_NOT_SUPPORTED; /* launch from inside a kernel */
     }
     ocu_status st = cpu_check_launch(p);
     if (st != OCU_OK) {
@@ -436,6 +484,7 @@ ocu_status cpu_kernel_launch(ocu_queue *queue, ocu_kernel *kernel,
     }
     size_t table = (size_t)p->num_args * sizeof(void *);
     table = (table + ARG_ALIGN - 1) & ~(size_t)(ARG_ALIGN - 1);
+    /* cpu_check_launch bounded the sizes, so these sums cannot overflow. */
     unsigned char *storage = aligned_alloc(ARG_ALIGN, table + total + ARG_ALIGN);
     if (storage == NULL) {
         return OCU_ERR_OUT_OF_MEMORY;

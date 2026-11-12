@@ -124,6 +124,11 @@ static ocu_status tracked_free(alloc_table *t, void *ptr)
     if (ptr == NULL) {
         return OCU_OK;
     }
+    if (cpu_in_kernel()) {
+        return OCU_ERR_NOT_SUPPORTED;
+    }
+    /* Queued work may still read or write this memory. */
+    cpu_queues_drain();
     pthread_mutex_lock(&g_mem_lock);
     bool found = table_remove(t, (uintptr_t)ptr);
     pthread_mutex_unlock(&g_mem_lock);
