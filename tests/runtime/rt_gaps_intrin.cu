@@ -122,9 +122,9 @@ static unsigned ref_perm(unsigned x, unsigned y, unsigned s)
     for (int k = 0; k < 4; ++k) { bytes[k] = (x >> (8 * k)) & 0xff; bytes[4 + k] = (y >> (8 * k)) & 0xff; }
     unsigned r = 0;
     for (int k = 0; k < 4; ++k) {
-        unsigned nib = (s >> (4 * k)) & 0xf;
+        // Public docs: selector n is s bits [4n+2:4n]; bit 3 of each nibble and bits 16..31 are unused.
+        unsigned nib = (s >> (4 * k)) & 0x7;
         unsigned char b = bytes[nib & 7];
-        if (nib & 8) b = (b & 0x80) ? 0xff : 0x00; // replicate the sign bit
         r |= (unsigned)b << (8 * k);
     }
     return r;
@@ -137,7 +137,7 @@ static void test_perm_mulhi()
     // all 65536 selectors on fixed data (the 16 low bits are the selector)
     for (unsigned sel = 0; sel < 65536; ++sel) { x.push_back(0x03020100u); y.push_back(0x07060504u); s.push_back(sel); }
     for (unsigned sel = 0; sel < 65536; ++sel) { x.push_back(0x80ff7f01u); y.push_back(0x7e81fe00u); s.push_back(sel); }
-    for (int i = 0; i < 100000; ++i) { x.push_back(g()); y.push_back(g()); s.push_back(g() & 0xffff); }
+    for (int i = 0; i < 100000; ++i) { x.push_back(g()); y.push_back(g()); s.push_back(g()); }
     // products
     unsigned sp[] = {0u, 1u, 2u, 0x7fffffffu, 0x80000000u, 0x80000001u, 0xffffffffu, 0xfffffffeu, 0x10000u, 0xffffu};
     for (unsigned p : sp)
@@ -166,6 +166,8 @@ static void test_perm_mulhi()
     CHECK(bu == 0);
     CHECK(bs == 0);
     CHECK(out[0x5432] == 0x05040302u); // the documented example
+    CHECK(out[0xfedc] == out[0x7654]);  // bit 3 of each selector nibble is unused: no sign replication
+    CHECK(out[0x8888] == out[0x0000]);
     unsigned idx = 65536 + 65536 + 100000; // first product pair is (0, 0)
     (void)idx;
     // umulhi(0xffffffff, 0x80000000) = 0x7fffffff
@@ -188,19 +190,11 @@ __global__ void k_f2i(const float *f, const double *d, int *o, int n)
     o[8 * i + 3] = __float2int_ru(f[i]);
     o[8 * i + 4] = __double2int_rn(d[i]);
     o[8 * i + 5] = __double2int_rz(d[i]);
-#ifdef OCU_CPU_PATH // the NVPTX header lacks the _rd/_ru double forms: see cg_compile_checks
     o[8 * i + 6] = __double2int_rd(d[i]);
     o[8 * i + 7] = __double2int_ru(d[i]);
-#else
-    o[8 * i + 6] = o[8 * i + 7] = 0;
-#endif
 }
 
-#ifdef OCU_CPU_PATH
 #define KMAX 8
-#else
-#define KMAX 6
-#endif
 
 static int sat(double v)
 {
@@ -240,9 +234,6 @@ static void test_float2int()
         int want[8] = {sat(std::nearbyint(fv)), sat(std::trunc(fv)), sat(std::floor(fv)), sat(std::ceil(fv)),
                        sat(std::nearbyint(dv)), sat(std::trunc(dv)), sat(std::floor(dv)), sat(std::ceil(dv))};
         for (int k = 0; k < 8; ++k) {
-#ifndef OCU_CPU_PATH
-            if (k >= 6) continue;
-#endif
             if (o[8 * i + k] != want[k]) {
                 if (bad++ < 8) std::printf("  mode %d of f=%a d=%a: got %d want %d\n", k, fv, dv, o[8 * i + k], want[k]);
             }
