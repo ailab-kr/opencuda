@@ -806,6 +806,7 @@ class Translator:
                 rid = ref.get("id")
                 if rid in self.globals:
                     g = self.global_info(rid)
+                    g["used"] = True
                     cb, ce = self.edit_span(n, st, f"use of '{ref.get('name')}'")
                     st["edits"].append((cb, ce, g["expr"]))
                 elif rid in self.dyn_shared:
@@ -1042,17 +1043,35 @@ class Translator:
         return g
 
     def place_globals(self) -> list[str]:
-        # every variable gets a place: the host may copy to any of them
-        for gid in self.globals:
-            self.global_info(gid)
+        """Offsets in the module buffer. Every variable the device code uses
+        gets a place, and every other one that can be translated (the host
+        may copy to it); one that cannot is left out with a warning (the
+        host then gets "not found" for it)."""
+        def drop(gid, e):
+            g = self.globals[gid]
+            if g.get("used"):
+                raise e
+            print(f"{self.src}: warning: left out variable '{g['node']['name']}': {e}", file=sys.stderr)
+            del self.globals[gid]
+
+        for gid in list(self.globals):
+            try:
+                self.global_info(gid)
+            except TranslateError as e:
+                drop(gid, e)
         self.probe_layouts([g["type"] for g in self.globals.values()])
+        for gid, g in list(self.globals.items()):
+            try:
+                g["init_data"] = self.init_bytes(g["node"], g["type"], self.layout[g["type"]][0])
+            except TranslateError as e:
+                drop(gid, e)
         off, lines = 0, []
         for gid, g in self.globals.items():
             size, align = self.layout[g["type"]]
             off = (off + align - 1) // align * align
             g["offset"], g["size"] = off, size
             lines.append(f"global {g['symbol']} {off} {size}")
-            data = self.init_bytes(g["node"], g["type"], size)
+            data = g["init_data"]
             if data and any(data):
                 lines.append(f"init {off} {data.hex()}")
             off += size
@@ -1286,6 +1305,8 @@ class Translator:
             raise TranslateError("no kernel could be translated")
         meta = []
         glines = self.place_globals() if self.globals else []
+        if not glines and any("ocu_glob [[buffer(2)]]" in i.head for i in self.order):
+            glines = ["global ocu_no_variables 0 4"]  # every variable left out: buffer 2 stays bound
         params = [i.param_line for i in self.order if i.param_line]
         # code, then the declarations it names (fixed point over identifiers)
         # callees before callers (an instance is complete after the ones it calls)
@@ -1328,6 +1349,12 @@ class Translator:
                     except TranslateError as e:
                         # Found by name only: the code may not need it. If it
                         # does, the Metal compiler stops at the missing name.
+                        # Types of kernel arguments and variables are needed.
+                        required = set(self.asserts)
+                        for gv in self.globals.values():
+                            required |= set(re.findall(r"[A-Za-z_]\w*", gv.get("type", "")))
+                        if g["names"] & required:
+                            raise
                         names = ", ".join(sorted(g["names"] & tokens))
                         print(f"{self.src}: warning: left out {names}: {e}", file=sys.stderr)
                         texts[i] = f"// cu2msl: left out {names}: {e}"
