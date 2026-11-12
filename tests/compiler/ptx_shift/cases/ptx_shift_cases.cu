@@ -3,14 +3,17 @@
 // is; the warning must name that file and line.
 //
 //  0  nothing to report (control)
-//  1  operands passed to a macro:            ((a) << (b))          warns
+//  1  operands passed to a macro whose body has the parentheses: ((a) << (b))
+//     the body is rewritten, no report (card: "매크로", accepted 2026-11-13)
 //  2  an operand that is itself a macro:     x << AMOUNT           warns
 //  3  device code in a file outside the source's folder (-I)       warns
 //  4  compound shift of a bit-field:         s.f <<= n             warns
 //  5  no warnings: whole expression in one macro body, literal
 //     amount below 32, ordinary shifts
 //  6  constexpr with an out-of-range amount (ill-formed C++): exit 1
-//  8  split between a macro and a local header                      warns
+//  8  the same macro form in a local header: rewritten, no report
+//  9  `#define SH(x) x << k`: the operand starts with an argument: left, reported
+// (case 10: ptx_shift_cases_if.cu)
 // The host function host_args uses the same macro; host code is never
 // changed, so it is never reported (it must not add a second warning).
 #include <cuda_runtime.h>
@@ -20,6 +23,7 @@
 #define SHL_ARGS(a, b) ((a) << (b))
 #define AMOUNT 40
 #define WHOLE (v << n)
+#define SH(x) x << k_amount
 
 struct BitsS {
     unsigned f : 5;
@@ -53,6 +57,9 @@ __global__ void k(unsigned *o, int n)
     o[0] = a;
 #elif CASE == 8
     o[0] = header_partial(v, n);
+#elif CASE == 9
+    unsigned k_amount = 3;
+    o[0] = SH(v); // MARK9
 #else
     o[0] = v + (unsigned)n;
 #endif

@@ -185,8 +185,8 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
               -DOUT=${CMAKE_CURRENT_BINARY_DIR}/${name}.${A_OUTEXT} ${A_DEFS}
               -P ${_psdir}/ptx_shift_cmd.cmake)
   endfunction()
-  foreach(c "1|warn|ptx_shift_cases.cu" "2|warn|ptx_shift_cases.cu" "3|warn|outside_shift.h"
-            "4|warn|ptx_shift_cases.cu" "8|warn|ptx_shift_cases.h" "5|quiet|-" "0|quiet|-" "6|error|-")
+  foreach(c "2|warn|ptx_shift_cases.cu" "3|warn|outside_shift.h"
+            "4|warn|ptx_shift_cases.cu" "9|warn|ptx_shift_cases.cu" "1|quiet|-" "8|quiet|-" "5|quiet|-" "0|quiet|-" "6|error|-")
     string(REPLACE "|" ";" c "${c}")
     list(GET c 0 cn)
     list(GET c 1 cx)
@@ -194,6 +194,8 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
     ocu_ptx_shift_cmd(ptx_shift_cmd_case${cn}_${cx}_cpu cpu DEFS -DMODE=warn -DCASE=${cn} -DEXPECT=${cx} -DMARK_FILE=${cf})
   endforeach()
   # Without the option the same sources compile and say nothing.
+  ocu_ptx_shift_cmd(ptx_shift_cmd_case10_warn_cpu cpu DEFS -DMODE=warn -DCASE=10 -DEXPECT=warn -DMARK_FILE=ptx_shift_cases_if.cu -DSRC_NAME=ptx_shift_cases_if.cu)
+  ocu_ptx_shift_cmd(ptx_shift_cmd_unsupported_opencl cpu DEFS -DMODE=unsupported -DARGS=--target|opencl)
   ocu_ptx_shift_cmd(ptx_shift_cmd_case1_no_option_cpu cpu DEFS -DMODE=warn -DCASE=1 -DEXPECT=quiet -DNO_OPTION=1)
   ocu_ptx_shift_cmd(ptx_shift_cmd_print_cpu cpu DEFS -DMODE=print)
   ocu_ptx_shift_cmd(ptx_shift_cmd_unsupported_amd cpu DEFS -DMODE=unsupported -DARGS=--target|amd)
@@ -464,14 +466,15 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
                 -DOUT=${CMAKE_CURRENT_BINARY_DIR}/cg_case${cn}_nvidia.o -DTARGET=nvidia -DCASE=${cn} -DEXPECT=${cx}
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/runtime/compile_case.cmake)
     endforeach()
-    foreach(c "1|warn|ptx_shift_cases.cu" "2|warn|ptx_shift_cases.cu" "3|warn|outside_shift.h"
-              "4|warn|ptx_shift_cases.cu" "8|warn|ptx_shift_cases.h" "5|quiet|-" "0|quiet|-" "6|error|-")
+    foreach(c "2|warn|ptx_shift_cases.cu" "3|warn|outside_shift.h"
+              "4|warn|ptx_shift_cases.cu" "9|warn|ptx_shift_cases.cu" "1|quiet|-" "8|quiet|-" "5|quiet|-" "0|quiet|-" "6|error|-")
       string(REPLACE "|" ";" c "${c}")
       list(GET c 0 cn)
       list(GET c 1 cx)
       list(GET c 2 cf)
       ocu_ptx_shift_cmd(ptx_shift_cmd_case${cn}_${cx}_nvidia nvidia DEFS -DMODE=warn -DCASE=${cn} -DEXPECT=${cx} -DMARK_FILE=${cf})
     endforeach()
+    ocu_ptx_shift_cmd(ptx_shift_cmd_case10_warn_nvidia nvidia DEFS -DMODE=warn -DCASE=10 -DEXPECT=warn -DMARK_FILE=ptx_shift_cases_if.cu -DSRC_NAME=ptx_shift_cases_if.cu)
     ocu_ptx_shift_cmd(ptx_shift_cmd_print_nvidia nvidia DEFS -DMODE=print)
     foreach(t "nvidia;sm_80;ptx" "amd;gfx1100;co" "amd;gfx1201;co")
       list(GET t 0 target)

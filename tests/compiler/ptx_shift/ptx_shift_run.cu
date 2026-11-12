@@ -316,7 +316,8 @@ __device__ unsigned &lgref(int id, unsigned &v, int *log, int *pos)
 // use gets the helper, host uses included (card: "식 전체가 한 매크로 본문에").
 #define SHIFT_LOCALS (val << amt)
 #define SHIFT_LOCALS_R (sval >> amt)
-// Operands come in as arguments: left as C++ (and reported), in-range only here.
+// Operands come in as arguments but the parentheses and the operator are the
+// macro's own text: the body is rewritten (card, "매크로"), whatever the arguments.
 #define SHL_ARGS(a, b) ((a) << (b))
 
 __device__ unsigned macro_dev(unsigned val, int amt) { return SHIFT_LOCALS; }
@@ -512,6 +513,8 @@ __global__ void misc_kernel(unsigned long long *res, const unsigned *u, const in
     res[k++] = (unsigned long long)macro_dev_r(-5, in[2]);  // -1
     res[k++] = (unsigned long long)macro_dev_r(5, in[2]);   // 0
     res[k++] = macro_args(3u, 4);          // in range: 48
+    res[k++] = macro_args(3u, in[2]);      // 3u << 40 = 0
+    res[k++] = macro_args(3u, in[0]);      // 3u << 32 = 0
     // templates
     res[k++] = tshl<unsigned char>(0x81, in[5]);   // 0x81 << 5 = 0x1020 -> unsigned char 0x20
     res[k++] = tshl<unsigned char>(0x81, in[2]);   // 0
@@ -709,6 +712,8 @@ static void run_misc()
         {C_MACRO, ALL, "SHIFT_LOCALS_R device, -5 >> 40"},
         {C_MACRO, 0, "SHIFT_LOCALS_R device, 5 >> 40"},
         {C_MACRO, 48, "SHL_ARGS(3u, 4) in range"},
+        {C_MACRO, 0, "SHL_ARGS(3u, 40): operands as macro arguments, body rewritten"},
+        {C_MACRO, 0, "SHL_ARGS(3u, 32)"},
     };
     for (const Row &w : macro) {
         bool ok = r[k] == w.v || (w.v == ALL && (r[k] & 0xffffffffull) == 0xffffffffull);
