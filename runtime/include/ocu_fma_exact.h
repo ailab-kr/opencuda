@@ -46,7 +46,7 @@
  * Selection: OCU_FMA_BUILTIN = 1 uses the compiler's fma builtin (the
  * instruction, or a call to the C library's fma where the target has
  * none), 0 the software path. Default, first match:
- *  - 1 in a device pass (__CUDA_ARCH__) and when the compiler says the
+ *  - 1 in an NVIDIA device pass (__NVPTX__ and __CUDA_ARCH__; the CPU path defines only __CUDA_ARCH__) and when the compiler says the
  *    target has a fused multiply-add instruction (__FP_FAST_FMA, __FMA__,
  *    __ARM_FEATURE_FMA);
  *  - OCU_LIBM_FMA_EXACT when defined: the result of the configure check
@@ -72,7 +72,7 @@
 #endif
 
 #ifndef OCU_FMA_BUILTIN
-#if defined(__CUDA_ARCH__) || defined(__FP_FAST_FMA) || defined(__FMA__) || \
+#if (defined(__NVPTX__) && defined(__CUDA_ARCH__)) || defined(__FP_FAST_FMA) || defined(__FMA__) || \
     defined(__ARM_FEATURE_FMA)
 #define OCU_FMA_BUILTIN 1
 #elif defined(OCU_LIBM_FMA_EXACT)
@@ -113,7 +113,7 @@ OCU_DM_FN float ocu_fma_flt_(uint32_t b) { union { float f; uint32_t u; } v; v.u
 #define OCU_FMA_FLT(b) ocu_fma_flt_(b)
 #endif
 
-#if !defined(__CUDA_ARCH__) && !defined(OCU_FMA_NO_SOFT)
+#if !(defined(__NVPTX__) && defined(__CUDA_ARCH__)) && !defined(OCU_FMA_NO_SOFT)
 
 /* ---- float ------------------------------------------------------------------ */
 
@@ -358,13 +358,13 @@ OCU_DM_FN double ocu_fma_soft(double a, double b, double c, int mode)
 }
 #endif /* __SIZEOF_INT128__ */
 
-#endif /* !__CUDA_ARCH__ && !OCU_FMA_NO_SOFT */
+#endif /* !__NVPTX__ && !OCU_FMA_NO_SOFT */
 
 /* ---- entry points ----------------------------------------------------------- */
 
 OCU_DM_FN float ocu_fmaf_rn(float a, float b, float c)
 {
-#if OCU_FMA_BUILTIN || defined(__CUDA_ARCH__)
+#if OCU_FMA_BUILTIN || (defined(__NVPTX__) && defined(__CUDA_ARCH__))
     return __builtin_fmaf(a, b, c);
 #elif defined(OCU_FMA_NO_SOFT)
     return __builtin_fmaf(a, b, c); /* the C library's; see OCU_FMA_NO_SOFT */
@@ -375,7 +375,7 @@ OCU_DM_FN float ocu_fmaf_rn(float a, float b, float c)
 
 OCU_DM_FN double ocu_fma_rn(double a, double b, double c)
 {
-#if OCU_FMA_BUILTIN || defined(__CUDA_ARCH__)
+#if OCU_FMA_BUILTIN || (defined(__NVPTX__) && defined(__CUDA_ARCH__))
     return __builtin_fma(a, b, c);
 #elif defined(OCU_FMA_HAVE_SOFT_DOUBLE)
     return ocu_fma_soft(a, b, c, OCU_FMA_RN);

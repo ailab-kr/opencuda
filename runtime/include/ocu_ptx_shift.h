@@ -60,7 +60,7 @@ __host__ __device__ constexpr unsigned amount(C c, unsigned width) {
     return u >= width ? width : static_cast<unsigned>(u);
 }
 
-#if defined(__CUDA_ARCH__)
+#if (defined(__NVPTX__) && defined(__CUDA_ARCH__))
 /* NVIDIA device pass: the PTX instructions clamp by themselves, so a shift
  * by an amount the compiler cannot see is one instruction (the portable
  * form below costs a compare and a select). The amount operand is .u32. */
@@ -110,7 +110,7 @@ template <class P, class C>
 __host__ __device__ constexpr P shl(P a, C c) {
     constexpr unsigned width = sizeof(P) * 8;
     using U = std::make_unsigned_t<P>;
-#if defined(__CUDA_ARCH__)
+#if (defined(__NVPTX__) && defined(__CUDA_ARCH__))
     if (use_ptx<P>(c)) {
         using W = std::conditional_t<sizeof(P) == 4, unsigned, unsigned long long>;
         return static_cast<P>(ptx_shl(static_cast<W>(static_cast<U>(a)), static_cast<unsigned>(c)));
@@ -123,7 +123,7 @@ __host__ __device__ constexpr P shl(P a, C c) {
 template <class P, class C>
 __host__ __device__ constexpr P shr(P a, C c) {
     constexpr unsigned width = sizeof(P) * 8;
-#if defined(__CUDA_ARCH__)
+#if (defined(__NVPTX__) && defined(__CUDA_ARCH__))
     if (use_ptx<P>(c)) {
         using W = std::conditional_t<
             std::is_signed<P>::value, std::conditional_t<sizeof(P) == 4, int, long long>,
