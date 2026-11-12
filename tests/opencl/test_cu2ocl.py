@@ -71,6 +71,31 @@ __global__ void k(float *o) { o[threadIdx.x] = scale[1] * counter; }""")
         self.assertIn("device uchar *ocu_glob,", src)
         self.assertIn("OCU_U3(get_local_id)", src)
 
+    def test_long_long_is_64_bits(self):
+        # OpenCL's `long long` is reserved for 128 bits; CUDA's is OpenCL's long.
+        rc, img, err = translate("__global__ void k(unsigned long long *p, long long s) {"
+                                 " unsigned long long v = p[0]; p[0] = (v << 3) + s; }")
+        self.assertEqual(rc, 0, err)
+        lines, src, _ = parse(img)
+        user = src[src.index("// ---- macros"):]
+        self.assertNotRegex(user, r"\blong\s+long\b")
+        self.assertIn("param _Z1kPyx 8 8", lines)
+
+    def test_inner_block_shared_moves_to_kernel_scope(self):
+        rc, img, err = translate("""
+__global__ void k(float *o) {
+    if (blockIdx.x == 0) {
+        __shared__ float tile[64];
+        tile[threadIdx.x] = 1.0f;
+        __syncthreads();
+        o[threadIdx.x] = tile[63 - threadIdx.x];
+    }
+}""")
+        self.assertEqual(rc, 0, err)
+        _, src, _ = parse(img)
+        body = src[src.index("kernel void _Z1kPf"):]
+        self.assertLess(body.index("threadgroup float tile[64];"), body.index("if (blockIdx.x == 0)"))
+
     @unittest.skipIf(SPIRV == "none", "no llvm-spirv")
     def test_spirv_module(self):
         rc, img, err = translate("__global__ void k(int *p) { p[blockIdx.x] = 1; }")
