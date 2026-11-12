@@ -1,0 +1,9 @@
+{
+  "comment": "Error bound for BLAS results: |actual - expected| <= factor * u * terms * scale + terms * tiny, where u is the unit roundoff of the element type (2^-24 for f32, 2^-53 for f64), and terms and scale come from the case (conformance/oracle/cases.py). Elements without a scale must match exactly. Change a factor only with a decision record.",
+  "default_factor": 2.0,
+  "per_fn": {
+    "nrm2": 4.0,
+    "trsv": 8.0,
+    "trsm": 8.0
+  }
+}
