@@ -1,6 +1,6 @@
 ---
 id: <묶음>-<이름>            # 예: blas-saxpy, runtime-malloc
-kind: library-function        # runtime-function | language-feature | library-function | app
+kind: library-function        # runtime-function | language-feature | library-function | app | component
 name: <공개 문서의 이름>
 spec_sources:
   - <공개 문서 주소와 절 이름>

@@ -43,9 +43,9 @@ int main(void)
     CHECK(info.name[0] != '\0');
     CHECK(b->dev_info(1, &info) == OCU_ERR_INVALID_DEVICE);
 
-    /* Unimplemented entries must say so, never pretend to succeed. */
+    /* A NULL device is rejected, never dereferenced. */
     void *p = NULL;
-    CHECK(b->mem_alloc(NULL, 16, &p) == OCU_ERR_NOT_IMPLEMENTED);
+    CHECK(b->mem_alloc(NULL, 16, &p) == OCU_ERR_INVALID_DEVICE);
 
     /* Registration rejects a wrong ABI, an incomplete table, a duplicate. */
     ocu_backend bad = *b;
