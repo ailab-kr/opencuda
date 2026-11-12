@@ -117,7 +117,8 @@ guard() {
     found=0
     # Build trees inside the repository (they hold installed copies of our
     # own headers) are not sources: skip every folder with a CMakeCache.txt.
-    prune=""
+    # Hidden folders (local worktrees, tool state) are not sources: skip them.
+    prune=""; for d in "$repo"/.[!.]*; do [ -d "$d" ] && prune="$prune -path $d -prune -o"; done
     for c in $(find "$repo" -path "$repo/.git" -prune -o -name CMakeCache.txt -print 2>/dev/null); do
         prune="$prune -path $(dirname "$c") -prune -o"
     done
