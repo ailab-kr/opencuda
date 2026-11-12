@@ -137,6 +137,8 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   add_test(NAME runtime_lang_random COMMAND rt_lang)
   set_tests_properties(runtime_lang_random PROPERTIES
     ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_THREADS=3;OCU_CPU_WARP=64")
+  ocu_add_cpu_cu_executable(rt_mem runtime/rt_mem.cu)
+  add_test(NAME runtime_memory COMMAND rt_mem)
   ocu_add_cpu_cu_executable(rt_review runtime/rt_review.cu)
   add_test(NAME runtime_review COMMAND rt_review)
   add_test(NAME runtime_review_random COMMAND rt_review)
