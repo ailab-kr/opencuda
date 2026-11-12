@@ -458,7 +458,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--ptx-shift", action="store_true",
                     help="shifts in device code as PTX shl/shr define them (ptx_shift.py)")
     args = ap.parse_args(argv)
-    if args.ptx_shift and (args.target == "amd" or
+    # Not available on the amd and opencl paths (OpenCL C defines shifts by
+    # the amount modulo the width, so cu2ocl.py would need its own rewrite).
+    if args.ptx_shift and (args.target in ("amd", "opencl") or
                            (args.target == "nvidia" and args.output.endswith(".ptx"))):
         print("ocu_cc: --ptx-shift is available for --target cpu and for nvidia objects, "
               "not for this output", file=sys.stderr)

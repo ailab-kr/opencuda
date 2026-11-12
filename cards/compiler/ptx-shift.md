@@ -3,14 +3,16 @@ id: compiler-ptx-shift
 kind: language-feature
 name: PTX shift semantics in device code (ocu_cc.py --ptx-shift, opt-in)
 spec_sources:
-  - PTX ISA 9.5, 9.7.9.8 "Logic and Shift Instructions: shl" (docs.nvidia.com/cuda/parallel-thread-execution, public)
-  - PTX ISA 9.5, 9.7.9.9 "Logic and Shift Instructions: shr" (same document)
-  - PTX ISA 9.5, 9.4 "Operand Type Information" (the shift amount operand is always .u32)
-  - ISO C++17 [expr.shift] (amount negative or >= width of the promoted left operand: undefined)
+  - PTX ISA 8.5, 9.7.7.8 "Logic and Shift Instructions: shl" (docs.nvidia.com/cuda/parallel-thread-execution, public; 9.7.9.8 in ISA 9.5)
+  - PTX ISA 8.5, 9.7.7.9 "Logic and Shift Instructions: shr" (same document; 9.7.9.9 in ISA 9.5)
+  - PTX ISA, 9.4 "Operand Type Information" (the shift amount operand is always .u32)
+  - ISO C++17 [expr.shift] (amount negative or >= width of the promoted left operand: undefined; /4: E1 sequenced before E2)
+  - ISO C++17 [expr.ass]/1 (in E1 op= E2, E2 sequenced before E1), [over.match.oper]/2 (an overloaded operator in operator notation keeps the built-in order)
 backend_map:
   cpu: source rewrite (compiler/probe/ptx_shift.py) + helpers (runtime/include/ocu_ptx_shift.h)
   nvidia: same rewrite (Clang's NVPTX output does not keep shl's clamping, see 메모)
   metal: not available (see 메모)
+  opencl: not available, refused (exit 2)
 state: spec
 owner_spec: AI Lab 2026-11-13
 owner_tests: (another session)
@@ -28,16 +30,19 @@ cost: { hours: 3, ai_usage: 0 }
 - `>>`, 부호 있음: 산술 옮김. 너비 이상이면 부호 비트로 채운다(0 또는 -1).
 - 음수 양은 큰 부호 없는 수이므로 너비로 줄어든다.
 - 결과의 형과 값(너비 안의 양)은 내장 연산자와 같다. `<<=`, `>>=`도 같고, 왼쪽은 한 번만 평가한다.
+- 평가 순서는 C++17 그대로다: `a << b`, `a >> b`는 a 다음 b, `a <<= b`, `a >>= b`는 b 다음 a. 그래서 바꾼 꼴은 함수 호출이 아니라 왼쪽만 감싸고 연산자를 남긴다: `__ocu_shift_lhs(a) << b`, `__ocu_shift_ref(a) <<= b`. 연산자 표기로 쓴 다중 정의 연산자는 내장 연산자의 순서를 따른다([over.match.oper]/2). `f(a, b)` 꼴이면 순서가 정해지지 않는다(처음 구현의 결함, GCC는 b 먼저, Clang `<<=`는 a 먼저였다).
 
 바꾸는 범위
 
 - `__global__`, `__device__`(그리고 `__host__ __device__`) 함수의 본문. 그 안의 람다와 템플릿 인스턴스 포함. 호스트 함수는 그대로 둔다.
-- 정수 리터럴로 32 미만만큼 옮기는 것은 그대로 둔다(C++에서도 정의됨, 비용 없음). 나머지(변수, 식, 32 이상 리터럴, 음수)는 도우미 호출로 바꾼다.
+- 정수 리터럴로 32 미만만큼 옮기는 것은 그대로 둔다(C++에서도 정의됨, 비용 없음). 나머지(변수, 식, 32 이상 리터럴, 음수)는 위 꼴로 바꾼다.
+- 매크로: 두 피연산자의 시작과 끝, 그리고 연산자가 모두 한 매크로 본문의 글자이면 그 본문을 바꾼다. 예: `#define SHL(a, b) ((a) << (b))`(괄호가 본문의 것), `#define W (v << n)`. 본문의 글자만 바뀌므로 어떤 인자로 펼쳐도 맞다. 그 매크로를 쓰는 모든 곳(호스트 포함)이 같은 의미가 된다.
 - 원본 파일과 그 폴더 아래에서 따옴표로 포함한 파일. 작업 폴더에 사본을 만들어 바꾸고 `#line`으로 원래 이름과 줄 번호를 지킨다. 원본은 고치지 않는다.
 
 그대로 두고 알리는 것(표준 C++ 유지, `ocu_cc: --ptx-shift: <파일>:<줄>: ...` 경고)
 
-- 식 일부만 매크로 안에 있는 것(매크로 인자로 들어온 피연산자, 피연산자 자체가 매크로). 식 전체가 한 매크로 본문에 있으면 본문을 바꾼다. 그러면 그 매크로를 쓰는 모든 곳(호스트 포함)이 같은 의미가 된다.
+- 피연산자의 시작이나 끝이 매크로 인자이거나 연산자와 다른 곳에 있는 것. 예: `#define SH(x) x << k`(왼쪽 피연산자가 인자 글자로 시작), `x << AMOUNT`(피연산자 자체가 매크로), 매크로와 지역 헤더에 걸친 식.
+- 위 규칙으로 바꿀 매크로가 `#if`·`#elif` 줄에도 쓰이는 것(전처리기는 감싼 꼴을 계산하지 못한다).
 - 원본 폴더 밖 파일의 장치 코드.
 - 비트 필드의 복합 대입(`s.f <<= n`): 참조로 묶을 수 없다.
 
@@ -50,7 +55,7 @@ cost: { hours: 3, ai_usage: 0 }
 
 ## 오류 코드
 
-- `--target amd`나 `.ptx` 출력에 옵션을 주면 실행하지 않고 2를 돌려준다(지원 안 함).
+- `--target amd`, `--target opencl`, `.ptx` 출력에 옵션을 주면 실행하지 않고 2를 돌려준다(지원 안 함). OpenCL C는 양을 너비로 나눈 나머지만큼 옮기므로 `cu2ocl.py`가 따로 바꿔야 한다.
 - 구문 트리를 만드는 Clang이 실패하면 1(옵션을 조용히 건너뛰지 않는다).
 
 ## 시험 목록
@@ -71,3 +76,5 @@ cost: { hours: 3, ai_usage: 0 }
 - 비용과 Rodinia 결과는 `conformance/external/rodinia/README.md`("compat").
 
 ## 이의
+
+- (구현 담당, 2026-11-13) `ptx_shift_cmd_case1_warn_*`, `ptx_shift_cmd_case8_warn_*`: `#define SHL_ARGS(a, b) ((a) << (b))`를 경고하고 그대로 두기를 기대한다. 처음 카드의 "매크로 인자로 들어온 피연산자"라는 말이 이 꼴까지 포함하는 것처럼 읽혀서 생긴 차이다. 구현은 이 꼴을 바꾸는 쪽을 택했다(위 "매크로"). 이유: 바꾸는 것은 본문의 괄호와 연산자 둘레의 글자뿐이라 인자가 무엇이든 맞다(`W` 같은 본문 전체 규칙과 같은 근거). 그대로 두면 장치 코드에서 흔한 비트 도우미 매크로가 표준 C++로 남아 이 옵션의 목적(PTX 결과)에 어긋난다. 위험한 곳(`#if` 안의 사용)은 따로 경고한다. 진짜로 걸친 꼴(`#define SH(x) x << k`)은 지금도 경고한다. 시험은 카드에 맞춰 고쳐 주기를 청한다: case 1·8은 경고 없음, 값은 옵션 켤 때 0(40만큼 옮김).
