@@ -170,7 +170,7 @@ static void enumerate_once(void)
             pthread_once_t once = PTHREAD_ONCE_INIT;
             e->warp_once = once;
             ocu_dev_info *info = &e->info;
-            strncpy(info->name, name, sizeof(info->name) - 1);
+            snprintf(info->name, sizeof(info->name), "%s", name); /* truncates, always terminated */
             cl_ulong gm = 0, lm = 0;
             a->GetDeviceInfo(d, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(gm), &gm, NULL);
             a->GetDeviceInfo(d, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(lm), &lm, NULL);
