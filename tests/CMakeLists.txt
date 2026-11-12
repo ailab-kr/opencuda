@@ -173,6 +173,17 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
       -DIMG=${CMAKE_CURRENT_BINARY_DIR}/probe_kernel.metal.img
       -DRUN=$<TARGET_FILE:test_metal_cu2msl>
       -P ${CMAKE_CURRENT_SOURCE_DIR}/backend/metal_cu2msl_test.cmake)
+    # Translator features (address-space overloads, templates, module
+    # variables, struct arguments, dynamic shared memory) on the GPU.
+    add_executable(test_metal_features metal/test_metal_features.c)
+    target_link_libraries(test_metal_features PRIVATE ocu_backend_metal)
+    add_test(NAME metal_cu2msl_features COMMAND ${CMAKE_COMMAND}
+      -DPY=${Python3_EXECUTABLE} -DCLANG=${CMAKE_CXX_COMPILER}
+      -DTOOL=${PROJECT_SOURCE_DIR}/compiler/metal/cu2msl.py
+      -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/metal/cu2msl_features.cu
+      -DIMG=${CMAKE_CURRENT_BINARY_DIR}/cu2msl_features.metal.img
+      -DRUN=$<TARGET_FILE:test_metal_features>
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/backend/metal_cu2msl_test.cmake)
   endif()
 
   # Device math library, compiled for the host, against long double.
@@ -204,6 +215,42 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
     if(_ocu_targets MATCHES "nvptx64" AND _ocu_targets MATCHES "amdgcn")
       set(OCU_CLANG_GPU_TARGETS ON)
     endif()
+  endif()
+
+  # cu2msl.py on any host (no Metal device or compiler needed): what it
+  # refuses, the shape of what it emits, and the generated MSL compiled
+  # as C++ for OpenCL against tests/metal/msl_stub.h (address spaces are
+  # checked as MSL checks them). Needs a Clang with the CUDA and C++ for
+  # OpenCL front ends.
+  set(_ocu_msl_clang "")
+  foreach(_c ${OCU_CLANGXX} ${CMAKE_CXX_COMPILER})
+    if(NOT _ocu_msl_clang)
+      execute_process(COMMAND ${_c} -x clcpp -cl-std=clc++2021 -fsyntax-only -
+                      INPUT_FILE /dev/null RESULT_VARIABLE _ocu_rc OUTPUT_QUIET ERROR_QUIET)
+      if(_ocu_rc EQUAL 0)
+        set(_ocu_msl_clang ${_c})
+      endif()
+    endif()
+  endforeach()
+  if(_ocu_msl_clang)
+    add_test(NAME metal_cu2msl_host
+      COMMAND ${CMAKE_COMMAND} -E env OCU_CLANG=${_ocu_msl_clang}
+              ${Python3_EXECUTABLE} -m unittest test_cu2msl
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/metal)
+    set(_ocu_msl_srcs
+      ${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu
+      ${PROJECT_SOURCE_DIR}/compiler/probe/probe_warp.cu
+      ${PROJECT_SOURCE_DIR}/compiler/probe/probe_features.cu
+      ${CMAKE_CURRENT_SOURCE_DIR}/metal/cu2msl_features.cu)
+    string(REPLACE ";" "|" _ocu_msl_srcs "${_ocu_msl_srcs}")
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/msl_check)
+    add_test(NAME metal_msl_check COMMAND ${CMAKE_COMMAND}
+      -DPY=${Python3_EXECUTABLE} -DCLANG=${_ocu_msl_clang}
+      -DTOOL=${PROJECT_SOURCE_DIR}/compiler/metal/cu2msl.py
+      -DCHECK=${CMAKE_CURRENT_SOURCE_DIR}/metal/msl_check.py
+      -DSRCS=${_ocu_msl_srcs} -DEXPECT=19
+      -DWORK=${CMAKE_CURRENT_BINARY_DIR}/msl_check
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/metal/msl_check_test.cmake)
   endif()
   if(OCU_CLANG_GPU_TARGETS)
     foreach(t "nvidia;sm_80;ptx" "amd;gfx1100;co" "amd;gfx1201;co")
