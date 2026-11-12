@@ -192,6 +192,7 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
     list(GET t 4 outre)
     add_test(NAME runtime_trap_${tname}
       COMMAND ${CMAKE_COMMAND} -DPROG=$<TARGET_FILE:${exe}> -DMODE=${mode} -DKIND=cpu
+              "-DEMULATOR=${CMAKE_CROSSCOMPILING_EMULATOR}"
               "-DERR_REGEX=${errre}" "-DOUT_REGEX=${outre}"
               -P ${CMAKE_CURRENT_SOURCE_DIR}/runtime/trap_test.cmake)
   endforeach()

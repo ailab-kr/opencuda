@@ -1,11 +1,12 @@
 # Runs a program that is expected to trap, and checks how it ended.
 #   -DPROG=<exe> -DMODE=<arg> -DKIND=cpu|nvidia [-DWRAPPER=<exe>]
-#   -DERR_REGEX=<regex on stderr, cpu only> -DOUT_REGEX=<regex on stdout, cpu only>
+#   [-DEMULATOR=<runner>] -DERR_REGEX=<regex on stderr, cpu only> -DOUT_REGEX=<regex on stdout, cpu only>
 # CPU: the process must end abnormally, with the position message on
 # stderr and the output printed before the trap on stdout.
 # NVIDIA: the process runs on, the next synchronization reports 719
 # (cudaErrorLaunchFailure) and nothing was written after the trap.
-execute_process(COMMAND ${WRAPPER} ${PROG} ${MODE}
+# EMULATOR: cross builds run the program through it (Wine).
+execute_process(COMMAND ${EMULATOR} ${WRAPPER} ${PROG} ${MODE}
   RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err)
 message("exit: ${rc}\nstdout:\n${out}\nstderr:\n${err}")
 if(WRAPPER AND rc EQUAL 77)
