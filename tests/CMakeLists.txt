@@ -328,6 +328,54 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   set_tests_properties(ocu_cc_refuses_vendor_path PROPERTIES WILL_FAIL TRUE)
 endif()
 
+# ---- the BLAS library API (cublas_v2.h): the same test program on the CPU
+# path and on an NVIDIA GPU (skipped without one). OCU_CUBLAS_TILE forces
+# each tile configuration, so both are checked whatever the device size.
+if(TARGET ocu_cublas_cpu)
+  ocu_add_cpu_cu_executable(cublas_accuracy libs/cublas_accuracy.cu LIBRARIES ocu_cublas_cpu)
+  add_test(NAME cublas_cpu COMMAND cublas_accuracy)
+  add_test(NAME cublas_cpu_tile64_random COMMAND cublas_accuracy)
+  set_tests_properties(cublas_cpu_tile64_random PROPERTIES
+    ENVIRONMENT "OCU_CUBLAS_TILE=64;OCU_CPU_ORDER=random;OCU_CPU_SEED=9")
+  add_test(NAME cublas_cpu_tile128 COMMAND cublas_accuracy)
+  set_tests_properties(cublas_cpu_tile128 PROPERTIES ENVIRONMENT "OCU_CUBLAS_TILE=128")
+endif()
+# The reference BLAS cases (conformance/oracle) through the library, for
+# the functions it offers.
+set(OCU_CUBLAS_CASES "gemm,gemv:f32,axpy:f32,dot:f32,scal:f32,nrm2:f32,trsm:f32")
+if(TARGET ocu_cublas_cpu)
+  ocu_add_cpu_cu_executable(cublas_driver conformance/cublas_driver.cu LIBRARIES ocu_cublas_cpu)
+  add_test(NAME conformance_cublas_cpu
+    COMMAND ${Python3_EXECUTABLE} -m ocu_conf.blas_run $<TARGET_FILE:cublas_driver>
+            --only ${OCU_CUBLAS_CASES} --out ${CMAKE_CURRENT_BINARY_DIR}/cublas_cpu_result.json
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/conformance/harness)
+  add_test(NAME conformance_cublas_cpu_stream
+    COMMAND ${Python3_EXECUTABLE} -m ocu_conf.blas_run $<TARGET_FILE:cublas_driver>
+            --only ${OCU_CUBLAS_CASES}
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/conformance/harness)
+  set_tests_properties(conformance_cublas_cpu_stream PROPERTIES
+    ENVIRONMENT "OCU_DRIVER_STREAM=1;OCU_CPU_ORDER=random")
+endif()
+if(TARGET ocu_cublas_nvidia AND TARGET run_if_nvidia)
+  ocu_add_nvidia_cu_executable(cublas_accuracy_nv libs/cublas_accuracy.cu LIBRARIES ocu_cublas_nvidia)
+  foreach(tile default 64 128)
+    add_test(NAME gpu_cublas_${tile} COMMAND run_if_nvidia $<TARGET_FILE:cublas_accuracy_nv>)
+    set(_env "ASAN_OPTIONS=detect_leaks=0")
+    if(NOT tile STREQUAL "default")
+      list(APPEND _env "OCU_CUBLAS_TILE=${tile}")
+    endif()
+    set_tests_properties(gpu_cublas_${tile} PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "${_env}")
+  endforeach()
+  ocu_add_nvidia_cu_executable(cublas_driver_nv conformance/cublas_driver.cu LIBRARIES ocu_cublas_nvidia)
+  add_test(NAME gpu_conformance_cublas
+    COMMAND run_if_nvidia ${Python3_EXECUTABLE} -m ocu_conf.blas_run
+            $<TARGET_FILE:cublas_driver_nv> --backend nvidia --only ${OCU_CUBLAS_CASES}
+            --out ${CMAKE_CURRENT_BINARY_DIR}/cublas_nvidia_result.json
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}/conformance/harness)
+  set_tests_properties(gpu_conformance_cublas PROPERTIES SKIP_RETURN_CODE 77
+    ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0;OCU_DRIVER_STREAM=1")
+endif()
+
 # ---- ocu-nvcc: the nvcc-compatible driver and the toolkit folder ----------
 if(OCU_BACKEND_CPU AND Python3_FOUND AND NOT WIN32 AND NOT CMAKE_CROSSCOMPILING)
   set(OCU_NVCC ${OCU_TOOLKIT_DIR}/bin/ocu-nvcc)

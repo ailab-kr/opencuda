@@ -5,7 +5,9 @@
 #   CUDA::cudart, CUDA::cudart_static, CUDA::cuda_driver, CUDA::cudadevrt
 #                       our runtime (ocu_cudart and the backends)
 #   CUDA::cublas, CUDA::cublas_static
-#                       ocu_blas (functions it does not have yet stay
+#                       ocu_cublas_<OCU_TARGET> (cublas_v2.h, built for the
+#                       same target as the CUDA code: cpu or nvidia), else
+#                       ocu_blas (functions it does not have stay
 #                       unresolved at link time)
 #   CUDA::toolkit       our include folder
 #
@@ -78,8 +80,16 @@ if(CUDAToolkit_FOUND)
     endif()
     set(CUDAToolkit_${_ocu_t}_FOUND TRUE)
   endforeach()
-  if(EXISTS "${_ocu_root}/lib/libocu_blas.a")
+  set(_ocu_target "${OCU_TARGET}")
+  if(NOT _ocu_target)
+    set(_ocu_target cpu)
+  endif()
+  if(EXISTS "${_ocu_root}/lib/libocu_cublas_${_ocu_target}.a")
+    set(CUDA_cublas_LIBRARY "${_ocu_root}/lib/libocu_cublas_${_ocu_target}.a")
+  elseif(EXISTS "${_ocu_root}/lib/libocu_blas.a")
     set(CUDA_cublas_LIBRARY "${_ocu_root}/lib/libocu_blas.a")
+  endif()
+  if(CUDA_cublas_LIBRARY)
     foreach(_ocu_t cublas cublas_static)
       if(NOT TARGET CUDA::${_ocu_t})
         add_library(CUDA::${_ocu_t} INTERFACE IMPORTED)
@@ -107,3 +117,4 @@ unset(_ocu_v)
 unset(_ocu_name)
 unset(_ocu_runtime)
 unset(_ocu_root)
+unset(_ocu_target)
