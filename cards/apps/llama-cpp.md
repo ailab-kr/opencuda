@@ -8,6 +8,7 @@ spec_sources:
   - public CUDA Math API reference (FP8 intrinsics, single precision intrinsics)
   - public cuBLAS / cuBLASLt documentation (cublasLt objects and cublasLtMatmul)
   - docs/llama-cpp-requirements.md (survey), docs/compiler-driver.md
+  - cards/libs/cub-subset.md (PDL declarations and CUB subset for the default CUDART 12030 profile)
 backend_map:
   cpu: ocu-nvcc --ocu-target=cpu (CPU rewrite) over backends/cpu
   nvidia: ocu-nvcc --ocu-target=nvidia (Clang CUDA, sm_50 PTX) over backends/nvidia
@@ -15,7 +16,7 @@ state: impl-written-untested
 owner_spec: AI Lab 2026-11-13
 owner_tests: (to be assigned: a session other than owner_impl)
 owner_impl: AI Lab 2026-11-13
-cost: { hours: 4.5, ai_usage: 0 }
+cost: { hours: 6, ai_usage: 0 }
 ---
 
 ## 동작
@@ -27,11 +28,11 @@ llama.cpp 저장소 밖 빌드 폴더에서 CMake 도구 사슬 파일 하나로
 cmake -S llama.cpp -B build -DCMAKE_TOOLCHAIN_FILE=<toolkit>/cmake/OcuCUDA.cmake -DOCU_TARGET=cpu|nvidia \
   -DGGML_CUDA=ON -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=50 \
   -DGGML_CUDA_FA=OFF -DGGML_CUDA_GRAPHS=OFF -DGGML_CUDA_NO_VMM=ON -DGGML_CUDA_NO_PEER_COPY=ON -DGGML_CUDA_NCCL=OFF \
-  -DBUILD_SHARED_LIBS=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DGGML_CCACHE=OFF \
-  "-DCMAKE_CUDA_FLAGS=-DOCU_CUDART_VERSION=11060"
+  -DBUILD_SHARED_LIBS=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DGGML_CCACHE=OFF
 ```
 
-- `OCU_CUDART_VERSION=11060`: llama.cpp가 `CUDART_VERSION`으로 켜는 PDL(`cudaLaunchKernelEx`), FP8, CUB, cublasLt 경로를 끈다(조사 문서 6.1). 헤더의 함수는 그대로다. 12030(기본)으로는 아직 시도하지 않았다(CUB 부분집합, PDL 선언이 필요).
+- 기본 프로필(`CUDART_VERSION` 12030)로 빌드한다. llama.cpp가 이 값으로 켜는 PDL(`cudaLaunchKernelEx`), CUB(`<cub/cub.cuh>`: argsort, cumsum, mean, ssm-scan, sum, top-k), FP8, cublasLt 경로가 모두 컴파일된다. PDL 선언과 CUB 부분집합은 `cards/libs/cub-subset.md`. 장치가 보고하는 `ptxVersion`이 90 미만이라 llama.cpp는 PDL 실행을 고르지 않는다(계산 능력을 9.0으로 보고하게 하면 고르며, 그때도 스트림 순서대로 실행된다). CCCL 판 매크로가 없어 `DeviceTopK`·`strided_iterator` 경로는 꺼진 채 대체 경로를 쓴다.
+- `"-DCMAKE_CUDA_FLAGS=-DOCU_CUDART_VERSION=11060"`을 주면 예전 프로필: 위 네 경로를 끈다(조사 문서 6.1). 헤더의 함수는 그대로다. 비교용으로 남겨 둔다.
 - 아키텍처 50: 장치가 보고하는 계산 능력 5.0과 `__CUDA_ARCH_LIST__=500`이 맞물려, 호스트가 고르는 커널과 장치 코드에 든 본문이 일치한다. 텐서 코어·cp.async PTX는 컴파일되지 않는다. 남는 인라인 PTX `prefetch.global.L2`도 이 llama.cpp 판에서는 부르는 곳(`mmvq.cu`, `mmq-few.cu`)이 특정 아키텍처(`__CUDA_ARCH__ ==` DGX Spark) 조건 안에 있어, 아키텍처 50에서는 어느 경로에도 들어가지 않는다.
 - 이 작업에서 고친 것: CPU 경로 실행 람다가 복사 캡처(`[=]`)라 함수 포인터 변수·템플릿 인자로 실행 가능, `__restrict` 포인터 인자 복사, `__shared__ alignas(N)`·`const alignas(N)` 순서, CPU 경로에서 `__CUDA_ARCH__=500`·`__CUDA_ARCH_LIST__=500`(NO_DEVICE_CODE가 `__trap`으로 멈춤), NVIDIA 경로의 `__CUDA_ARCH_LIST__`, NVPTX 1·2바이트 셔플, `cuda_fp8.h`, `__half2_raw`, `<limits.h>`, `__frcp_rn` 등, `cublasLt.h`(객체만, 행렬곱은 지원 안 함), 툴킷 include의 `cooperative_groups/` 폴더.
 
@@ -60,7 +61,8 @@ cmake -S llama.cpp -B build -DCMAKE_TOOLCHAIN_FILE=<toolkit>/cmake/OcuCUDA.cmake
 8. `OCU_CUDART_VERSION=11060`이면 `CUDART_VERSION == 11060`, 없으면 12030. `<cuda_runtime.h>`만으로 `INT_MAX` 사용 가능.
 9. `cublasLt.h`: C와 C++에서 포함됨, Create/Destroy/SetAttribute 성공, NULL 인자는 `CUBLAS_STATUS_INVALID_VALUE`, `cublasLtMatmulAlgoGetHeuristic`은 결과 0개와 NOT_SUPPORTED, `cublasLtMatmul`은 NOT_SUPPORTED.
 10. 툴킷 폴더에 `include/cooperative_groups/reduce.h`가 있고 `-I<toolkit>/include`만으로 포함됨.
-11. 응용 시험(자동화 후보): 위 구성으로 llama.cpp를 CPU·NVIDIA 대상 각각 빌드(모든 `.cu` 컴파일·링크), Qwen2.5-0.5B-Instruct Q8_0로 탐욕 생성 64토큰이 의미 있는 문장, CPU 경로와 NVIDIA 경로의 토큰 일치율, test-backend-ops 통과 수(아래 메모의 값보다 줄지 않음).
+11. 응용 시험(자동화 후보): 위 구성으로 llama.cpp를 CPU·NVIDIA 대상 각각 빌드(모든 `.cu` 컴파일·링크), Qwen2.5-0.5B-Instruct Q8_0로 탐욕 생성 64토큰이 의미 있는 문장, CPU 경로와 NVIDIA 경로의 토큰 일치율, test-backend-ops 통과 수(아래 메모의 값보다 줄지 않음). 기본 프로필(12030)과 11060 프로필 둘 다.
+12. 기본 프로필에서 CUB를 쓰는 연산(ARGSORT 큰 행, TOP_K, CUMSUM 긴 행, SUM, MEAN 한 행 65537 이상, SSM_SCAN)이 두 경로에서 통과하고, ARGSORT가 "지원 안 함" 없이 98건. `OCU_COMPUTE_CAPABILITY=9.0`으로 PDL 실행 경로를 탄 test-backend-ops가 통과(CUB·PDL 자체의 동작 시험은 `cards/libs/cub-subset.md`).
 
 ## 메모
 
@@ -69,7 +71,10 @@ cmake -S llama.cpp -B build -DCMAKE_TOOLCHAIN_FILE=<toolkit>/cmake/OcuCUDA.cmake
 - 생성: CPU 경로·NVIDIA 경로 모두 문장이 자연스럽다. 기준(llama.cpp 자체 CPU 백엔드)과는 7번째 토큰에서 갈라진다("light and history" ↔ "light and culture"); 같은 위치 일치 47/64(CPU 경로), 48/64(NVIDIA 경로). 우리 CPU 경로와 NVIDIA 경로는 63/64 일치(첫 34토큰 같음, "1st century AD" ↔ "BC" 한 토큰). 백엔드 사이 차이(MMVQ가 활성값을 q8_1로 양자화하는 등)로 보이며, 같은 CUDA 소스를 두 칩에서 돌린 결과는 거의 같다.
 - 둘째 모델(TinyLlama-1.1B-Chat Q4_K_M, 64토큰): 세 결과 모두 자연스러운 문장, 첫 갈림은 기준↔NVIDIA 경로 26토큰, NVIDIA↔CPU 경로 28토큰 뒤(근소한 차이의 동률 근처).
 - test-backend-ops(CUDA0 대 CPU, FA 끔, `-p`로 비연속 K·IQ 양자 행렬곱 76건 제외): NVIDIA 경로 15866/15866, CPU 경로 15866/15866 통과, 지원 안 함 11418(그중 FLASH_ATTN_EXT 5721, OUT_PROD 1472, SET_ROWS 588, MUL_MAT 469). 제외한 76건을 NVIDIA 경로에서 하나씩 돌리면 66 통과, 10건은 llama.cpp의 `GGML_ASSERT(convert_func)`로 중단. 고치기 전(`__byte_perm` 부호 복제)에는 NVIDIA 경로 1010건 실패(IQ4_NL·IQ4_XS·MXFP4·NVFP4·Q1_0·Q2_0 행렬곱).
-- `CUDART_VERSION` 12030(기본)으로 빌드하면 CPU 경로에서 150개 모두 실패, 오류 1335개: 근본 원인은 PDL 선언 없음(`cudaLaunchConfig_t`, `cudaLaunchAttribute`, `cudaLaunchAttributeProgrammaticStreamSerialization`, `cudaLaunchKernelEx`; 나머지 1000여 개는 그 연쇄)과 `cub/cub.cuh` 없음(argsort, cumsum, mean, ssm-scan, sum, top-k). `cuda_fp8.h`와 `cublasLt.h` 경로는 오류 없이 컴파일됐다. 그래서 11060 프로필을 쓴다.
+- 위 세 줄과 아래 속도는 11060 프로필 때의 값이다. 그때 12030으로 빌드하면 CPU 경로에서 150개 모두 실패(오류 1335개): PDL 선언 없음과 `cub/cub.cuh` 없음이 원인이었다.
+- 12030 기본 프로필(2026-11-13, PDL 선언과 CUB 부분집합을 더한 뒤): CPU·NVIDIA 두 경로 모두 `.cu` 150개 컴파일, `llama-simple`·`test-backend-ops`·`llama-bench` 링크(각 약 6분, -j2). test-backend-ops(같은 `-p` 제외): NVIDIA 경로 15894/15894 통과, 지원 안 함 11390; CPU 경로 15894/15894 통과, 지원 안 함 11390(32분, 부하 평균 20~35). 늘어난 28건은 ARGSORT의 큰 행(열 1025 이상 여러 행, 열 16384~200000 한 행): 11060에서는 "지원 안 함"이던 CUB 정렬 경로다. CUB를 쓰는 연산만 따로: ARGSORT 98, TOP_K 534, CUMSUM 15, MEAN 17, SUM 10(지원 안 함 2), SUM_ROWS 11, SSM_SCAN 17, 두 경로 모두 실패 0. 계산 능력을 9.0으로 보고하게 해(`OCU_COMPUTE_CAPABILITY=9.0`, `ptxVersion` 90 → llama.cpp가 PDL 실행을 고름) ADD 167·SCALE 11·NORM 51·ROPE 490(두 경로)과 GET_ROWS 227·CPY 285(NVIDIA) 모두 통과.
+- 생성(12030, 프롬프트 26토큰 = 위 문장 그대로, 끝 공백·줄바꿈 없음, 64토큰 탐욕): 기준 "The city of Paris has a rich history that dates back to the 6th century. The city was founded by the Romans and was named after …", CPU 경로 "… dates back to the 6th century. The city was founded by the Romans, who built a city on the site of an ancient Roman settlement …", NVIDIA 경로 "… dates back to the Middle Ages. The city was founded by the Romans in the 6th century …". 같은 단어 접두: 기준↔CPU 21단어, 기준↔NVIDIA 13단어, CPU↔NVIDIA 13단어. 같은 프롬프트로 11060 프로필(지금 런타임)의 CPU 경로도 첫 16토큰이 12030과 같다. 앞의 측정(27토큰)과 첫 문장이 다른 것은 프롬프트 토큰 하나 차이 때문이다(11월 13일 04시의 이전 NVIDIA 실행 파일도 26토큰 프롬프트로는 "The city of Paris …"로 시작).
+- CUB 연산 속도(NVIDIA 경로, test-backend-ops perf, 같은 PC의 다른 작업으로 부하 평균 20~35라 흔들림 큼): SUM 8192×8192 351 µs(11060의 대체 경로 5920 µs), CUMSUM 2000000×1 67 µs(929 µs), ARGSORT 200000×1 347~379 µs(11060에서는 지원 안 함). 같은 부하에서 번갈아 잰 작은 입력: SUM 8192항목 45~48 µs ↔ 41 µs, CUMSUM 4096×1 11~12 µs ↔ 9.5 µs. 느린 곳: CUMSUM 32768×4(llama.cpp가 행마다 CUB 스캔을 부르는 경우) 98~109 µs ↔ 대체 경로 23 µs. 행마다 커널 3번(타일 합계, 합계 스캔, 타일 스캔) 실행이라 실행 비용이 지배한다. 한 번에 끝내는 스캔(앞 타일 합을 기다리는 방식)이 다음 개선 후보다.
 - 속도(llama-bench, 프롬프트 32토큰·생성 32토큰(CPU 경로 16), 중앙값 / 느린 10%): 기준 CPU 백엔드 8스레드 554 / 534 t/s 처리, 62.6 / 61.3 t/s 생성. NVIDIA 경로 1373 / 1350, 95.5 / 93.3 t/s(드라이버 번역 캐시가 찬 뒤; 첫 실행은 첫 프롬프트에 약 25초). CPU 경로 8스레드 4.7 / 2.9, 0.37 / 0.35 t/s; 24스레드 11.9 / 11.4, 0.79 / 0.71 t/s. 측정 동안 같은 PC에서 다른 작업이 돌아 부하 평균이 18~24였다(기준 24스레드는 흔들려 8스레드 값을 씀).
 - CPU 경로가 기준보다 생성에서 약 170배 느린 주된 이유(추정): 행렬-벡터 커널이 행마다 워프 셔플 축소를 하는데, CPU 백엔드는 셔플 한 번마다 32개 파이버를 모두 갈아탄다. 토큰당 수천만 번의 전환으로 어림된다. 백엔드의 워프 실행 방식(묶음 실행 등) 문제이고 이 카드의 범위 밖이다.
 

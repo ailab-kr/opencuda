@@ -61,4 +61,18 @@ OCU_LANG_FN T __ldg(const T *p)
     return *p;
 }
 
+/*
+ * Programmatic dependent launch, device side.
+ *   cudaGridDependencySynchronize(): waits until the grids this grid
+ *     depends on have completed and their memory operations are visible.
+ *   cudaTriggerProgrammaticLaunchCompletion(): allows a dependent grid to
+ *     start before this one has finished.
+ * This layer never starts a kernel before the earlier work in its stream
+ * has completed (cudaLaunchKernelEx keeps full stream order), so at the
+ * first instruction of a kernel the dependency is already resolved: the
+ * wait returns at once and the trigger has nothing to release.
+ */
+OCU_LANG_FN void cudaGridDependencySynchronize(void) {}
+OCU_LANG_FN void cudaTriggerProgrammaticLaunchCompletion(void) {}
+
 #endif /* OCU_CUDA_LANG_COMMON_H */
