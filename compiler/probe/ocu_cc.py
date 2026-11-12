@@ -9,6 +9,9 @@ is not the nvcc-compatible driver.
     ocu_cc.py --target nvidia --arch sm_80   -c k.cu -o k.ptx
     ocu_cc.py --target amd    --arch gfx1201 -c k.cu -o k.co
     ocu_cc.py ... --print-commands      (show what runs, do not run)
+    ocu_cc.py ... --ptx-shift           (cpu, and nvidia objects: shifts in
+                                         device code with PTX semantics,
+                                         see ptx_shift.py; off by default)
 
 What it guarantees on every path:
   - no vendor SDK file is read: -nocudainc -nocudalib (or -nogpuinc
@@ -165,6 +168,35 @@ def header_dirs() -> list[Path]:
 FP_CONTRACT = ["-ffp-contract=fast-honor-pragmas"]
 
 
+def ptx_shift_step(args, src: Path, work: Path, common: list[str], side: str):
+    """--ptx-shift (ptx_shift.py): a step that writes rewritten copies of
+    the source and its local includes, the source to compile instead, and
+    the extra compiler options (the helpers, the original folder for
+    quoted includes). Without the option: nothing, src, nothing."""
+    if not args.ptx_shift:
+        return [], src, []
+    dirs = header_dirs()
+    path = pinned_cuda_path(work.parent if args.cache is None else Path(args.cache))
+    ast = [_llvm_tool("clang++"), "-x", "cuda", "-std=c++17", "-nocudainc", "-nocudalib",
+           f"--cuda-path={path}", f"--cuda-gpu-arch={args.arch or 'sm_80'}", side,
+           *[f"-I{d}" for d in dirs], "-include", str(dirs[0] / "cuda_runtime.h"),
+           "-Wno-unknown-cuda-version", *common]
+    if args.target == "cpu":
+        # Headers the CPU compiler finds in its own folder (omp.h with GCC)
+        # come after Clang's own, so that both read the same program.
+        try:
+            own = subprocess.run([os.environ.get("CXX", "c++"), "-print-file-name=include"],
+                                 capture_output=True, text=True).stdout.strip()
+        except OSError:
+            own = ""
+        if own and os.path.isabs(own) and os.path.isdir(own):
+            ast += ["-idirafter", own]
+    dest = work / "ptx-shift"
+    step = ["<ptx-shift>", str(src), str(dest), str(path), *ast]
+    extra = ["-include", str(dirs[0] / "ocu_ptx_shift.h"), "-iquote", str(src.parent)]
+    return [step], dest / src.name, extra
+
+
 def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
     codegen = []  # options that matter after preprocessing
     if args.O:
@@ -190,10 +222,12 @@ def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
             return [[cxx, *ours, *common, "-c", str(src), "-o", str(out)]]
         pre = work / (src.stem + ".ii")
         rewritten = work / (src.stem + ".ocu.ii")
-        return [[cxx, "-std=c++17", "-x", "c++", "-E", "-DOCU_CPU_PATH",
+        shift, src, extra = ptx_shift_step(args, src, work, common, "--cuda-host-only")
+        return [*shift,
+                [cxx, "-std=c++17", "-x", "c++", "-E", "-DOCU_CPU_PATH",
                  "-DOCU_CPU_PREPROCESS", "-D__CUDACC__", *ours,
                  # nvcc includes cuda_runtime.h in every .cu file
-                 "-include", str(rt / "cuda_runtime.h"),
+                 "-include", str(rt / "cuda_runtime.h"), *extra,
                  *common, str(src), "-o", str(pre)],
                 ["<rewrite>", str(pre), str(rewritten)],
                 [cxx, "-std=c++17", "-x", "c++-cpp-output", *codegen,
@@ -218,14 +252,19 @@ def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
                 "-Wno-unknown-cuda-version", *FP_CONTRACT]
         ptx = work / (src.stem + ".ptx")
         fat = work / (src.stem + ".ocufat")
+        # --ptx-shift: the device pass's view of the source decides which
+        # shifts are rewritten (its copies also join spaced chevrons).
+        shift, src, extra = ptx_shift_step(args, src, work, common, "--cuda-device-only")
+        cuda += extra
         # Spaced chevrons ("<< <"), which Clang rejects: compile copies of
         # the source and its local quoted includes with only those
         # characters changed (see normalized_copies).
-        copy = normalized_copies(src, work / "src")
+        copy = None if shift else normalized_copies(src, work / "src")
         if copy is not None:
             cuda += ["-iquote", str(src.parent), "-I", str(src.parent)]
             src = copy
-        return [[*cuda, "--cuda-device-only", "-S", *common, str(src), "-o", str(ptx)],
+        return [*shift,
+                [*cuda, "--cuda-device-only", "-S", *common, str(src), "-o", str(ptx)],
                 ["<container>", str(fat), "nvidia", str(ptx)],
                 [*cuda, "--cuda-host-only", "-Xclang", "-fcuda-include-gpubinary",
                  "-Xclang", str(fat), *common, "-c", str(src), "-o", str(out)]]
@@ -253,7 +292,14 @@ def main(argv: list[str]) -> int:
     ap.add_argument("-g", action="store_true")
     ap.add_argument("--cache", help="folder for the generated version marker")
     ap.add_argument("--print-commands", action="store_true")
+    ap.add_argument("--ptx-shift", action="store_true",
+                    help="shifts in device code as PTX shl/shr define them (ptx_shift.py)")
     args = ap.parse_args(argv)
+    if args.ptx_shift and (args.target == "amd" or
+                           (args.target == "nvidia" and args.output.endswith(".ptx"))):
+        print("ocu_cc: --ptx-shift is available for --target cpu and for nvidia objects, "
+              "not for this output", file=sys.stderr)
+        return 2
 
     for inc in args.I:
         real = os.path.realpath(inc)  # symlinks resolved
@@ -279,6 +325,17 @@ def main(argv: list[str]) -> int:
                 continue
             if cmd[0] == "<container>":
                 write_container(Path(cmd[1]), [(cmd[2], Path(cmd[3]).read_bytes())])
+                continue
+            if cmd[0] == "<ptx-shift>":
+                from ptx_shift import ShiftError, prepare
+                ours = [str(REPO / "runtime"), str(REPO / "backends"), cmd[3],
+                        *[str(d) for d in header_dirs()]]
+                try:
+                    prepare(Path(cmd[1]), Path(cmd[2]), cmd[4:], env, ours,
+                            lambda m: print(f"ocu_cc: --ptx-shift: {m}", file=sys.stderr))
+                except ShiftError as error:
+                    print(f"{args.source}: {error}", file=sys.stderr)
+                    return 1
                 continue
             if cmd[0] == "<rewrite>":
                 try:
