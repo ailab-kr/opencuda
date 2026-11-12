@@ -116,9 +116,22 @@ guard() {
             found=1
         fi
     done
+    # Our own CUDA-named headers live only in runtime/include and are
+    # written from public documentation; the same names anywhere else, or
+    # vendor libraries anywhere, are refused.
+    if find "$repo" -path "$repo/.git" -prune -o -path "$repo/runtime/include" -prune \
+        -o -type f \( -name 'cuda_runtime*.h' -o -name 'cuda.h' -o -name 'cublas*.h' \
+           -o -name 'cudnn*.h' \) -print | grep .; then
+        found=1
+    fi
     if find "$repo" -path "$repo/.git" -prune -o -type f \
-        \( -name 'cuda_runtime*.h' -o -name 'cuda.h' -o -name 'cublas*.h' \
-           -o -name 'cudnn*.h' -o -name 'libcuda*' -o -name 'libcudart*' \) -print | grep .; then
+        \( -name 'libcuda*' -o -name 'libcudart*' -o -name 'libcublas*' \) -print | grep .; then
+        found=1
+    fi
+    # Vendor header text: the licence and copyright lines vendor files carry.
+    if find "$repo" -path "$repo/.git" -prune -o -type f \
+        \( -name '*.h' -o -name '*.hpp' -o -name '*.cuh' -o -name '*.inl' \) -print0 |
+        xargs -0 grep -lE 'NVIDIA CORPORATION|NVIDIA Software License|Copyright \(c\) 1993-'; then
         found=1
     fi
     for f in "$root"/probe/*.log; do

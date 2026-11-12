@@ -7,3 +7,4 @@ conformance/results/*.json
 !conformance/results/.gitkeep
 .vscode/
 .idea/
+Testing/
