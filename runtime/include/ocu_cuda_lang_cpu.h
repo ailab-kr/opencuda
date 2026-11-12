@@ -85,6 +85,9 @@ inline void *dynamic_shared() { return ocu_cpu_dynamic_shared(); }
 template <typename T>
 struct dyn_shared {
     operator T *() const { return static_cast<T *>(ocu_cpu_dynamic_shared()); }
+    /* (U *)name and static_cast<U *>(name), as for the array. */
+    template <typename U>
+    explicit operator U *() const { return static_cast<U *>(ocu_cpu_dynamic_shared()); }
     T &operator[](std::size_t i) const { return static_cast<T *>(*this)[i]; }
 };
 
@@ -106,6 +109,13 @@ inline config cfg(dim3 grid, dim3 block, std::size_t shared = 0,
 inline config cfg(dim3 grid, dim3 block, std::size_t shared, std::nullptr_t)
 {
     return config{grid, block, shared, nullptr};
+}
+/* K<<<g, b, s, NULL>>>: NULL is __null (a long) after GCC preprocessing. */
+inline config cfg(dim3 grid, dim3 block, std::size_t shared, long stream)
+{
+    return config{grid, block, shared,
+                  stream == 0 ? nullptr
+                              : reinterpret_cast<cudaStream_t>(static_cast<std::intptr_t>(stream))};
 }
 inline config cfg(dim3 grid, dim3 block, std::size_t shared, int stream)
 {
@@ -152,13 +162,35 @@ struct thunk {
     }
 };
 
+/* A literal 0 argument is passed as int when the kernel accepts an int
+   there (a template parameter deduces int, as in a direct call), and as
+   literal_zero (which converts to a pointer) otherwise. */
+template <typename A>
+using zero_as_int = std::conditional_t<std::is_same_v<std::decay_t<A>, literal_zero>, int,
+                                       std::decay_t<A>>;
+
+template <typename F, typename... V, typename... A>
+void launch_values(const config &c, F f, A &&...a);
+
 template <typename F, typename... A>
 void launch(const config &c, F f, A &&...a)
 {
     static_assert(std::is_empty_v<F>, "launch lambda must not capture");
-    std::tuple<std::decay_t<A>...> values(std::forward<A>(a)...);
-    void *ptrs[sizeof...(A) + 1];
-    std::size_t sizes[sizeof...(A) + 1];
+    if constexpr ((std::is_same_v<std::decay_t<A>, literal_zero> || ...) &&
+                  std::is_invocable_v<F &, zero_as_int<A> &...>) {
+        launch_values<F, zero_as_int<A>...>(c, f, std::forward<A>(a)...);
+    } else {
+        launch_values<F, std::decay_t<A>...>(c, f, std::forward<A>(a)...);
+    }
+}
+
+template <typename F, typename... V, typename... A>
+void launch_values(const config &c, F f, A &&...a)
+{
+    std::tuple<V...> values(static_cast<V>(std::forward<A>(a))...);
+    constexpr std::size_t n_args = sizeof...(V);
+    void *ptrs[n_args + 1];
+    std::size_t sizes[n_args + 1];
     ptrs[0] = &f;
     sizes[0] = sizeof(f);
     std::apply(
@@ -173,8 +205,8 @@ void launch(const config &c, F f, A &&...a)
     p.shared_memory_bytes = c.shared;
     p.args = ptrs;
     p.arg_sizes = sizes;
-    p.num_args = sizeof...(A) + 1;
-    (void)ocu_rt_launch(thunk<F, std::decay_t<A>...>::kernel(), &p, c.stream);
+    p.num_args = n_args + 1;
+    (void)ocu_rt_launch(thunk<F, V...>::kernel(), &p, c.stream);
 }
 
 /* ---- atomics: blocks run on different OS threads ------------------------ */

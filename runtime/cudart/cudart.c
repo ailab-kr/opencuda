@@ -45,12 +45,29 @@ struct ocu_rt_event {
     int         device;
 };
 
+typedef struct pinned_range {
+    char  *base;
+    size_t size;
+} pinned_range;
+
 typedef struct rt_device {
     pthread_mutex_t       lock;
     bool                  open;
     ocu_device           *dev;
     ocu_queue            *legacy;   /* the default stream */
     struct ocu_rt_stream *streams;
+    /* Held from the ordering check to the enqueue of work on the default
+       stream or a blocking stream, so the legacy rule holds across host
+       threads. Order: submit before lock. */
+    pthread_mutex_t       submit;
+    /* A kernel failure stays visible to every later synchronising call
+       until cudaDeviceReset, as the API describes. 0 = none. */
+    _Atomic int           sticky;
+    /* Page-locked host allocations (cudaMallocHost/cudaHostAlloc), guarded
+       by `lock`: asynchronous copies may read these later; any other host
+       memory is copied before the call returns. */
+    pinned_range         *pinned;
+    size_t                pinned_count, pinned_cap;
 } rt_device;
 
 static const ocu_backend *g_backend;
@@ -92,6 +109,22 @@ static cudaError_t set_error(cudaError_t e)
 }
 
 static cudaError_t from(ocu_status st) { return set_error(ocu_rt_error(st)); }
+
+/* A backend result from synchronising work on device d: a kernel failure
+   becomes the device's sticky error; an earlier sticky error wins. */
+static cudaError_t dev_result(struct rt_device *d, ocu_status st)
+{
+    cudaError_t e = ocu_rt_error(st);
+    if (e == cudaErrorLaunchFailure) {
+        int none = 0;
+        atomic_compare_exchange_strong(&d->sticky, &none, (int)e);
+    }
+    int sticky = atomic_load(&d->sticky);
+    if (sticky != 0 && e != cudaErrorNotReady) {
+        e = (cudaError_t)sticky;
+    }
+    return set_error(e);
+}
 
 cudaError_t cudaGetLastError(void)
 {
@@ -142,6 +175,7 @@ static void init_once(void)
     g_device_count = n > MAX_DEVICES ? MAX_DEVICES : (int)n;
     for (int i = 0; i < MAX_DEVICES; ++i) {
         pthread_mutex_init(&g_devices[i].lock, NULL);
+        pthread_mutex_init(&g_devices[i].submit, NULL);
     }
     if (g_device_count == 0 && g_init_error == cudaSuccess) {
         g_init_error = cudaErrorNoDevice;
@@ -320,7 +354,7 @@ static cudaError_t sync_device(rt_device *d)
         if (first == OCU_OK) first = st;
     }
     pthread_mutex_unlock(&d->lock);
-    return ocu_rt_error(first);
+    return dev_result(d, first);
 }
 
 cudaError_t cudaDeviceSynchronize(void)
@@ -345,6 +379,7 @@ cudaError_t cudaDeviceReset(void)
     /* Finish all work; streams and events the program still holds stay
        valid (their queues keep working). */
     (void)sync_device(d);
+    atomic_store(&d->sticky, 0);
     tl_last_error = cudaSuccess;
     return cudaSuccess;
 }
@@ -393,9 +428,30 @@ cudaError_t cudaFuncSetCacheConfig(const void *func, enum cudaFuncCache config)
  * The backend queue for `stream`, after applying the legacy ordering rule
  * for work about to be submitted to it.
  */
-static cudaError_t queue_for_submit(rt_device *d, cudaStream_t stream, ocu_queue **q)
+typedef struct submission {
+    rt_device *d;
+    ocu_queue *q;
+    bool       held; /* d->submit is held until submit_end */
+} submission;
+
+/*
+ * Start submitting work to `stream`: apply the legacy ordering rule and
+ * pick the queue. For the default stream and blocking streams the
+ * submission lock is held until submit_end(), so no other host thread can
+ * enqueue in between the ordering check and this enqueue.
+ */
+static cudaError_t submit_begin(rt_device *d, cudaStream_t stream, submission *sub)
 {
+    sub->d = d;
+    sub->q = NULL;
+    sub->held = false;
+    int sticky = atomic_load(&d->sticky);
+    if (sticky != 0) {
+        return set_error((cudaError_t)sticky);
+    }
     if (stream == NULL || stream == cudaStreamLegacy || stream == cudaStreamPerThread) {
+        pthread_mutex_lock(&d->submit);
+        sub->held = true;
         /* Default stream: wait for every blocking stream first. */
         pthread_mutex_lock(&d->lock);
         ocu_status first = OCU_OK;
@@ -406,18 +462,35 @@ static cudaError_t queue_for_submit(rt_device *d, cudaStream_t stream, ocu_queue
             }
         }
         pthread_mutex_unlock(&d->lock);
-        *q = d->legacy;
-        return ocu_rt_error(first);
+        sub->q = d->legacy;
+        if (first != OCU_OK) {
+            pthread_mutex_unlock(&d->submit);
+            sub->held = false;
+            return dev_result(d, first);
+        }
+        return cudaSuccess;
     }
     if (!(stream->flags & cudaStreamNonBlocking)) {
+        pthread_mutex_lock(&d->submit);
+        sub->held = true;
         /* Blocking stream: wait for the default stream first. */
         ocu_status st = g_backend->queue_sync(d->legacy);
         if (st != OCU_OK) {
-            return ocu_rt_error(st);
+            pthread_mutex_unlock(&d->submit);
+            sub->held = false;
+            return dev_result(d, st);
         }
     }
-    *q = stream->queue;
+    sub->q = stream->queue;
     return cudaSuccess;
+}
+
+static void submit_end(submission *sub)
+{
+    if (sub->held) {
+        pthread_mutex_unlock(&sub->d->submit);
+        sub->held = false;
+    }
 }
 
 /* The queue a synchronising call on `stream` waits for. */
@@ -448,13 +521,69 @@ cudaError_t cudaFree(void *ptr)
     return from(g_backend->mem_free(d->dev, ptr)); /* waits for queued work */
 }
 
+static bool pinned_add(rt_device *d, void *p, size_t size)
+{
+    pthread_mutex_lock(&d->lock);
+    bool ok = true;
+    if (d->pinned_count == d->pinned_cap) {
+        size_t cap = d->pinned_cap ? d->pinned_cap * 2 : 16;
+        pinned_range *n = realloc(d->pinned, cap * sizeof(*n));
+        if (n == NULL) {
+            ok = false;
+        } else {
+            d->pinned = n;
+            d->pinned_cap = cap;
+        }
+    }
+    if (ok) {
+        d->pinned[d->pinned_count].base = p;
+        d->pinned[d->pinned_count].size = size;
+        d->pinned_count++;
+    }
+    pthread_mutex_unlock(&d->lock);
+    return ok;
+}
+
+static void pinned_remove(rt_device *d, void *p)
+{
+    pthread_mutex_lock(&d->lock);
+    for (size_t i = 0; i < d->pinned_count; ++i) {
+        if (d->pinned[i].base == (char *)p) {
+            d->pinned[i] = d->pinned[--d->pinned_count];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&d->lock);
+}
+
+/* True when [p, p + n) lies inside one page-locked allocation. */
+static bool pinned_contains(rt_device *d, const void *p, size_t n)
+{
+    const char *c = p;
+    bool found = false;
+    pthread_mutex_lock(&d->lock);
+    for (size_t i = 0; i < d->pinned_count && !found; ++i) {
+        const pinned_range *r = &d->pinned[i];
+        found = c >= r->base && (size_t)(c - r->base) <= r->size && n <= r->size - (size_t)(c - r->base);
+    }
+    pthread_mutex_unlock(&d->lock);
+    return found;
+}
+
 cudaError_t cudaMallocHost(void **ptr, size_t size)
 {
     rt_device *d;
     cudaError_t e = current(&d);
     if (e != cudaSuccess) return set_error(e);
     if (ptr == NULL) return set_error(cudaErrorInvalidValue);
-    return from(g_backend->host_alloc_pinned(d->dev, size, ptr));
+    ocu_status st = g_backend->host_alloc_pinned(d->dev, size, ptr);
+    if (st != OCU_OK) return from(st);
+    if (!pinned_add(d, *ptr, size)) {
+        (void)g_backend->host_free_pinned(d->dev, *ptr);
+        *ptr = NULL;
+        return set_error(cudaErrorMemoryAllocation);
+    }
+    return cudaSuccess;
 }
 
 cudaError_t cudaFreeHost(void *ptr)
@@ -462,7 +591,9 @@ cudaError_t cudaFreeHost(void *ptr)
     rt_device *d;
     cudaError_t e = current(&d);
     if (e != cudaSuccess) return set_error(e);
-    return from(g_backend->host_free_pinned(d->dev, ptr));
+    ocu_status st = g_backend->host_free_pinned(d->dev, ptr);
+    if (st == OCU_OK) pinned_remove(d, ptr);
+    return from(st);
 }
 
 cudaError_t cudaHostAlloc(void **ptr, size_t size, unsigned int flags)
@@ -522,24 +653,32 @@ static cudaError_t copy(void *dst, const void *src, size_t count, enum cudaMemcp
     if (count == 0) return cudaSuccess;
     ocu_copy_dir dir;
     e = copy_dir(kind, &dir);
+    submission sub;
     if (e == cudaErrorNotReady) { /* host to host: ordered after the stream */
-        ocu_queue *q;
-        e = queue_for_submit(d, stream, &q);
-        if (e == cudaSuccess) e = ocu_rt_error(g_backend->queue_sync(q));
-        if (e != cudaSuccess) return set_error(e);
-        if (dst == NULL || src == NULL) return set_error(cudaErrorInvalidValue);
-        memmove(dst, src, count);
-        return cudaSuccess;
+        e = submit_begin(d, stream, &sub);
+        if (e != cudaSuccess) return e;
+        ocu_status st = g_backend->queue_sync(sub.q);
+        if (st == OCU_OK && (dst == NULL || src == NULL)) st = OCU_ERR_INVALID_VALUE;
+        if (st == OCU_OK) memmove(dst, src, count);
+        submit_end(&sub);
+        return dev_result(d, st);
     }
     if (e != cudaSuccess) return set_error(e);
-    ocu_queue *q;
-    e = queue_for_submit(d, stream, &q);
-    if (e != cudaSuccess) return set_error(e);
-    ocu_status st = g_backend->mem_copy(d->dev, q, dst, src, count, dir);
-    if (st == OCU_OK && wait) {
-        st = g_backend->queue_sync(q);
+    /* Pageable host memory: the documented behaviour is that the source is
+       consumed (host to device) or the result is in place (device to host)
+       when the call returns, so such copies complete before returning. */
+    if (!wait) {
+        const void *host = dir == OCU_COPY_HOST_TO_DEVICE ? src
+                         : dir == OCU_COPY_DEVICE_TO_HOST ? (const void *)dst : NULL;
+        if (host != NULL && !pinned_contains(d, host, count)) wait = true;
     }
-    return from(st);
+    e = submit_begin(d, stream, &sub);
+    if (e != cudaSuccess) return e;
+    ocu_status st = g_backend->mem_copy(d->dev, sub.q, dst, src, count, dir);
+    submit_end(&sub);
+    if (st != OCU_OK) return from(st); /* rejected: bad pointers or range */
+    if (wait) return dev_result(d, g_backend->queue_sync(sub.q));
+    return cudaSuccess;
 }
 
 cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, enum cudaMemcpyKind kind)
@@ -568,7 +707,7 @@ static cudaError_t copy2d(void *dst, size_t dpitch, const void *src, size_t spit
         rt_device *d;
         cudaError_t e = current(&d);
         if (e != cudaSuccess) return set_error(e);
-        return from(g_backend->queue_sync(queue_of(d, stream)));
+        return dev_result(d, g_backend->queue_sync(queue_of(d, stream)));
     }
     return cudaSuccess;
 }
@@ -591,10 +730,12 @@ static cudaError_t fill(void *ptr, int value, size_t count, cudaStream_t stream)
     rt_device *d;
     cudaError_t e = current(&d);
     if (e != cudaSuccess) return set_error(e);
-    ocu_queue *q;
-    e = queue_for_submit(d, stream, &q);
-    if (e != cudaSuccess) return set_error(e);
-    return from(g_backend->mem_set(d->dev, q, ptr, value, count));
+    submission sub;
+    e = submit_begin(d, stream, &sub);
+    if (e != cudaSuccess) return e;
+    ocu_status st = g_backend->mem_set(d->dev, sub.q, ptr, value, count);
+    submit_end(&sub);
+    return from(st);
 }
 
 cudaError_t cudaMemset(void *ptr, int value, size_t count)
@@ -633,12 +774,13 @@ static cudaError_t symbol_copy(void *dst, const void *src, size_t count, cudaStr
     ocu_status st = g_backend->dev_info((uint32_t)tl_device, &info);
     if (st != OCU_OK) return from(st);
     if (!info.supports_unified_memory) return set_error(cudaErrorNotSupported);
-    ocu_queue *q;
-    e = queue_for_submit(d, stream, &q); /* ordered after the stream's work */
-    if (e == cudaSuccess) e = ocu_rt_error(g_backend->queue_sync(q));
-    if (e != cudaSuccess) return set_error(e);
-    if (count > 0) memmove(dst, src, count);
-    return cudaSuccess;
+    submission sub;
+    e = submit_begin(d, stream, &sub); /* ordered after the stream's work */
+    if (e != cudaSuccess) return e;
+    st = g_backend->queue_sync(sub.q);
+    if (st == OCU_OK && count > 0) memmove(dst, src, count);
+    submit_end(&sub);
+    return dev_result(d, st);
 }
 
 static cudaError_t to_symbol(const void *symbol, const void *src, size_t count,
@@ -754,7 +896,7 @@ cudaError_t cudaStreamSynchronize(cudaStream_t stream)
     rt_device *d;
     cudaError_t e = is_default(stream) ? current(&d) : device_at(stream->device, &d);
     if (e != cudaSuccess) return set_error(e);
-    return from(g_backend->queue_sync(queue_of(d, stream)));
+    return dev_result(d, g_backend->queue_sync(queue_of(d, stream)));
 }
 
 cudaError_t cudaStreamQuery(cudaStream_t stream)
@@ -762,7 +904,7 @@ cudaError_t cudaStreamQuery(cudaStream_t stream)
     rt_device *d;
     cudaError_t e = is_default(stream) ? current(&d) : device_at(stream->device, &d);
     if (e != cudaSuccess) return set_error(e);
-    return from(g_backend->queue_query(queue_of(d, stream)));
+    return dev_result(d, g_backend->queue_query(queue_of(d, stream)));
 }
 
 /*
@@ -776,7 +918,7 @@ cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t event, unsigned
     rt_device *d;
     cudaError_t e = device_at(event->device, &d);
     if (e != cudaSuccess) return set_error(e);
-    return from(g_backend->marker_wait(event->marker));
+    return dev_result(d, g_backend->marker_wait(event->marker));
 }
 
 /* ---- events -------------------------------------------------------------- */
@@ -821,22 +963,30 @@ cudaError_t cudaEventRecord(cudaEvent_t event, cudaStream_t stream)
     rt_device *d;
     cudaError_t e = device_at(event->device, &d);
     if (e != cudaSuccess) return set_error(e);
-    ocu_queue *q;
-    e = queue_for_submit(d, stream, &q);
-    if (e != cudaSuccess) return set_error(e);
-    return from(g_backend->marker_record(event->marker, q));
+    submission sub;
+    e = submit_begin(d, stream, &sub);
+    if (e != cudaSuccess) return e;
+    ocu_status st = g_backend->marker_record(event->marker, sub.q);
+    submit_end(&sub);
+    return from(st);
 }
 
 cudaError_t cudaEventSynchronize(cudaEvent_t event)
 {
     if (event == NULL) return set_error(cudaErrorInvalidResourceHandle);
-    return from(g_backend->marker_wait(event->marker));
+    rt_device *d;
+    cudaError_t e = device_at(event->device, &d);
+    if (e != cudaSuccess) return set_error(e);
+    return dev_result(d, g_backend->marker_wait(event->marker));
 }
 
 cudaError_t cudaEventQuery(cudaEvent_t event)
 {
     if (event == NULL) return set_error(cudaErrorInvalidResourceHandle);
-    return from(g_backend->marker_query(event->marker));
+    rt_device *d;
+    cudaError_t e = device_at(event->device, &d);
+    if (e != cudaSuccess) return set_error(e);
+    return dev_result(d, g_backend->marker_query(event->marker));
 }
 
 cudaError_t cudaEventElapsedTime(float *ms, cudaEvent_t start, cudaEvent_t end)
@@ -858,10 +1008,11 @@ cudaError_t ocu_rt_launch(ocu_kernel *kernel, const ocu_launch_params *params,
     cudaError_t e = current(&d);
     if (e != cudaSuccess) return set_error(e);
     if (kernel == NULL || params == NULL) return set_error(cudaErrorInvalidDeviceFunction);
-    ocu_queue *q;
-    e = queue_for_submit(d, stream, &q);
-    if (e != cudaSuccess) return set_error(e);
-    ocu_status st = g_backend->kernel_launch(q, kernel, params);
+    submission sub;
+    e = submit_begin(d, stream, &sub);
+    if (e != cudaSuccess) return e;
+    ocu_status st = g_backend->kernel_launch(sub.q, kernel, params);
+    submit_end(&sub);
     if (st == OCU_ERR_INVALID_VALUE) {
         return set_error(cudaErrorInvalidConfiguration); /* dimensions, sizes */
     }

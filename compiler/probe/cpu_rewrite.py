@@ -10,12 +10,16 @@ byte for byte, keeping line numbers:
          ->     ::ocu_cpu::launch(::ocu_cpu::cfg(CFG),
                                   [](auto &&...ocu_a_) { KERNEL(ocu_a_...); }, ARGS)
      The kernel call inside the lambda is an ordinary C++ call, so template
-     arguments, overloads and conversions resolve as in any call. A `NULL`
+     arguments, overloads and conversions resolve as in any call; the
+     lambda's return type names that call, so the launch can test which
+     argument types the kernel accepts (literal 0, below). A `NULL`
      argument becomes `nullptr` and a literal `0` becomes
      ::ocu_cpu::literal_zero{}, so both still convert to a pointer after
      being copied.
   2. Dynamic shared memory:  extern __shared__ T NAME[];
-         ->     static ::ocu_cpu::dyn_shared<T> NAME;
+         ->     T *const NAME = static_cast<T *>(::ocu_cpu::dynamic_shared());
+                inside a function, or static ::ocu_cpu::dyn_shared<T> NAME;
+                at namespace scope (looked up at each use)
      (qualifiers kept, __align__ dropped: the backend aligns to 64 bytes).
 
 Comments, string and character literals (including raw strings and
@@ -268,7 +272,7 @@ def _split_top_level(text: str) -> list[str]:
     return parts
 
 
-def _fix_null_args(args: str) -> str:
+def _fix_null_args(args: str, zero: bool = True) -> str:
     if not args.strip():
         return args
     out = []
@@ -279,7 +283,7 @@ def _fix_null_args(args: str) -> str:
         word = " ".join(lines[k] for k in code).strip()
         if word in ("NULL", "__null"):  # __null: NULL after GCC preprocessing
             new = "nullptr"
-        elif word == "0":
+        elif word == "0" and zero:
             # A literal 0 converts to a pointer in a direct call; copied into
             # the launch it would be an int. This type converts to both.
             new = "::ocu_cpu::literal_zero{}"
@@ -306,6 +310,9 @@ def _rewrite_launches(src: str) -> tuple[str, int]:
     # From the end, so earlier offsets and their mask stay valid.
     for m in reversed(opens):
         pos, open_end = m.start(), m.end()
+        before = src[:_skip_back(src, mask, pos)]
+        if re.search(r"\boperator$", before):
+            continue  # `operator<< <>`: a template operator, not a launch
         callee_from = _callee_start(src, mask, pos)
         # the callee text ends where the whitespace/comments before <<< start
         callee_end = _skip_back(src, mask, pos)
@@ -321,8 +328,9 @@ def _rewrite_launches(src: str) -> tuple[str, int]:
         args = _fix_null_args(src[j + 1:args_end])
         gaps = _layout(src[callee_end:pos] + src[close_end:j]) + "\\\n" * continued
         sep = ", " if args.strip() else ""
-        replacement = (f"::ocu_cpu::launch(::ocu_cpu::cfg({cfg}), "
-                       f"[](auto &&...{LAMBDA_ARG}) {{ {callee}({LAMBDA_ARG}...); }}"
+        replacement = (f"::ocu_cpu::launch(::ocu_cpu::cfg({_fix_null_args(cfg, zero=False)}), "
+                       f"[](auto &&...{LAMBDA_ARG}) -> decltype({callee}({LAMBDA_ARG}...)) "
+                       f"{{ {callee}({LAMBDA_ARG}...); }}"
                        f"{sep}{args}){gaps}")
         src = src[:callee_from] + replacement + src[args_end + 1:]
         mask = mask[:callee_from] + bytearray(b"\x01") * len(replacement) + mask[args_end + 1:]
@@ -334,6 +342,30 @@ _EXTERN_SHARED = re.compile(
     r"\bextern\b(?P<pre>[^;{}()\[\]]*?)\b(?:__shared__|__ocu_shared__)\b(?P<post>[^;{}\[\]]*?)"
     r"\b(?P<name>[A-Za-z_]\w*)\s*\[\s*\]\s*;")
 _ALIGN = re.compile(r"__align__\s*\(\s*\d+\s*\)")
+
+
+_BODY_TAIL = re.compile(r"\)\s*(?:(?:const|volatile|noexcept|override|final|mutable)\s*)*$")
+
+
+def _in_function(src: str, mask, pos: int) -> bool:
+    """True when `pos` is inside a function body: some enclosing '{' follows
+    a ')' (a parameter list, or if/for/while inside a function)."""
+    depth = 0
+    i = pos - 1
+    while i >= 0:
+        if mask[i]:
+            c = src[i]
+            if c == "}":
+                depth += 1
+            elif c == "{":
+                if depth == 0:
+                    j = _skip_back(src, mask, i)
+                    if _BODY_TAIL.search(src, max(0, j - 200), j):
+                        return True
+                else:
+                    depth -= 1
+        i -= 1
+    return False
 
 
 def _rewrite_extern_shared(src: str) -> tuple[str, int]:
@@ -349,8 +381,14 @@ def _rewrite_extern_shared(src: str) -> tuple[str, int]:
         if not type_:
             raise RewriteError(f"extern __shared__ {m.group('name')} has no type")
         out.append(src[last:m.start()])
-        out.append(f"static ::ocu_cpu::dyn_shared<{type_}> {m.group('name')};"
-                   f"{_layout(m.group(0))}")
+        if _in_function(src, mask, m.start()):
+            # A pointer: casts (reinterpret_cast<U *>(name), (U *)name) work.
+            out.append(f"{type_} *const {m.group('name')} = "
+                       f"static_cast<{type_} *>(::ocu_cpu::dynamic_shared());"
+                       f"{_layout(m.group(0))}")
+        else:
+            out.append(f"static ::ocu_cpu::dyn_shared<{type_}> {m.group('name')};"
+                       f"{_layout(m.group(0))}")
         last = m.end()
         count += 1
     out.append(src[last:])
