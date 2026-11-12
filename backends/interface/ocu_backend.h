@@ -190,6 +190,19 @@ typedef struct ocu_backend {
                                     void **ptr, size_t *bytes);
     ocu_status (*kernel_arg_sizes)(ocu_kernel *kernel, uint32_t *count,
                                    size_t *sizes, uint32_t max);
+
+    /*
+     * Optional (ABI 2). May be NULL; the runtime then offers these only
+     * where supports_unified_memory is set.
+     *
+     * mem_alloc_shared: memory the host and the device both use directly
+     * at the same address (freed with mem_free).
+     * host_register / host_unregister: make existing host memory usable by
+     * the device; *dev_ptr receives the address device code uses for it.
+     */
+    ocu_status (*mem_alloc_shared)(ocu_device *dev, size_t bytes, void **ptr);
+    ocu_status (*host_register)(ocu_device *dev, void *ptr, size_t bytes, void **dev_ptr);
+    ocu_status (*host_unregister)(ocu_device *dev, void *ptr);
 } ocu_backend;
 
 /* Human-readable name of a status value. Never returns NULL. */

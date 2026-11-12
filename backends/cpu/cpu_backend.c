@@ -177,6 +177,9 @@ static const ocu_backend cpu_backend = {
     .get_provider = cpu_get_provider,
     .module_get_global = NULL, /* host addresses are device addresses */
     .kernel_arg_sizes = NULL,  /* CPU images are called with typed thunks */
+    .mem_alloc_shared = NULL,  /* all memory is shared: the runtime uses mem_alloc */
+    .host_register = NULL,
+    .host_unregister = NULL,
 };
 
 const ocu_backend *ocu_backend_cpu(void)

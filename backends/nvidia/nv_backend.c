@@ -268,6 +268,60 @@ static ocu_status nv_mem_alloc(ocu_device *d, size_t bytes, void **ptr)
     return OCU_OK;
 }
 
+static ocu_status nv_mem_alloc_shared(ocu_device *d, size_t bytes, void **ptr)
+{
+    if (d == NULL) return OCU_ERR_INVALID_HANDLE;
+    if (ptr == NULL) return OCU_ERR_INVALID_VALUE;
+    if (bytes == 0) {
+        *ptr = NULL;
+        return OCU_OK;
+    }
+    ocu_status st = enter(d);
+    if (st != OCU_OK) return st;
+    nv_dptr p = 0;
+    st = map(d->nv->MemAllocManaged(&p, bytes, NV_MEM_ATTACH_GLOBAL));
+    if (st != OCU_OK) return st;
+    if (!table_add(d, p, bytes)) {
+        d->nv->MemFree(p);
+        return OCU_ERR_OUT_OF_MEMORY;
+    }
+    *ptr = (void *)(uintptr_t)p;
+    return OCU_OK;
+}
+
+static ocu_status nv_host_register(ocu_device *d, void *ptr, size_t bytes, void **dev_ptr)
+{
+    if (d == NULL) return OCU_ERR_INVALID_HANDLE;
+    if (ptr == NULL || bytes == 0 || dev_ptr == NULL) return OCU_ERR_INVALID_VALUE;
+    ocu_status st = enter(d);
+    if (st != OCU_OK) return st;
+    st = map(d->nv->MemHostRegister(ptr, bytes,
+                                    NV_MEMHOSTREGISTER_PORTABLE | NV_MEMHOSTREGISTER_DEVICEMAP));
+    if (st != OCU_OK) return st;
+    nv_dptr p = 0;
+    st = map(d->nv->MemHostGetDevicePointer(&p, ptr, 0));
+    if (st == OCU_OK && !table_add(d, p, bytes)) st = OCU_ERR_OUT_OF_MEMORY;
+    if (st != OCU_OK) {
+        d->nv->MemHostUnregister(ptr);
+        return st;
+    }
+    *dev_ptr = (void *)(uintptr_t)p;
+    return OCU_OK;
+}
+
+static ocu_status nv_host_unregister(ocu_device *d, void *ptr)
+{
+    if (d == NULL) return OCU_ERR_INVALID_HANDLE;
+    if (ptr == NULL) return OCU_ERR_INVALID_VALUE;
+    ocu_status st = enter(d);
+    if (st != OCU_OK) return st;
+    nv_dptr p = 0;
+    if (d->nv->MemHostGetDevicePointer(&p, ptr, 0) == NV_SUCCESS) (void)table_remove(d, p);
+    st = map(d->nv->CtxSynchronize()); /* work may still read it */
+    ocu_status u = map(d->nv->MemHostUnregister(ptr));
+    return st != OCU_OK ? st : u;
+}
+
 static ocu_status nv_mem_free(ocu_device *d, void *ptr)
 {
     if (d == NULL) return OCU_ERR_INVALID_HANDLE;
@@ -735,6 +789,9 @@ static const ocu_backend g_nvidia = {
     .get_provider = nv_get_provider,
     .module_get_global = nv_module_get_global,
     .kernel_arg_sizes = nv_kernel_arg_sizes,
+    .mem_alloc_shared = nv_mem_alloc_shared,
+    .host_register = nv_host_register,
+    .host_unregister = nv_host_unregister,
 };
 
 const ocu_backend *ocu_backend_nvidia(void) { return &g_nvidia; }

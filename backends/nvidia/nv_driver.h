@@ -70,6 +70,9 @@ enum {
 #define NV_STREAM_NON_BLOCKING 0x1u
 #define NV_EVENT_DEFAULT 0x0u
 #define NV_MEMHOSTALLOC_PORTABLE 0x1u
+#define NV_MEMHOSTREGISTER_PORTABLE 0x1u
+#define NV_MEMHOSTREGISTER_DEVICEMAP 0x2u
+#define NV_MEM_ATTACH_GLOBAL 0x1u
 
 /* The driver entry points the backend uses, resolved by nv_load(). */
 typedef struct nv_api {
@@ -112,6 +115,10 @@ typedef struct nv_api {
     nv_result (*EventQuery)(nv_event e);
     nv_result (*EventElapsedTime)(float *ms, nv_event start, nv_event end);
     nv_result (*GetErrorName)(nv_result r, const char **name);
+    nv_result (*MemAllocManaged)(nv_dptr *ptr, size_t bytes, unsigned flags);
+    nv_result (*MemHostRegister)(void *ptr, size_t bytes, unsigned flags);
+    nv_result (*MemHostUnregister)(void *ptr);
+    nv_result (*MemHostGetDevicePointer)(nv_dptr *dptr, void *ptr, unsigned flags);
 } nv_api;
 
 /*

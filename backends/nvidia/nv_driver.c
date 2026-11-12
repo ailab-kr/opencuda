@@ -69,6 +69,10 @@ static void load_once(void)
     NV_SYM(EventQuery, "cuEventQuery");
     NV_SYM(EventElapsedTime, "cuEventElapsedTime");
     NV_SYM(GetErrorName, "cuGetErrorName");
+    NV_SYM(MemAllocManaged, "cuMemAllocManaged");
+    NV_SYM(MemHostRegister, "cuMemHostRegister_v2");
+    NV_SYM(MemHostUnregister, "cuMemHostUnregister");
+    NV_SYM(MemHostGetDevicePointer, "cuMemHostGetDevicePointer_v2");
 #undef NV_SYM
     if (!ok || a.Init(0) != NV_SUCCESS) {
         dlclose(lib);
