@@ -87,11 +87,11 @@ def clang_env() -> dict:
     return env
 
 
-def device_cmd(clang: str, flags: list[str]) -> list[str]:
+def device_cmd(clang: str, flags: list[str], define: str = "OCU_METAL_PATH") -> list[str]:
     rt = REPO / "runtime" / "include"
     return [clang, "-x", "cuda", "--cuda-device-only", "-nocudainc", "-nocudalib",
             f"--cuda-path={cuda_path()}", "--cuda-gpu-arch=sm_80", "-std=c++17",
-            f"-I{rt}", "-include", str(rt / "cuda_runtime.h"), "-DOCU_METAL_PATH",
+            f"-I{rt}", "-include", str(rt / "cuda_runtime.h"), f"-D{define}",
             "-Wno-unknown-cuda-version", *flags]
 
 
@@ -199,7 +199,7 @@ SCALAR_SIZES = {
     "bool": 1, "char": 1, "signed char": 1, "unsigned char": 1, "short": 2,
     "unsigned short": 2, "int": 4, "unsigned int": 4, "unsigned": 4, "float": 4,
     "long": 8, "unsigned long": 8, "long long": 8, "unsigned long long": 8,
-    "size_t": 8, "half": 2, "__half": 2, "int8_t": 1, "uint8_t": 1, "int16_t": 2,
+    "size_t": 8, "double": 8, "half": 2, "__half": 2, "int8_t": 1, "uint8_t": 1, "int16_t": 2,
     "uint16_t": 2, "int32_t": 4, "uint32_t": 4, "int64_t": 8, "uint64_t": 8,
     "std::int8_t": 1, "std::uint8_t": 1, "std::int16_t": 2, "std::uint16_t": 2,
     "std::int32_t": 4, "std::uint32_t": 4, "std::int64_t": 8, "std::uint64_t": 8,
@@ -208,7 +208,7 @@ SCALAR_SIZES = {
 }
 PACK = {"bool": "?", "char": "b", "signed char": "b", "unsigned char": "B", "short": "h",
         "unsigned short": "H", "int": "i", "unsigned int": "I", "unsigned": "I",
-        "float": "f", "long": "q", "unsigned long": "Q", "long long": "q",
+        "float": "f", "double": "d", "long": "q", "unsigned long": "Q", "long long": "q",
         "unsigned long long": "Q"}
 
 CASTS = ("CStyleCastExpr", "CXXStaticCastExpr", "CXXReinterpretCastExpr", "CXXConstCastExpr",
@@ -247,6 +247,40 @@ class Instance:
 
 
 class Translator:
+    """CUDA to MSL. Subclasses for other targets whose kernel language has
+    the same address-space model (compiler/opencl/cu2ocl.py) override the
+    class attributes and the kernel_head / context_init / vec3_read /
+    prelude hooks."""
+    TARGET = "Metal"            # in messages: "not available on Metal"
+    CHIP = "Apple GPUs"         # in messages: "double is not available on ..."
+    DOUBLE_OK = False
+    PATH_DEFINE = "OCU_METAL_PATH"
+    MAGIC = "OCUMSL1"
+    GLOB_PARAM = "ocu_glob [[buffer(2)]]"  # in a kernel head that takes the variables buffer
+    UNAVAILABLE = NO_METAL
+
+    def has_double(self, t: str) -> bool:
+        return not self.DOUBLE_OK and has_double(t)
+
+    def kernel_head(self, inst) -> str:
+        glob = "    device uchar *ocu_glob [[buffer(2)]],\n" if self.globals else ""
+        return (f"kernel void {inst.name}(constant uchar *ocu_args [[buffer(0)]],\n"
+                "    constant uint *ocu_offs [[buffer(1)]],\n" + glob +
+                "    threadgroup uchar *ocu_dyn [[threadgroup(0)]],\n"
+                "    uint3 ocu_tid [[thread_position_in_threadgroup]],\n"
+                "    uint3 ocu_bid [[threadgroup_position_in_grid]],\n"
+                "    uint3 ocu_bdim [[threads_per_threadgroup]],\n"
+                "    uint3 ocu_gdim [[threadgroups_per_grid]])")
+
+    def context_init(self, glob: str) -> str:
+        return f"\n    ocu_context ocu_ctx{{ocu_tid, ocu_bid, ocu_bdim, ocu_gdim, ocu_dyn, {glob}}};\n"
+
+    def vec3_read(self, t: str, base: str, name: str, i: int) -> str:
+        return f"    {t} {name} = {base}(ocu_arg<packed_{base}>(ocu_args, ocu_offs, {i}));"
+
+    def prelude(self) -> str:
+        return (HERE / "msl_prelude.h").read_text(encoding="utf-8")
+
     def __init__(self, src: Path, flags: list[str], clang: str):
         self.src = src
         self.flags = flags
@@ -344,7 +378,7 @@ class Translator:
 
     def load(self):
         self.chevrons()
-        cmd = device_cmd(self.clang, self.flags) + ["-fsyntax-only", "-Xclang", "-ast-dump=json",
+        cmd = device_cmd(self.clang, self.flags, self.PATH_DEFINE) + ["-fsyntax-only", "-Xclang", "-ast-dump=json",
                                                     str(self.src)]
         tu = json.loads(run(cmd, "syntax tree"))
         annotate_files(tu)
@@ -427,11 +461,11 @@ class Translator:
     def macros(self) -> list[str]:
         """#define/#undef lines from user files and the command line, in order,
         as the device pass saw them (inactive #if branches are not there)."""
-        cmd = device_cmd(self.clang, self.flags) + ["-E", "-dD", str(self.src)]
+        cmd = device_cmd(self.clang, self.flags, self.PATH_DEFINE) + ["-E", "-dD", str(self.src)]
         out = run(cmd, "macros")
         lines, cur, keep = [], None, False
         builtin_keep = {"__CUDA_ARCH__", "__CUDACC__", "__CUDA__", "__NVCC__", "CUDA_VERSION",
-                        "CUDART_VERSION", "OCU_METAL_PATH"}
+                        "CUDART_VERSION", self.PATH_DEFINE}
         skip = {"__global__", "__device__", "__host__", "__shared__", "__constant__",
                 "__forceinline__", "__noinline__", "__restrict__", "__launch_bounds__",
                 "__managed__", "__align__"}
@@ -463,7 +497,7 @@ class Translator:
             for i, t in enumerate(types):
                 body.append(f"extern char (*ocu_layout_{i})[sizeof({t})][alignof({t})];")
             w.write_text("\n".join(body) + "\n")
-            out = run(device_cmd(self.clang, self.flags) +
+            out = run(device_cmd(self.clang, self.flags, self.PATH_DEFINE) +
                       ["-fsyntax-only", "-Xclang", "-ast-dump=json", "-Xclang",
                        "-ast-dump-filter=ocu_layout_", str(w)], "layout")
         for m in re.finditer(r'"name":\s*"ocu_layout_(\d+)",\s*(?:"mangledName":\s*"[^"]*",\s*)?'
@@ -489,7 +523,7 @@ class Translator:
             if ck == "IntegralToPointer":
                 return "device"
             if ck == "FunctionToPointerDecay":
-                raise TranslateError(f"'{st['fname']}': function pointers are not available on Metal")
+                raise TranslateError(f"'{st['fname']}': function pointers are not available on {self.TARGET}")
             if inner is None:
                 return None
             if not (is_pointer(dtype(inner)) or "[" in dtype(inner)):
@@ -606,8 +640,8 @@ class Translator:
         if callee is not None and callee.get("kind") == "DeclRefExpr":
             ref = callee.get("referencedDecl", {})
             st["callees"].add(callee["id"])
-            if ref.get("name") in NO_METAL:
-                raise TranslateError(f"'{st['fname']}': {NO_METAL[ref['name']]} is not available on Metal")
+            if ref.get("name") in self.UNAVAILABLE:
+                raise TranslateError(f"'{st['fname']}': {self.UNAVAILABLE[ref['name']]} is not available on {self.TARGET}")
             d = self.defs.get(ref.get("id"))
             if d is not None:
                 params = [c for c in kids(d) if c.get("kind") == "ParmVarDecl"]
@@ -642,7 +676,7 @@ class Translator:
             if callee.get("kind") in ("UnresolvedLookupExpr",):
                 pass
             else:
-                raise TranslateError(f"'{st['fname']}': calls through pointers are not available on Metal")
+                raise TranslateError(f"'{st['fname']}': calls through pointers are not available on {self.TARGET}")
         st["calls"][e["id"]] = inst
         return inst
 
@@ -685,8 +719,8 @@ class Translator:
                     raise TranslateError(f"'{d['name']}': template argument for '{name}' is not a type")
                 if is_pointer(at) or is_ref(at) or "(" in at or "[" in at:
                     raise TranslateError(f"'{d['name']}': template argument '{at}' (pointer, array or function type) is not handled yet")
-                if has_double(at):
-                    raise TranslateError(f"'{d['name']}': double is not available on Apple GPUs")
+                if self.has_double(at):
+                    raise TranslateError(f"'{d['name']}': double is not available on {self.CHIP}")
                 out.append(f"typedef {at} {name};")
             else:
                 if "value" not in a:
@@ -749,8 +783,8 @@ class Translator:
         ret = self.return_type(fn)
         for i, p in enumerate(params):
             t = dtype(p)
-            if has_double(t) or has_double(qtype(p)):
-                raise TranslateError(f"'{fname}': double is not available on Apple GPUs")
+            if self.has_double(t) or self.has_double(qtype(p)):
+                raise TranslateError(f"'{fname}': double is not available on {self.CHIP}")
             if is_pointer(t):
                 if is_pointer(pointee(t)):
                     raise TranslateError(f"'{fname}': pointers to pointers are not handled yet")
@@ -815,24 +849,24 @@ class Translator:
                     et = self.dyn_shared[rid]
                     st["edits"].append((cb, ce, f"((threadgroup {et} *)ocu_ctx.dyn)"))
                 elif ref.get("kind") == "FunctionDecl" and rid in self.defs and n["id"] not in st["callees"]:
-                    raise TranslateError(f"'{fname}': taking the address of '{ref.get('name')}' is not available on Metal")
+                    raise TranslateError(f"'{fname}': taking the address of '{ref.get('name')}' is not available on {self.TARGET}")
                 elif ref.get("kind") == "VarDecl" and rid not in st["vars"] and rid not in self.consts \
                         and ref.get("name") not in ("threadIdx", "blockIdx", "blockDim", "gridDim", "warpSize"):
                     pass  # variables from the runtime headers: the prelude has them
             elif k == "ReturnStmt" and kids(n) and is_pointer(ret):
                 ret_space = merge(ret_space, self.ptr_space(kids(n)[0], st), f"'{fname}': the returned pointer")
             elif k in ("GCCAsmStmt", "MSAsmStmt"):
-                raise TranslateError(f"'{fname}': inline assembly is not available on Metal")
+                raise TranslateError(f"'{fname}': inline assembly is not available on {self.TARGET}")
             elif k in ("LambdaExpr", "CXXThisExpr", "CXXNewExpr", "CXXDeleteExpr", "CXXThrowExpr",
                        "CXXTryStmt", "CXXTypeidExpr"):
                 raise TranslateError(f"'{fname}': {k[3:] if k.startswith('CXX') else k} is not handled yet")
             t = qtype(n)
-            if has_double(t) and k not in ("FloatingLiteral", "ImplicitCastExpr", "BinaryOperator",
+            if self.has_double(t) and k not in ("FloatingLiteral", "ImplicitCastExpr", "BinaryOperator",
                                            "ParenExpr", "UnaryOperator", "CallExpr", "DeclRefExpr",
                                            "ConditionalOperator", "CompoundAssignOperator"):
-                raise TranslateError(f"'{fname}': double is not available on Apple GPUs")
-            if k in ("CStyleCastExpr", "CXXStaticCastExpr", "CXXFunctionalCastExpr") and has_double(t):
-                raise TranslateError(f"'{fname}': double is not available on Apple GPUs")
+                raise TranslateError(f"'{fname}': double is not available on {self.CHIP}")
+            if k in ("CStyleCastExpr", "CXXStaticCastExpr", "CXXFunctionalCastExpr") and self.has_double(t):
+                raise TranslateError(f"'{fname}': double is not available on {self.CHIP}")
         # pointer and reference declarations: their address space, once known
         groups: dict[int, set] = {}
         for pos, rid, auto in st["decls"]:
@@ -855,8 +889,8 @@ class Translator:
     def local_var(self, n, inst, st):
         fname = st["fname"]
         t, td = qtype(n), dtype(n)
-        if has_double(t) or has_double(td):
-            raise TranslateError(f"'{fname}': double is not available on Apple GPUs")
+        if self.has_double(t) or self.has_double(td):
+            raise TranslateError(f"'{fname}': double is not available on {self.CHIP}")
         attrs = {c.get("kind") for c in kids(n)}
         text = st["text"]
         if "CUDASharedAttr" in attrs:
@@ -918,8 +952,8 @@ class Translator:
     def head(self, inst: Instance, params, ret) -> tuple[str, str | None]:
         fn = inst.fn
         fname = fn["name"]
-        if has_double(ret):
-            raise TranslateError(f"'{fname}': double is not available on Apple GPUs")
+        if self.has_double(ret):
+            raise TranslateError(f"'{fname}': double is not available on {self.CHIP}")
         if inst.kernel:
             sizes = []
             for i, p in enumerate(params):
@@ -928,14 +962,7 @@ class Translator:
                     sizes.append(8)
                 else:
                     sizes.append(self.value_size(strip_qual(t), fname))
-            glob = "    device uchar *ocu_glob [[buffer(2)]],\n" if self.globals else ""
-            head = (f"kernel void {inst.name}(constant uchar *ocu_args [[buffer(0)]],\n"
-                    "    constant uint *ocu_offs [[buffer(1)]],\n" + glob +
-                    "    threadgroup uchar *ocu_dyn [[threadgroup(0)]],\n"
-                    "    uint3 ocu_tid [[thread_position_in_threadgroup]],\n"
-                    "    uint3 ocu_bid [[threadgroup_position_in_grid]],\n"
-                    "    uint3 ocu_bdim [[threads_per_threadgroup]],\n"
-                    "    uint3 ocu_gdim [[threadgroups_per_grid]])")
+            head = self.kernel_head(inst)
             return head, f"param {inst.name} " + " ".join(str(s) for s in sizes)
         if is_ref(ret):
             raise TranslateError(f"'{fname}': functions returning references are not handled yet")
@@ -958,7 +985,7 @@ class Translator:
                 decls.append(f"{inst.spaces[i]} {t} {name}")
             else:
                 if "(" in td:
-                    raise TranslateError(f"'{fname}': function pointer parameters are not available on Metal")
+                    raise TranslateError(f"'{fname}': function pointer parameters are not available on {self.TARGET}")
                 decls.append(f"{t} {name}")
         if fname.startswith("operator"):
             return f"static {ret} {inst.name}(" + ", ".join(decls) + ")", None
@@ -968,8 +995,8 @@ class Translator:
     def value_size(self, t: str, fname: str) -> int:
         if t in SCALAR_SIZES:
             return SCALAR_SIZES[t]
-        if has_double(t):
-            raise TranslateError(f"'{fname}': double is not available on Apple GPUs")
+        if self.has_double(t):
+            raise TranslateError(f"'{fname}': double is not available on {self.CHIP}")
         if t in self.layout:
             return self.layout[t][0]
         raise TranslateError(f"'{fname}': argument type '{t}' has no known layout")
@@ -985,14 +1012,13 @@ class Translator:
                 base = strip_qual(t)
                 m = VEC3.fullmatch(base)
                 if m:
-                    reads.append(f"    {t} {name} = {base}(ocu_arg<packed_{base}>(ocu_args, ocu_offs, {i}));")
+                    reads.append(self.vec3_read(t, base, name, i))
                 else:
                     reads.append(f"    {t} {name} = ocu_arg<{base}>(ocu_args, ocu_offs, {i});")
                     if base not in SCALAR_SIZES:
                         self.asserts.append(base)
         glob = "ocu_glob" if self.globals else "nullptr"
-        return (f"\n    ocu_context ocu_ctx{{ocu_tid, ocu_bid, ocu_bdim, ocu_gdim, ocu_dyn, {glob}}};\n"
-                + "\n".join(reads))
+        return self.context_init(glob) + "\n".join(reads)
 
     @staticmethod
     def apply(seg: str, base: int, edits, fname) -> str:
@@ -1019,10 +1045,10 @@ class Translator:
         n = g["node"]
         name = n["name"]
         t, td = qtype(n), dtype(n)
-        if has_double(t) or has_double(td):
-            raise TranslateError(f"'{name}': double is not available on Apple GPUs")
+        if self.has_double(t) or self.has_double(td):
+            raise TranslateError(f"'{name}': double is not available on {self.CHIP}")
         if "(" in td:
-            raise TranslateError(f"'{name}': function pointer variables are not available on Metal")
+            raise TranslateError(f"'{name}': function pointer variables are not available on {self.TARGET}")
         if is_pointer(td) and "[" not in td:
             if is_pointer(pointee(td)):
                 raise TranslateError(f"'{name}': pointers to pointers are not handled yet")
@@ -1035,7 +1061,7 @@ class Translator:
         else:
             g["typedef"] = f"typedef {t} ocu_gt_{name};"
         if VEC3.search(td) or VEC3.search(t):
-            raise TranslateError(f"'{name}': 3-component vector variables are laid out differently on Metal")
+            raise TranslateError(f"'{name}': 3-component vector variables are laid out differently on {self.TARGET}")
         g["type"] = t
         g["expr"] = f"(*(device ocu_gt_{name} *)(ocu_ctx.glob + OCU_G_{name}))"
         g["name"] = name
@@ -1176,8 +1202,8 @@ class Translator:
         edits = []
         if k == "VarDecl":
             t = qtype(n)
-            if has_double(t):
-                raise TranslateError(f"'{name}': double is not available on Apple GPUs")
+            if self.has_double(t):
+                raise TranslateError(f"'{name}': double is not available on {self.CHIP}")
             if is_pointer(dtype(n)) or "*" in t:
                 raise TranslateError(f"'{name}': pointer constants are not handled yet")
             seg = text[b:e]
@@ -1195,10 +1221,10 @@ class Translator:
             if rk == "FieldDecl":
                 ft, fd = qtype(r), dtype(r)
                 fname = f"'{name}.{r.get('name', '')}'"
-                if has_double(ft) or has_double(fd):
-                    raise TranslateError(f"{fname}: double is not available on Apple GPUs")
+                if self.has_double(ft) or self.has_double(fd):
+                    raise TranslateError(f"{fname}: double is not available on {self.CHIP}")
                 if VEC3.search(ft) or VEC3.search(fd):
-                    raise TranslateError(f"{fname}: 3-component vectors are laid out differently on Metal")
+                    raise TranslateError(f"{fname}: 3-component vectors are laid out differently on {self.TARGET}")
                 if is_ref(fd):
                     raise TranslateError(f"{fname}: reference fields are not handled")
                 if "*" in fd:
@@ -1215,8 +1241,8 @@ class Translator:
             ut = (n.get("type") or {}).get("qualType", "")
             for c in kids(n):
                 ut = ut or qtype(c)
-            if has_double(td) or has_double(ut):
-                raise TranslateError(f"'{name}': double is not available on Apple GPUs")
+            if self.has_double(td) or self.has_double(ut):
+                raise TranslateError(f"'{name}': double is not available on {self.CHIP}")
             if "*" in td and "{" not in text[b:e]:
                 raise TranslateError(f"'{name}': pointer typedefs are not handled yet")
             if VEC3.fullmatch(strip_qual(td)) and "{" not in text[b:e]:
@@ -1275,7 +1301,7 @@ class Translator:
             for p in kids(k):
                 if p.get("kind") == "ParmVarDecl":
                     t = strip_qual(no_restrict(dtype(p)))
-                    if not is_pointer(t) and t not in SCALAR_SIZES and not has_double(t):
+                    if not is_pointer(t) and t not in SCALAR_SIZES and not self.has_double(t):
                         need.append(t)
         if need:
             self.probe_layouts(need)
@@ -1305,7 +1331,7 @@ class Translator:
             raise TranslateError("no kernel could be translated")
         meta = []
         glines = self.place_globals() if self.globals else []
-        if not glines and any("ocu_glob [[buffer(2)]]" in i.head for i in self.order):
+        if not glines and any(self.GLOB_PARAM in i.head for i in self.order):
             glines = ["global ocu_no_variables 0 4"]  # every variable left out: buffer 2 stays bound
         params = [i.param_line for i in self.order if i.param_line]
         # code, then the declarations it names (fixed point over identifiers)
@@ -1362,20 +1388,21 @@ class Translator:
                     add_tokens(texts[i])
         decls = [texts[i] for i in sorted(chosen)]
         asserts = [f'static_assert(sizeof({t}) == {self.layout[t][0]}, '
-                   f'"cu2msl: {t} is laid out differently on Metal");'
+                   f'"cu2msl: {t} is laid out differently on {self.TARGET}");'
                    for t in dict.fromkeys(self.asserts) if t in self.layout]
         asserts += [f'static_assert(sizeof(ocu_gt_{g["name"]}) == {g["size"]}, '
-                    f'"cu2msl: {g["name"]} is laid out differently on Metal");'
+                    f'"cu2msl: {g["name"]} is laid out differently on {self.TARGET}");'
                     for g in self.globals.values()]
         protos = [i.head + ";" for i in self.order if not i.kernel]
-        prelude = (HERE / "msl_prelude.h").read_text(encoding="utf-8")
+        prelude = self.prelude()
         source = "\n".join([prelude, "// ---- macros", *macro_lines, "// ---- types and constants",
                             *decls, *gdefs, *asserts, "// ---- functions", *protos, *code]) + "\n"
         meta = params + glines
-        return "OCUMSL1\n" + "\n".join(meta) + "\n---\n" + source
+        return self.MAGIC + "\n" + "\n".join(meta) + "\n---\n" + source
 
 
-def main(argv):
+def main(argv, translator=None):
+    translator = translator or Translator
     ap = argparse.ArgumentParser()
     ap.add_argument("source")
     ap.add_argument("-o", "--output", required=True)
@@ -1388,10 +1415,10 @@ def main(argv):
     a = ap.parse_args(argv)
     flags = [f"-I{d}" for d in a.I] + [f"-D{d}" for d in a.D]
     try:
-        image = Translator(Path(a.source).resolve(), flags, a.clang).run(
+        image = translator(Path(a.source).resolve(), flags, a.clang).run(
             a.keep_going, sys.stdout if a.report else None)
     except TranslateError as e:
-        print(f"{a.source}: cannot translate for Metal: {e}", file=sys.stderr)
+        print(f"{a.source}: cannot translate for {translator.TARGET}: {e}", file=sys.stderr)
         return 1
     Path(a.output).write_bytes(image.encode("latin-1"))  # source bytes as they were
     return 0
