@@ -8,7 +8,15 @@ using namespace metal;
 struct ocu_context {
     uint3 tid, bid, bdim, gdim;
     threadgroup uchar *dyn; // the launch's dynamic threadgroup memory
+    device uchar *glob;     // the module's __device__/__constant__ variables (buffer 2)
 };
+// Built-in index variables: every translated function has ocu_ctx in scope
+// (kernels declare it, device functions take it as their first parameter).
+#define threadIdx ocu_ctx.tid
+#define blockIdx ocu_ctx.bid
+#define blockDim ocu_ctx.bdim
+#define gridDim ocu_ctx.gdim
+#define warpSize 32
 template <typename T> T ocu_arg(constant uchar *a, constant uint *o, uint i)
 {
     return *(constant T *)(a + o[i]);
@@ -26,6 +34,9 @@ template <typename P> P ocu_ptr(constant uchar *a, constant uint *o, uint i)
 #define __noinline__
 #define __restrict__
 #define __launch_bounds__(...)
+
+// ---- loads through the read-only path: plain loads on Apple GPUs ----------------------
+template <typename T> T __ldg(const device T *p) { return *p; }
 
 // ---- synchronisation ------------------------------------------------------------------
 #define __syncthreads() threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device)
@@ -81,7 +92,17 @@ inline float __cosf(float x) { return fast::cos(x); }
 inline float __powf(float x, float y) { return fast::pow(x, y); }
 inline float __fdividef(float x, float y) { return fast::divide(x, y); }
 inline float __saturatef(float x) { return saturate(x); }
+inline float __log2f(float x) { return fast::log2(x); }
+inline float __log10f(float x) { return fast::log10(x); }
+inline float __exp10f(float x) { return fast::exp10(x); }
+inline float __tanf(float x) { return fast::tan(x); }
+inline float __fmaf_rn(float a, float b, float c) { return fma(a, b, c); }
+// 24-bit multiplies: the low 24 bits of each operand (sign-extended for __mul24)
+inline int __mul24(int a, int b) { return ((a << 8) >> 8) * ((b << 8) >> 8); }
+inline uint __umul24(uint a, uint b) { return (a & 0xffffffu) * (b & 0xffffffu); }
 inline int __float2int_rn(float x) { return int(rint(x)); }
+inline int __float2int_rz(float x) { return int(x); }
+inline uint __float2uint_rz(float x) { return uint(x); }
 inline int __float_as_int(float x) { return as_type<int>(x); }
 inline float __int_as_float(int x) { return as_type<float>(x); }
 inline uint __float_as_uint(float x) { return as_type<uint>(x); }
