@@ -48,6 +48,29 @@ Launch symbols the compiler emits calls to:
 6. **Clean-room guard is required.** This machine has a vendor CUDA installation at `/usr/local/cuda` (13.3), and clang finds it automatically. `-nocudainc` alone stops header inclusion, but our driver and build must always pass `--cuda-path=<a folder we own>` and `-nocudainc -nocudalib`. A CI check should fail if any vendor path appears in compiler command lines or dependency files.
 7. **Toolchain gap.** Ubuntu's clang-18 package does not ship `clang-offload-bundler`, so a multi-target fat binary did not build. We can embed per-target code objects ourselves (we own the registration format), or install a fuller LLVM. Decide in P0-W4.
 
+## Rewriter on real code (2026-11-12)
+
+`compiler/probe/survey_rewrite.py` ran the rewriter over two public CUDA code bases, read as text only:
+
+| Code base | Files | Launches in code | Rewritten | Left | Files failed | `extern __shared__` rewritten |
+|---|---|---|---|---|---|---|
+| Rodinia (CUDA part, public mirror `yuhc/gpu-rodinia`) | 89 | 81 | 81 | 0 | 0 | 2 |
+| llama.cpp `ggml/src/ggml-cuda` (MIT) | 303 | 192 | 192 | 0 | 0 | 20 |
+
+Line counts were preserved in every file. Whether the rewritten files then compile was not checked: they also need the CUDA runtime API, which waits for legal review.
+
+Features those files use that the CPU path does not support yet (number of files):
+
+| Feature | Rodinia | llama.cpp |
+|---|---|---|
+| CUDA runtime API calls | 42 | 26 |
+| `__constant__` memory | 9 | 0 |
+| Textures | 5 | 0 |
+| Atomics | 6 | 3 |
+| Warp shuffles | 0 | 12 |
+| Warp votes | 0 | 4 |
+| Inline PTX assembly | 0 | 4 |
+
 ## CPU path limits found so far
 
 - Kernels launched from inside a kernel (dynamic parallelism) are refused with "not supported".
