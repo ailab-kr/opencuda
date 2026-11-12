@@ -94,3 +94,48 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   set_tests_properties(conformance_blas_cpu_queue PROPERTIES
     ENVIRONMENT "OCU_BACKEND=cpu;OCU_DRIVER_QUEUE=1;OCU_CPU_ORDER=random")
 endif()
+
+# ---- ocu_cc.py (probe driver): every target, and a CPU program end to end
+if(OCU_BACKEND_CPU AND Python3_FOUND)
+  set(OCU_CC ${PROJECT_SOURCE_DIR}/compiler/probe/ocu_cc.py)
+  set(OCU_CC_OUT ${CMAKE_CURRENT_BINARY_DIR}/ocu_cc)
+  add_custom_command(
+    OUTPUT ${OCU_CC_OUT}/probe_kernel.cpu.o
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${OCU_CC_OUT}
+    COMMAND ${CMAKE_COMMAND} -E env CXX=${CMAKE_CXX_COMPILER}
+            ${Python3_EXECUTABLE} ${OCU_CC} --target cpu -O2
+            -I ${PROJECT_SOURCE_DIR}/runtime/core
+            -c ${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu
+            -o ${OCU_CC_OUT}/probe_kernel.cpu.o
+    DEPENDS ${OCU_CC} ${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu
+            ${PROJECT_SOURCE_DIR}/compiler/probe/cpu_rewrite.py
+            ${PROJECT_SOURCE_DIR}/compiler/probe/probe_cpu.h
+    COMMENT "ocu_cc.py --target cpu probe_kernel.cu")
+  add_executable(ocu_cc_saxpy probe/main_saxpy.cpp
+    ${PROJECT_SOURCE_DIR}/compiler/probe/probe_cpu_runtime.cpp
+    ${OCU_CC_OUT}/probe_kernel.cpu.o)
+  target_include_directories(ocu_cc_saxpy PRIVATE ${PROJECT_SOURCE_DIR}/compiler/probe)
+  target_compile_definitions(ocu_cc_saxpy PRIVATE OCU_CPU_PATH)
+  target_link_libraries(ocu_cc_saxpy PRIVATE ocu_core ocu_backend_cpu)
+  add_test(NAME ocu_cc_cpu_saxpy COMMAND ocu_cc_saxpy)
+
+  find_program(OCU_CLANGXX NAMES clang++-18 clang++ PATHS /usr/lib/llvm-18/bin)
+  if(OCU_CLANGXX)
+    foreach(t "nvidia;sm_80;ptx" "amd;gfx1100;co" "amd;gfx1201;co")
+      list(GET t 0 target)
+      list(GET t 1 arch)
+      list(GET t 2 ext)
+      foreach(src probe_kernel probe_features probe_review probe_warp)
+        add_test(NAME ocu_cc_${target}_${arch}_${src}
+          COMMAND ${Python3_EXECUTABLE} ${OCU_CC} --target ${target} --arch ${arch}
+                  --cache ${OCU_CC_OUT}
+                  -c ${PROJECT_SOURCE_DIR}/compiler/probe/${src}.cu
+                  -o ${OCU_CC_OUT}/${src}.${arch}.${ext})
+      endforeach()
+    endforeach()
+  endif()
+  add_test(NAME ocu_cc_refuses_vendor_path
+    COMMAND ${Python3_EXECUTABLE} ${OCU_CC} --target cpu -I /usr/local/cuda/include
+            -c ${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu -o ${OCU_CC_OUT}/x.o)
+  set_tests_properties(ocu_cc_refuses_vendor_path PROPERTIES WILL_FAIL TRUE)
+endif()
