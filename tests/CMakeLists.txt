@@ -198,6 +198,32 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   ocu_ptx_shift_cmd(ptx_shift_cmd_print_cpu cpu DEFS -DMODE=print)
   ocu_ptx_shift_cmd(ptx_shift_cmd_unsupported_amd cpu DEFS -DMODE=unsupported -DARGS=--target|amd)
   ocu_ptx_shift_cmd(ptx_shift_cmd_unsupported_nvidia_ptx cpu DEFS -DMODE=unsupported "-DARGS=--target|nvidia|--arch|sm_80" OUTEXT ptx)
+
+  # Exact software fma/fmaf (runtime/include/ocu_fma_exact.h): kernel functions,
+  # host std::fma with ocu_cudart linked, the header's software functions, and
+  # powf within its documented bound.  Tables: runtime/gen_fma_tables.py.
+  ocu_add_cpu_cu_executable(fma_exact_test runtime/fma_exact_test.cu)
+  add_test(NAME fma_exact COMMAND fma_exact_test)
+  add_test(NAME fma_exact_powf COMMAND fma_exact_test powf)
+  # What the configure check decided against what the C library does, and
+  # against the platform: glibc exact, MinGW-w64 not.
+  add_executable(fma_libm_probe runtime/fma_libm_probe.c)
+  if(UNIX)
+    target_link_libraries(fma_libm_probe PRIVATE m)
+  endif()
+  string(REGEX REPLACE "^(ON|TRUE|1|Y|YES)$" "1" _fma_got "${OCU_LIBM_FMA_EXACT}")
+  string(REGEX REPLACE "^(OFF|FALSE|0|N|NO)$" "0" _fma_got "${_fma_got}")
+  add_test(NAME fma_configure_matches_libm COMMAND ${CMAKE_CROSSCOMPILING_EMULATOR} $<TARGET_FILE:fma_libm_probe> ${_fma_got})
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(_fma_want ON)
+  elseif(WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    set(_fma_want OFF)
+  endif()
+  if(DEFINED _fma_want)
+    add_test(NAME fma_configure_platform
+      COMMAND ${CMAKE_COMMAND} -DGOT=${OCU_LIBM_FMA_EXACT} -DWANT=${_fma_want}
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/runtime/fma_configure_check.cmake)
+  endif()
   # Runtime API gaps (card runtime-llama-gaps): data types, attribute
   # policy, PCI bus id, peer access, cooperative launch. The compute
   # capability variants pass the expected value as arguments.
@@ -488,6 +514,10 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
     ocu_add_nvidia_cu_executable(ptx_shift_run_nv compiler/ptx_shift/ptx_shift_run.cu PTX_SHIFT)
     add_test(NAME gpu_ptx_shift COMMAND run_if_nvidia $<TARGET_FILE:ptx_shift_run_nv>)
     set_tests_properties(gpu_ptx_shift PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+    ocu_add_nvidia_cu_executable(fma_exact_test_nv runtime/fma_exact_test.cu)
+    add_test(NAME gpu_fma_exact COMMAND run_if_nvidia $<TARGET_FILE:fma_exact_test_nv>)
+    add_test(NAME gpu_fma_exact_powf COMMAND run_if_nvidia $<TARGET_FILE:fma_exact_test_nv> powf)
+    set_tests_properties(gpu_fma_exact gpu_fma_exact_powf PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
     add_test(NAME gpu_ptx_shift_eval_order COMMAND run_if_nvidia $<TARGET_FILE:ptx_shift_run_nv> order)
     set_tests_properties(gpu_ptx_shift_eval_order PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
     ocu_add_nvidia_cu_executable(rt_trap_nv runtime/rt_trap.cu)
