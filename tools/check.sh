@@ -78,6 +78,19 @@ EOF
     done
 fi
 
+# 3b. AArch64 (the fast fiber switch has a separate implementation there):
+#     cross-build statically and run every test under qemu-user, when the
+#     cross compiler and qemu are installed.
+if command -v aarch64-linux-gnu-g++ >/dev/null 2>&1 && command -v qemu-aarch64 >/dev/null 2>&1; then
+    step build_aarch64_qemu build_and_test "$root/aarch64" \
+        -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+        -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+        -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+        -DCMAKE_ASM_COMPILER=aarch64-linux-gnu-gcc \
+        -DCMAKE_EXE_LINKER_FLAGS=-static \
+        -DCMAKE_CROSSCOMPILING_EMULATOR=qemu-aarch64
+fi
+
 # 4. Conformance harness unit tests.
 step harness sh -c "cd '$repo/conformance/harness' && python3 -m unittest discover -s tests"
 

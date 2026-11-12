@@ -178,7 +178,7 @@ GPU 코드를 CPU에서 그대로 실행한다. 속도가 아니라 정확성 �
 
 빌드 옵션: `OCU_BACKEND_CPU`(기본 켬), `OCU_BACKEND_AMD`, `OCU_BACKEND_INTEL`(아직 없음, 켜면 오류), `OCU_BUILD_TESTS`(기본 켬), `OCU_CPU_UCONTEXT`(기본 끔).
 
-전체 검증은 `tools/check.sh` 하나로 한다. gcc·clang 빌드(경고는 실패), 주소·정의되지 않은 동작·스레드 검사, 채점기 시험, 컴파일러 실험, 클린룸 점검을 돈다.
+전체 검증은 `tools/check.sh` 하나로 한다. gcc·clang 빌드(경고는 실패), 주소·정의되지 않은 동작·스레드 검사, ARM64 교차 빌드와 에뮬레이터(qemu-user) 실행(도구가 있을 때), 채점기 시험, 컴파일러 실험, 클린룸 점검을 돈다.
 
 ## 10. 적합성 시험
 
