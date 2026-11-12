@@ -17,6 +17,10 @@ void run_square_int(const int *in, int *out, int w, int h);
 void run_reverse(int *data, int blocks, int threads);
 void run_histogram(const int *values, int n, unsigned *bins);
 void run_affine(float *v, int n);
+// From probe_review.cu
+void run_rotate(float *data, int blocks);
+void run_fill(int *a, double *b, int n);
+void run_maybe_scale(float *v, const float *factor, int n);
 
 namespace ocu_cpu {
 static ocu_device *g_dev;
@@ -60,7 +64,8 @@ int main()
         const int blocks = 9, threads = 256;
         float *in = dev_alloc<float>(blocks * threads), *out = dev_alloc<float>(blocks);
         for (int i = 0; i < blocks * threads; ++i) in[i] = float(i % 5);
-        ocu_cpu::launch(block_sum, ocu_cpu::cfg(blocks, threads), in, out);
+        ocu_cpu::launch(ocu_cpu::cfg(blocks, threads),
+                        [](auto &&...a) { block_sum(a...); }, in, out);
         CHECK(ocu_cpu::last_status() == OCU_OK);
         int bad = 0;
         for (int b = 0; b < blocks; ++b) {
@@ -126,6 +131,44 @@ int main()
         for (int i = 0; i < n; ++i) bad += v[i] != float(i) * 2.0f - 1.0f;
         CHECK(bad == 0);
         dev_free(v);
+    }
+
+    { // file-scope extern __shared__ shared by blocks on several OS threads
+        const int blocks = 40, threads = 32;
+        float *d = dev_alloc<float>(blocks * threads);
+        for (int i = 0; i < blocks * threads; ++i) d[i] = float(i);
+        run_rotate(d, blocks);
+        CHECK(ocu_cpu::last_status() == OCU_OK);
+        int bad = 0;
+        for (int b = 0; b < blocks; ++b)
+            for (int t = 0; t < threads; ++t)
+                bad += d[b * threads + t] != float(b * threads + (t + 1) % threads);
+        CHECK(bad == 0);
+        dev_free(d);
+    }
+    { // template argument deduction, launch inside a multi-line macro
+        const int n = 100;
+        int *a = dev_alloc<int>(n);
+        double *b = dev_alloc<double>(n);
+        run_fill(a, b, n);
+        CHECK(ocu_cpu::last_status() == OCU_OK);
+        int bad = 0;
+        for (int i = 0; i < n; ++i) bad += a[i] != 7 || b[i] != 2.5;
+        CHECK(bad == 0);
+        dev_free(a); dev_free(b);
+    }
+    { // NULL kernel argument
+        const int n = 50;
+        float *v = dev_alloc<float>(n), *f = dev_alloc<float>(1);
+        for (int i = 0; i < n; ++i) v[i] = float(i);
+        f[0] = 3.0f;
+        run_maybe_scale(v, f, n);
+        run_maybe_scale(v, nullptr, n);
+        CHECK(ocu_cpu::last_status() == OCU_OK);
+        int bad = 0;
+        for (int i = 0; i < n; ++i) bad += v[i] != -3.0f * float(i);
+        CHECK(bad == 0);
+        dev_free(v); dev_free(f);
     }
 
     ocu_cpu::backend()->dev_close(ocu_cpu::device());

@@ -14,6 +14,17 @@ if(OCU_BACKEND_CPU)
   add_test(NAME cpu_backend_strict_warp64_1thread COMMAND test_cpu_backend)
   set_tests_properties(cpu_backend_strict_warp64_1thread PROPERTIES
     ENVIRONMENT "OCU_CPU_STRICT=1;OCU_CPU_WARP=64;OCU_CPU_THREADS=1")
+  # Many workers: memory regions per launch must stay small (review finding 4).
+  add_test(NAME cpu_backend_64workers COMMAND test_cpu_backend)
+  set_tests_properties(cpu_backend_64workers PROPERTIES
+    ENVIRONMENT "OCU_CPU_THREADS=64")
+
+  add_executable(test_cpu_regressions backend/test_cpu_regressions.c)
+  target_link_libraries(test_cpu_regressions PRIVATE ocu_backend_cpu)
+  add_test(NAME cpu_regressions COMMAND test_cpu_regressions)
+  add_test(NAME cpu_regressions_small_stack COMMAND test_cpu_regressions)
+  set_tests_properties(cpu_regressions_small_stack PROPERTIES
+    ENVIRONMENT "OCU_CPU_STACK_KB=16;OCU_CPU_THREADS=1")
 endif()
 
 # ---- compiler probe, CPU path (PLAN P0-W1-11) ----------------------------
@@ -23,7 +34,7 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   set(OCU_PROBE_DIR ${PROJECT_SOURCE_DIR}/compiler/probe)
   set(OCU_PROBE_GEN ${CMAKE_CURRENT_BINARY_DIR}/probe_gen)
   set(OCU_PROBE_SOURCES)
-  foreach(name probe_kernel probe_features)
+  foreach(name probe_kernel probe_features probe_review)
     set(out ${OCU_PROBE_GEN}/${name}.cpp)
     add_custom_command(
       OUTPUT ${out}
