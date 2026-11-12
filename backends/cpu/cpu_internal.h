@@ -87,6 +87,7 @@ struct ocu_queue {
     bool            running;   /* worker is executing an op */
     bool            stopping;
     ocu_status      sticky;    /* first error from queued work */
+    unsigned        generation; /* fork generation that created it */
 };
 
 /* ---- memory (cpu_memory.c) -------------------------------------------- */

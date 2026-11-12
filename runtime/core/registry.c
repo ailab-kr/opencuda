@@ -145,9 +145,9 @@ ocu_status ocu_core_device(const ocu_backend **backend, ocu_device **device)
         return OCU_ERR_INVALID_DEVICE;
     }
     if (dev == NULL || dev_backend != b) {
-        if (dev != NULL && dev_backend != NULL) {
-            (void)dev_backend->dev_close(dev); /* the backend changed */
-        }
+        /* The previous device is not closed: other threads may still use
+           the handle they got. Switching backends after first use is rare;
+           the cost is one open device per switch. */
         dev = NULL;
         st = b->dev_open(0, &dev);
         dev_backend = st == OCU_OK ? b : NULL;

@@ -100,12 +100,16 @@ uint32_t ocu_cpu_warp_gather_tagged(uint64_t value, uint64_t tag, uint64_t *all)
 
 /*
  * The same, with the participation mask of a CUDA-style *_sync call: bit b
- * names lane b of the caller's 32-lane group. Lanes whose bit is clear are
- * not checked. With OCU_CPU_STRICT=1, a lane named in the mask that has
- * already returned fails the launch (CUDA leaves this undefined; by default
- * it is tolerated, as exited threads are at the block barrier). Strict mode
- * also catches a lane that skipped an occurrence of the call and finished
- * early, which the sequence check alone cannot see.
+ * names lane b of the caller's 32-lane group (the caller always takes
+ * part). A lane is released once every lane its mask names waits at a warp
+ * operation or has returned; lanes the mask does not name may do anything
+ * else meanwhile, including waiting at the block barrier. The named lanes
+ * must be at the same call, the same occurrence of it and with the same
+ * mask, else the launch fails with OCU_ERR_LAUNCH_FAILED. So disjoint
+ * masks (0x0000ffff in one half, 0xffff0000 in the other) work as in CUDA.
+ * A named lane that has already returned is undefined in CUDA: tolerated by
+ * default, an error with OCU_CPU_STRICT=1 (this also catches a lane that
+ * skipped an occurrence and finished early). Mask 0 names the whole warp.
  */
 uint32_t ocu_cpu_warp_gather_masked(uint64_t value, uint64_t tag, uint32_t mask,
                                     uint64_t *all);

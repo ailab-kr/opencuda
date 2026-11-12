@@ -218,6 +218,7 @@ typedef struct block_exec {
     uint64_t         *warp_slots;    /* one value per thread, for gathers */
     uint64_t         *warp_tags;     /* the call each lane's gather came from */
     uint64_t         *warp_seq;      /* how many warp operations each lane did */
+    uint64_t         *warp_masks;    /* lanes each waiting lane waits for (warp-relative) */
     uint32_t          warp_size;
     bool              warp_mismatch; /* lanes of a warp met at different calls */
     char             *stack_region;  /* one mmap for all fiber stacks */
@@ -320,9 +321,10 @@ static ocu_status block_exec_init(block_exec *ex, uint32_t nthreads,
     ex->warp_slots = calloc(nthreads, sizeof(*ex->warp_slots));
     ex->warp_tags = calloc(nthreads, sizeof(*ex->warp_tags));
     ex->warp_seq = calloc(nthreads, sizeof(*ex->warp_seq));
+    ex->warp_masks = calloc(nthreads, sizeof(*ex->warp_masks));
     ex->warp_size = cfg->warp_size;
     if (ex->fibers == NULL || ex->order == NULL || ex->warp_slots == NULL ||
-        ex->warp_tags == NULL || ex->warp_seq == NULL) {
+        ex->warp_tags == NULL || ex->warp_seq == NULL || ex->warp_masks == NULL) {
         return OCU_ERR_OUT_OF_MEMORY;
     }
     for (uint32_t i = 0; i < nthreads; ++i) {
@@ -352,6 +354,7 @@ static void block_exec_release(block_exec *ex)
     free(ex->warp_slots);
     free(ex->warp_tags);
     free(ex->warp_seq);
+    free(ex->warp_masks);
     free(ex->dyn_shared);
     memset(ex, 0, sizeof(*ex));
 }
@@ -399,19 +402,30 @@ static bool release_warps(block_exec *ex)
     uint32_t w = ex->warp_size;
     for (uint32_t base = 0; base < ex->nthreads; base += w) {
         uint32_t end = base + w < ex->nthreads ? base + w : ex->nthreads;
-        uint32_t live = 0, waiting = 0;
+        /* Decide first, change states after: a decision must not see the
+           result of another one made in the same pass. */
+        uint64_t go = 0;
         for (uint32_t i = base; i < end; ++i) {
-            fiber_state s = ex->fibers[i].state;
-            live += s != FIBER_DONE;
-            waiting += s == FIBER_WAITING_WARP;
-        }
-        if (live > 0 && waiting == live) {
-            for (uint32_t i = base; i < end; ++i) {
-                if (ex->fibers[i].state == FIBER_WAITING_WARP) {
-                    ex->fibers[i].state = FIBER_READY;
+            if (ex->fibers[i].state != FIBER_WAITING_WARP) {
+                continue;
+            }
+            uint64_t need = ex->warp_masks[i];
+            bool ok = true;
+            for (uint32_t b = 0; b < end - base && ok; ++b) {
+                if (need >> b & 1u) {
+                    fiber_state s = ex->fibers[base + b].state;
+                    ok = s == FIBER_WAITING_WARP || s == FIBER_DONE;
                 }
             }
-            released = true;
+            if (ok) {
+                go |= 1ULL << (i - base);
+            }
+        }
+        for (uint32_t i = base; i < end; ++i) {
+            if (go >> (i - base) & 1u) {
+                ex->fibers[i].state = FIBER_READY;
+                released = true;
+            }
         }
     }
     return released;
@@ -449,6 +463,7 @@ static ocu_status run_block(block_exec *ex, uint64_t linear_block)
     memset(ex->warp_slots, 0, ex->nthreads * sizeof(*ex->warp_slots));
     memset(ex->warp_tags, 0, ex->nthreads * sizeof(*ex->warp_tags));
     memset(ex->warp_seq, 0, ex->nthreads * sizeof(*ex->warp_seq));
+    memset(ex->warp_masks, 0, ex->nthreads * sizeof(*ex->warp_masks));
     ex->warp_mismatch = false;
     for (uint32_t i = 0; i < ex->nthreads; ++i) {
         fiber *f = &ex->fibers[i];
@@ -740,8 +755,9 @@ static void pool_prepare(void) { pthread_mutex_lock(&g_pool_lock); }
 static void pool_parent(void) { pthread_mutex_unlock(&g_pool_lock); }
 static void pool_child(void)
 {
-    pthread_mutex_init(&g_pool_lock, NULL);
-    pthread_cond_init(&g_pool_cv, NULL);
+    /* prepare() locked it on this very thread, the only one in the child. */
+    pthread_mutex_unlock(&g_pool_lock);
+    pthread_cond_init(&g_pool_cv, NULL); /* its waiters do not exist here */
     g_open_jobs = NULL;
     g_pool_threads = 0;
     g_pool_idle = 0;
@@ -888,24 +904,38 @@ static uint32_t warp_meet(block_exec *ex, uint64_t tag, uint32_t mask, uint64_t 
     uint32_t w = ex->warp_size;
     uint32_t base = me - me % w;
     uint32_t count = ex->nthreads - base < w ? ex->nthreads - base : w;
-    ex->warp_slots[me] = value;
-    ex->warp_tags[me] = tag;
-    uint64_t seq = ++ex->warp_seq[me];
-    warp_wait(ex); /* every live lane has written */
-    for (uint32_t i = base; i < base + count; ++i) {
-        if (ex->fibers[i].state != FIBER_DONE &&
-            (ex->warp_tags[i] != tag || ex->warp_seq[i] != seq)) {
-            ex->warp_mismatch = true;
+    /* The lanes this call waits for, relative to the warp: the mask's 32
+       lanes in the caller's own 32-lane group, or every lane (mask 0).
+       The caller itself is always included. */
+    uint64_t named;
+    if (mask == 0) {
+        named = count == 64 ? ~0ULL : ((1ULL << count) - 1u);
+    } else {
+        uint32_t group = (me - base) & ~31u;
+        named = (uint64_t)mask << group;
+        if (count < 64) {
+            named &= (1ULL << count) - 1u;
         }
     }
-    if (mask != 0 && cpu_get_config()->strict_barrier) {
-        /* A lane named in the mask must still be running. */
-        uint32_t group = base + ((me - base) & ~31u);
-        for (uint32_t b = 0; b < 32; ++b) {
-            uint32_t i = group + b;
-            if ((mask >> b & 1u) && i < base + count && ex->fibers[i].state == FIBER_DONE) {
-                ex->warp_mismatch = true;
+    named |= 1ULL << (me - base);
+    ex->warp_slots[me] = value;
+    ex->warp_tags[me] = tag;
+    ex->warp_masks[me] = named;
+    uint64_t seq = ++ex->warp_seq[me];
+    warp_wait(ex); /* every named lane has written (or returned) */
+    bool strict = cpu_get_config()->strict_barrier;
+    for (uint32_t b = 0; b < count; ++b) {
+        if (!(named >> b & 1u)) {
+            continue;
+        }
+        uint32_t i = base + b;
+        if (ex->fibers[i].state == FIBER_DONE) {
+            if (strict && mask != 0) {
+                ex->warp_mismatch = true; /* explicitly named lane has returned */
             }
+        } else if (ex->warp_tags[i] != tag || ex->warp_seq[i] != seq ||
+                   ex->warp_masks[i] != named) {
+            ex->warp_mismatch = true;     /* a different call, occurrence or mask */
         }
     }
     if (all != NULL) {

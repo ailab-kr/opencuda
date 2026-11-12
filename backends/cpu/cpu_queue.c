@@ -9,6 +9,7 @@
 
 #include "cpu_internal.h"
 
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -217,6 +218,36 @@ static void op_free(cpu_op *op)
 static pthread_mutex_t g_queues_lock = PTHREAD_MUTEX_INITIALIZER;
 static ocu_queue      *g_queues;
 
+/*
+ * fork(): a queue's worker thread does not exist in the child, and its
+ * lock may have been held by it. The child therefore forgets every queue
+ * (drains see none) and, through the fork generation, refuses to use
+ * queue handles inherited from the parent (OCU_ERR_NOT_SUPPORTED) without
+ * touching their locks. Queues created in the child work normally.
+ */
+static _Atomic unsigned g_fork_generation;
+static pthread_once_t   g_queue_atfork_once = PTHREAD_ONCE_INIT;
+
+static void queues_prepare(void) { pthread_mutex_lock(&g_queues_lock); }
+static void queues_parent(void) { pthread_mutex_unlock(&g_queues_lock); }
+static void queues_child(void)
+{
+    g_queues = NULL;
+    atomic_fetch_add(&g_fork_generation, 1);
+    pthread_mutex_unlock(&g_queues_lock);
+}
+
+static void queue_install_atfork(void)
+{
+    (void)pthread_atfork(queues_prepare, queues_parent, queues_child);
+}
+
+/* True when the handle belongs to an ancestor process. */
+static bool inherited(const ocu_queue *q)
+{
+    return q->generation != atomic_load(&g_fork_generation);
+}
+
 static void wait_idle_locked(ocu_queue *q)
 {
     while (q->head != NULL || q->running) {
@@ -278,6 +309,10 @@ static ocu_status submit(ocu_queue *q, cpu_op *op)
         op_free(op);
         return st;
     }
+    if (inherited(q)) {
+        op_free(op);
+        return OCU_ERR_NOT_SUPPORTED;
+    }
     op->next = NULL;
     pthread_mutex_lock(&q->lock);
     if (q->tail != NULL) {
@@ -307,6 +342,8 @@ ocu_status cpu_queue_create(ocu_device *dev, ocu_queue **queue)
     pthread_cond_init(&q->work_cv, NULL);
     pthread_cond_init(&q->idle_cv, NULL);
     q->sticky = OCU_OK;
+    pthread_once(&g_queue_atfork_once, queue_install_atfork);
+    q->generation = atomic_load(&g_fork_generation);
     if (pthread_create(&q->worker, NULL, queue_worker, q) != 0) {
         pthread_cond_destroy(&q->idle_cv);
         pthread_cond_destroy(&q->work_cv);
@@ -328,7 +365,7 @@ ocu_status cpu_queue_destroy(ocu_queue *q)
     if (q == NULL) {
         return OCU_ERR_INVALID_HANDLE;
     }
-    if (cpu_in_kernel()) {
+    if (cpu_in_kernel() || inherited(q)) {
         return OCU_ERR_NOT_SUPPORTED;
     }
     pthread_mutex_lock(&g_queues_lock);
@@ -356,7 +393,7 @@ ocu_status cpu_queue_sync(ocu_queue *q)
     if (q == NULL) {
         return OCU_ERR_INVALID_HANDLE;
     }
-    if (cpu_in_kernel()) {
+    if (cpu_in_kernel() || inherited(q)) {
         return OCU_ERR_NOT_SUPPORTED;
     }
     pthread_mutex_lock(&q->lock);
@@ -371,6 +408,9 @@ ocu_status cpu_queue_query(ocu_queue *q)
 {
     if (q == NULL) {
         return OCU_ERR_INVALID_HANDLE;
+    }
+    if (inherited(q)) {
+        return OCU_ERR_NOT_SUPPORTED;
     }
     pthread_mutex_lock(&q->lock);
     ocu_status st;
