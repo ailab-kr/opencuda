@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="ctest" tests="3">
+ <testcase name="cpu_backend" time="0.5"/>
+ <testcase name="blas_args" time="0.1"><failure message="x"/></testcase>
+ <testcase name="runtime_misc" time="0.2"><skipped/></testcase>
+</testsuite>
