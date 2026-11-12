@@ -1,5 +1,7 @@
 # Operator table (`ocu_ops`), version 1
 
+**English** · [한국어](op-table.ko.md)
+
 Status: draft, version 1 (2026-11-13). Header: `backends/interface/ocu_ops.h`.
 
 ## 1. Purpose and position
