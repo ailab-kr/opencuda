@@ -1,0 +1,2 @@
+# The NVIDIA driver keeps allocations for the life of the process.
+leak:libcuda.so

@@ -156,6 +156,11 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
     ${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu)
   add_test(NAME ocu_cc_cpu_saxpy COMMAND ocu_cc_saxpy)
 
+  # Device math library, compiled for the host, against long double.
+  add_executable(test_device_math runtime/test_device_math.cpp)
+  target_include_directories(test_device_math PRIVATE ${PROJECT_SOURCE_DIR}/runtime/include)
+  add_test(NAME device_math COMMAND test_device_math)
+
   # The installed package works for a project outside this tree, built
   # with the same compilers and flags (sanitizers included). Not when
   # cross-compiling: the consumer would need the whole toolchain setup.
@@ -194,6 +199,27 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
                   -o ${OCU_CC_OUT}/${src}.${arch}.${ext})
       endforeach()
     endforeach()
+  endif()
+  # The NVIDIA backend on a real GPU, with PTX Clang makes from the probe
+  # kernel. Without an NVIDIA driver and device it prints SKIP and passes.
+  if(OCU_CLANG_GPU_TARGETS AND OCU_BACKEND_NVIDIA)
+    add_custom_command(
+      OUTPUT ${OCU_CC_OUT}/probe_kernel.nvtest.ptx
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${OCU_CC_OUT}
+      COMMAND ${Python3_EXECUTABLE} ${OCU_CC} --target nvidia --arch sm_80 --cache ${OCU_CC_OUT}
+              -c ${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu
+              -o ${OCU_CC_OUT}/probe_kernel.nvtest.ptx
+      DEPENDS ${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu ${OCU_CC})
+    add_custom_target(nvtest_ptx ALL DEPENDS ${OCU_CC_OUT}/probe_kernel.nvtest.ptx)
+    add_executable(test_nvidia_backend backend/test_nvidia_backend.c)
+    target_link_libraries(test_nvidia_backend PRIVATE ocu_backend_nvidia m)
+    add_dependencies(test_nvidia_backend nvtest_ptx)
+    add_test(NAME nvidia_backend COMMAND test_nvidia_backend ${OCU_CC_OUT}/probe_kernel.nvtest.ptx)
+    # Leak checking is off for this one test: the driver and the code
+    # generator it loads at run time (no symbol names) keep allocations for
+    # the life of the process. Memory errors are still checked.
+    set_tests_properties(nvidia_backend PROPERTIES ENVIRONMENT
+      "ASAN_OPTIONS=detect_leaks=0;LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/lsan_nvidia_driver.supp")
   endif()
   add_test(NAME ocu_cc_refuses_vendor_path
     COMMAND ${Python3_EXECUTABLE} ${OCU_CC} --target cpu -I /usr/local/cuda/include
