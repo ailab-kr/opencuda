@@ -45,6 +45,14 @@ void cpu_ctx_switch(cpu_ctx *from, cpu_ctx *to);
  * Where contexts are reused (Windows fibers), the next cpu_ctx_make of
  * `from` restarts it cheaply; elsewhere this is cpu_ctx_switch and
  * `from` is never resumed.
+ *
+ * Both switch functions must reach the actual switch in one call level and
+ * the same one: the thread sanitizer moves to the target's shadow call
+ * stack before the call (cpu_exec.c), so the switch function's entry is
+ * recorded on the target and popped there when the target's own switch call
+ * returns. An extra nested call here leaves one entry behind per finished
+ * fiber, and the thread's shadow stack grows until the sanitizer slows to a
+ * crawl and overflows it.
  */
 void cpu_ctx_finish(cpu_ctx *from, cpu_ctx *to);
 
