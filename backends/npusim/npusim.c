@@ -89,9 +89,16 @@ static struct {
 
 static double now_ms(void)
 {
+#if defined(_WIN32)
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart * 1e3 / (double)f.QuadPart;
+#else
     struct timespec ts;
-    timespec_get(&ts, TIME_UTC);
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+#endif
 }
 
 static void sleep_ms(uint32_t ms)
