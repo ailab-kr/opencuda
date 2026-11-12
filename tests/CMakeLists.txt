@@ -52,6 +52,60 @@ if(OCU_BACKEND_CPU)
     add_test(NAME cpu_fork COMMAND test_cpu_fork)
   endif()
 
+  # Fast paths (card backend-cpu, tester list 1-9): independent tests.
+  if(NOT WIN32)
+    add_executable(test_cpu_fastpath backend/test_cpu_fastpath.c)
+    target_link_libraries(test_cpu_fastpath PRIVATE ocu_backend_cpu)
+    foreach(mode
+        "fixed_w32|OCU_CPU_WARP=32"
+        "fixed_w64|OCU_CPU_WARP=64"
+        "random_w32|OCU_CPU_ORDER=random;OCU_CPU_SEED=3"
+        "random_w64|OCU_CPU_ORDER=random;OCU_CPU_SEED=4;OCU_CPU_WARP=64"
+        "fixed_w32_1thread|OCU_CPU_THREADS=1"
+        "fixed_w64_1thread|OCU_CPU_THREADS=1;OCU_CPU_WARP=64"
+        "random_w32_1thread|OCU_CPU_THREADS=1;OCU_CPU_ORDER=random;OCU_CPU_SEED=9"
+        "random_w64_1thread|OCU_CPU_THREADS=1;OCU_CPU_ORDER=random;OCU_CPU_SEED=2;OCU_CPU_WARP=64"
+        "fixed_w32_4threads|OCU_CPU_THREADS=4"
+        "random_w64_4threads|OCU_CPU_THREADS=4;OCU_CPU_ORDER=random;OCU_CPU_WARP=64"
+        "strict_w32|OCU_CPU_STRICT=1"
+        "strict_w64_random|OCU_CPU_STRICT=1;OCU_CPU_WARP=64;OCU_CPU_ORDER=random;OCU_CPU_SEED=6"
+        "spin0_w32|OCU_CPU_SPIN_US=0"
+        "spin0_w64_random_4threads|OCU_CPU_SPIN_US=0;OCU_CPU_WARP=64;OCU_CPU_ORDER=random;OCU_CPU_THREADS=4"
+        "small_stack_1thread|OCU_CPU_STACK_KB=16;OCU_CPU_THREADS=1")
+      string(REPLACE "|" ";" mode "${mode}")
+      list(GET mode 0 tag)
+      list(GET mode 1 envs)
+      add_test(NAME cpu_fastpath_${tag} COMMAND test_cpu_fastpath)
+      set_tests_properties(cpu_fastpath_${tag} PROPERTIES ENVIRONMENT "${envs}" TIMEOUT 600)
+    endforeach()
+    # Card item 6 says the lane id is right outside a kernel; ocu_cpu_lane_id()
+    # called from host code crashes (SIGSEGV) instead.  Expected to fail until
+    # the implementation is fixed; remove WILL_FAIL then.
+    add_test(NAME cpu_fastpath_lane_id_outside_kernel COMMAND test_cpu_fastpath lane_outside)
+    set_tests_properties(cpu_fastpath_lane_id_outside_kernel PROPERTIES WILL_FAIL TRUE)
+    # Card item 2 / header: mask 0 names the whole warp, and with
+    # OCU_CPU_STRICT=1 a named lane that already returned is an error.  With
+    # mask 0 the launch succeeds instead (mask 0xffffffff is detected).
+    add_test(NAME cpu_fastpath_strict_mask0_lane_gone COMMAND test_cpu_fastpath strict_mask0)
+    set_tests_properties(cpu_fastpath_strict_mask0_lane_gone PROPERTIES
+      ENVIRONMENT "OCU_CPU_STRICT=1" WILL_FAIL TRUE)
+    # Card item 9: control registers changed by one thread must not reach the
+    # next one.  A thread that ends with a changed rounding mode / FTZ+DAZ
+    # leaves it to the threads started after it on the same stack.  Expected
+    # to fail until fixed; remove WILL_FAIL then.
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+      add_test(NAME cpu_fastpath_fpu_state_reaches_next_thread COMMAND test_cpu_fastpath fpu_dirty)
+      add_test(NAME cpu_fastpath_fpu_state_reaches_next_thread_random COMMAND test_cpu_fastpath fpu_dirty)
+      set_tests_properties(cpu_fastpath_fpu_state_reaches_next_thread_random PROPERTIES
+        ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_SEED=5")
+      # Random order starts every thread through the scheduler: no leak there.
+      # Sanitizer builds always start threads through the scheduler: no leak there.
+      if(NOT CMAKE_C_FLAGS MATCHES "-fsanitize")
+        set_tests_properties(cpu_fastpath_fpu_state_reaches_next_thread PROPERTIES WILL_FAIL TRUE)
+      endif()
+    endif()
+  endif()
+
   add_executable(test_cpu_regressions backend/test_cpu_regressions.c)
   target_link_libraries(test_cpu_regressions PRIVATE ocu_backend_cpu)
   add_executable(test_cpu_tsan_fibers backend/test_cpu_tsan_fibers.c)
@@ -153,6 +207,19 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   add_test(NAME runtime_lang_random COMMAND rt_lang)
   set_tests_properties(runtime_lang_random PROPERTIES
     ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_THREADS=3;OCU_CPU_WARP=64")
+  # card backend-cpu tester list item 5: shuffles and votes as CUDA code.
+  ocu_add_cpu_cu_executable(rt_warp_lang runtime/rt_warp_lang.cu)
+  foreach(mode "w32|OCU_CPU_WARP=32" "w64|OCU_CPU_WARP=64"
+               "random_w32|OCU_CPU_ORDER=random;OCU_CPU_SEED=2"
+               "random_w64|OCU_CPU_ORDER=random;OCU_CPU_SEED=8;OCU_CPU_WARP=64"
+               "w32_1thread|OCU_CPU_THREADS=1" "w64_random_1thread|OCU_CPU_THREADS=1;OCU_CPU_WARP=64;OCU_CPU_ORDER=random"
+               "w32_4threads|OCU_CPU_THREADS=4" "w32_strict|OCU_CPU_STRICT=1")
+    string(REPLACE "|" ";" mode "${mode}")
+    list(GET mode 0 tag)
+    list(GET mode 1 envs)
+    add_test(NAME runtime_warp_lang_${tag} COMMAND rt_warp_lang)
+    set_tests_properties(runtime_warp_lang_${tag} PROPERTIES ENVIRONMENT "${envs}" TIMEOUT 600)
+  endforeach()
   ocu_add_cpu_cu_executable(rt_mem runtime/rt_mem.cu)
   add_test(NAME runtime_memory COMMAND rt_mem)
   ocu_add_cpu_cu_executable(rt_misc runtime/rt_misc.cu)
