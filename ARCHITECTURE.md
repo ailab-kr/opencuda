@@ -42,6 +42,8 @@ compiler/         runtime/         libs/
 | `backends/interface/` | 장치 연결 층 규격 `ocu_backend.h` | 초안 있음 |
 | `backends/cpu/` | CPU 기준 구현 | 규격 함수 26개 전부 |
 | `backends/amd/`, `backends/intel/` | 칩별 구현 | 없음 |
+| `backends/npusim/` | NPU 제약 흉내 백엔드: 커널 없음, 연산 표만, 호스트가 못 읽는 장치 메모리, 온칩 메모리 한도 | 연산 5종 |
+| `backends/ops_ref/` | 연산 표의 공통 검사와 기준 계산(백엔드 아님, 연산 표를 내놓는 백엔드가 링크) | 있음 |
 | `runtime/core/` | 백엔드 등록과 선택 | 있음 |
 | `runtime/include/` | 사용자 프로그램이 보는 헤더: `cuda_runtime_api.h`·`cuda_runtime.h`·`cuda.h`·`cuda_fp16.h`, 벡터 형, CPU 경로 언어 지원 `ocu_cuda_lang_cpu.h` | 함수 80여 개 |
 | `runtime/cudart/` | 실행 API 구현(`ocu_cudart`): 장치·오류·메모리·스트림·사건·실행. 백엔드 규격만 부른다 | 있음 |
@@ -116,6 +118,16 @@ libs/blas  ──(get_provider("blas"))──▶  백엔드
 - `libs`는 인자 검사, 오류 코드, 색인 기준 같은 CUDA 쪽 동작을 맡고, 실제 계산만 제공자에게 넘긴다.
 - 제공자가 없는 칩에서도 공통 구현으로 동작한다. 느릴 뿐 틀리지 않는다.
 
+### 연산 표 (`ocu_ops`)
+
+SIMT 스레드가 없는 칩(NPU)은 커널을 못 돌리지만 행렬곱·정규화·softmax 같은 연산은 돌린다. 그런 칩을 위한 두 번째 일하는 길이 연산 표다. 규격은 `docs/spec/op-table.md`, 헤더는 `backends/interface/ocu_ops.h`.
+
+- 백엔드는 `get_provider("ops")`로 표를 내놓는다. `ocu_backend` 표와 `OCU_BACKEND_ABI`는 바뀌지 않는다. 연산 표는 자기 판 번호와 크기를 가진다.
+- 순서: 지원 질의(연산 × 자료형) → 정확한 질의(설명자 하나) → 계획(모양 고정, 미리 컴파일 가능, "지원 안 함" 가능) → 실행(대기열에) → 해제. 행 수만 바뀌는 호출은 `OCU_OP_FLAG_VAR_ROWS`로 계획 하나를 쓴다.
+- 허용 오차는 등급 네 개(정확, ulp, 행 축소, 내적)로 정하고, 누적 순서가 달라도 통과하게 한다.
+- 상위 층(`libs/blas` 등)은 질의 결과로 길을 고른다. 칩 이름을 보지 않는다.
+- `backends/ops_ref`는 백엔드가 아니라 공통 부품이다. 백엔드끼리 가져다 쓰지 않는다는 규칙은 그대로다.
+
 ## 5. 한 번의 실행이 지나가는 길
 
 GPU 코드 하나를 빌드해서 실행할 때의 흐름이다. GPU 칩용 2~4번은 아직 구현되지 않았다. CPU 경로는 아래 "CPU 경로" 대로 동작한다.
@@ -178,6 +190,12 @@ GPU 코드를 CPU에서 그대로 실행한다. 속도가 아니라 정확성 �
 | `OCU_CPU_THREADS` | 정수 | 실행 한 번에 쓰는 OS 스레드 수. 기본 코어 수 | 동작 |
 | `OCU_CPU_STACK_KB` | 정수 | 파이버 스택 크기. 기본 128 | 동작 |
 | `OCU_CPU_STRICT` | `1` | 동기화 전에 끝난 스레드를 오류로 | 동작 |
+| `OCU_NPUSIM_SCRATCH_KB` | 정수 | npusim 온칩 메모리 크기. 기본 256 | 동작 |
+| `OCU_NPUSIM_TILING` | `0`, `1` | npusim 행렬곱 타일 나누기. 기본 1 | 동작 |
+| `OCU_NPUSIM_DTYPES` | `f32,f16,bf16` 부분 | npusim이 받는 입력 자료형. 기본 셋 다 | 동작 |
+| `OCU_NPUSIM_PLAN_MS` | 정수 | npusim 계획마다 기다리는 시간(컴파일 흉내). 기본 0 | 동작 |
+| `OCU_NPUSIM_MEM_MB` | 정수 | npusim 장치 메모리 크기. 기본 256 | 동작 |
+| `OCU_NPUSIM_REPORT` | `1` | 장치를 닫을 때 npusim 집계를 표준 오류로 | 동작 |
 | `OCU_LOG` | `0`~`3` | 기록 수준 | 예정 |
 
 ## 9. 빌드 대상
@@ -197,7 +215,7 @@ GPU 코드를 CPU에서 그대로 실행한다. 속도가 아니라 정확성 �
 
 설치: `cmake --install <빌드 폴더> --prefix <위치>`가 라이브러리, 공개 헤더(한 폴더에 모아 `<cuda_runtime.h>`가 우리 것을 찾게 함), CPU 경로 드라이버, CMake 패키지를 놓는다. 다른 프로젝트는 `find_package(Ocu)` 뒤 `ocu::cudart`와 `ocu_add_cpu_cu_executable()`를 쓴다.
 
-빌드 옵션: `OCU_BACKEND_CPU`(기본 켬), `OCU_BACKEND_AMD`, `OCU_BACKEND_INTEL`(아직 없음, 켜면 오류), `OCU_BUILD_TESTS`(기본 켬), `OCU_CPU_UCONTEXT`(기본 끔).
+빌드 옵션: `OCU_BACKEND_CPU`(기본 켬), `OCU_BACKEND_NPUSIM`(기본 켬, 등록 순서가 마지막이라 기본 선택이 되지 않음), `OCU_BACKEND_AMD`, `OCU_BACKEND_INTEL`(아직 없음, 켜면 오류), `OCU_BUILD_TESTS`(기본 켬), `OCU_CPU_UCONTEXT`(기본 끔).
 
 전체 검증은 `tools/check.sh` 하나로 한다. gcc·clang 빌드(경고는 실패), 주소·정의되지 않은 동작·스레드 검사, ARM64 교차 빌드와 에뮬레이터(qemu-user) 실행(도구가 있을 때), 채점기 시험, 컴파일러 실험, 클린룸 점검을 돈다.
 
