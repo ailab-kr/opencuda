@@ -215,6 +215,20 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
     target_link_libraries(test_nvidia_backend PRIVATE ocu_backend_nvidia m)
     add_dependencies(test_nvidia_backend nvtest_ptx)
     add_test(NAME nvidia_backend COMMAND test_nvidia_backend ${OCU_CC_OUT}/probe_kernel.nvtest.ptx)
+    # The runtime test programs again, built for the GPU: the same CUDA
+    # sources, on the installed NVIDIA GPU (skipped without one).
+    add_executable(run_if_nvidia runtime/run_if_nvidia.c)
+    target_link_libraries(run_if_nvidia PRIVATE ocu_backend_nvidia)
+    foreach(t rt_api rt_lang rt_mem rt_misc rt_launch_api rt_review rt_review2 rt_fp16)
+      ocu_add_nvidia_cu_executable(${t}_nv runtime/${t}.cu)
+      add_test(NAME gpu_${t} COMMAND run_if_nvidia $<TARGET_FILE:${t}_nv>)
+      set_tests_properties(gpu_${t} PROPERTIES SKIP_RETURN_CODE 77
+        ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+    endforeach()
+    ocu_add_nvidia_cu_executable(ocu_cc_saxpy_nv probe/main_saxpy.cu
+      ${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu)
+    add_test(NAME gpu_saxpy COMMAND run_if_nvidia $<TARGET_FILE:ocu_cc_saxpy_nv>)
+    set_tests_properties(gpu_saxpy PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
     # Leak checking is off for this one test: the driver and the code
     # generator it loads at run time (no symbol names) keep allocations for
     # the life of the process. Memory errors are still checked.

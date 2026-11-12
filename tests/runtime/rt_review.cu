@@ -45,16 +45,21 @@ __global__ void through_bytes(T *out)
     out[threadIdx.x] = c[blockDim.x - 1 - threadIdx.x];
 }
 
+#if defined(OCU_CPU_PATH)
 __global__ void broken_warp()
 {
     // Lane 0 waits for its warp while the others wait for the block: the
-    // backend reports a launch failure instead of hanging.
+    // CPU backend reports a launch failure instead of hanging. (On a GPU
+    // this is undefined behaviour and may hang, so GPUs use a trap.)
     if (threadIdx.x == 0) {
         __syncwarp();
     } else {
         __syncthreads();
     }
 }
+#else
+__global__ void broken_warp() { __trap(); }
+#endif
 
 static void test_pageable_async()
 {
@@ -122,6 +127,18 @@ static void test_shared_bytes()
     OK(cudaFree(out));
 }
 
+#if !defined(OCU_CPU_PATH)
+static void test_sticky_failure()
+{
+    // A kernel fault on a GPU: reported, and stays reported. The device's
+    // context is lost for the process, so reset is not part of this test.
+    broken_warp<<<1, 32>>>();
+    CHECK(cudaGetLastError() == cudaSuccess);
+    CHECK(cudaDeviceSynchronize() == cudaErrorLaunchFailure);
+    CHECK(cudaDeviceSynchronize() == cudaErrorLaunchFailure);
+    CHECK(cudaStreamSynchronize(0) == cudaErrorLaunchFailure);
+}
+#else
 static void test_sticky_failure()
 {
     broken_warp<<<1, 32>>>();
@@ -140,6 +157,7 @@ static void test_sticky_failure()
     OK(cudaDeviceSynchronize());
     OK(cudaFree(p));
 }
+#endif
 
 int main()
 {
