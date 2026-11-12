@@ -66,3 +66,30 @@ void run_misc(const int *in, int *bcast, int *scan, unsigned *ballots,
 {
     misc<<<blocks, threads>>>(in, bcast, scan, ballots, any_all);
 }
+
+// xor with width 16 may read the earlier 16-lane group (review finding 3).
+__global__ void xor16(const int *in, int *out)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    out[i] = __shfl_xor_sync(0xffffffffu, in[i], 16, 16);
+}
+
+// Partial-mask code: lanes 0-15 shuffle with mask 0xffff, then every lane
+// shuffles again. Lanes 16-31 never join the first call.
+__global__ void partial_mask(int *out)
+{
+    int lane = threadIdx.x % 32;
+    int v = lane;
+    if (lane < 16) v = __shfl_down_sync(0x0000ffffu, v, 1, 16);
+    out[threadIdx.x] = __shfl_sync(0xffffffffu, v, 0);
+}
+
+void run_xor16(const int *in, int *out, int threads)
+{
+    xor16<<<1, threads>>>(in, out);
+}
+
+void run_partial_mask(int *out)
+{
+    partial_mask<<<1, 32>>>(out);
+}

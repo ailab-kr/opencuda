@@ -120,11 +120,11 @@ static inline __device__ unsigned probe_lane()
     return __builtin_amdgcn_mbcnt_hi(~0u, __builtin_amdgcn_mbcnt_lo(~0u, 0u));
 }
 template <typename T>
-static inline __device__ T probe_from_lane(T v, int src, int width)
+static inline __device__ T probe_from_lane(T v, int src, int width, bool earlier_ok = false)
 {
     int lane = (int)probe_lane();
     int base = lane - lane % width;
-    if (src < base || src >= base + width) src = lane;
+    if ((src < base && !earlier_ok) || src < 0 || src >= base + width) src = lane;
     return probe_from_int<T>(__builtin_amdgcn_ds_bpermute(src << 2, probe_as_int(v)));
 }
 template <typename T>
@@ -141,7 +141,7 @@ static inline __device__ T __shfl_down_sync(unsigned, T v, unsigned d, int width
 { return probe_from_lane(v, (int)probe_lane() + (int)d, width); }
 template <typename T>
 static inline __device__ T __shfl_xor_sync(unsigned, T v, int x, int width = warpSize)
-{ return probe_from_lane(v, (int)probe_lane() ^ x, width); }
+{ return probe_from_lane(v, (int)probe_lane() ^ x, width, true); }
 static inline __device__ unsigned __ballot_sync(unsigned, int p)
 { return __builtin_amdgcn_ballot_w32(p != 0); }
 static inline __device__ int __any_sync(unsigned m, int p) { return __ballot_sync(m, p) != 0; }
