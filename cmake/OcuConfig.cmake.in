@@ -1,9 +1,12 @@
 # Package configuration for find_package(Ocu).
 #
 # Targets: ocu::cudart (runtime API + backends), ocu::blas, ocu::core,
-# ocu::backend_cpu, ocu::backend_interface.
-# Function: ocu_add_cpu_cu_executable(<target> <sources>...) builds CUDA
-# sources for the CPU path with the installed driver.
+# ocu::backend_cpu, ocu::backend_interface, and the BLAS library API
+# (cublas_v2.h) per target: ocu::cublas_cpu, ocu::cublas_nvidia (when built).
+# Functions (OcuCpuPath.cmake): ocu_add_cpu_cu_executable(<target>
+# <sources>... [LIBRARIES ...]) builds CUDA sources for the CPU path with the
+# installed driver; ocu_add_nvidia_cu_executable() for NVIDIA GPUs;
+# ocu_add_cu_library() builds a static library of CUDA sources for one target.
 @PACKAGE_INIT@
 
 include(CMakeFindDependencyMacro)

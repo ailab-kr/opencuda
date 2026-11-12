@@ -130,10 +130,12 @@ guard() {
             found=1
         fi
     done
-    # Our own CUDA-named headers live only in runtime/include and are
-    # written from public documentation; the same names anywhere else, or
-    # vendor libraries anywhere, are refused.
+    # Our own CUDA-named headers live only in runtime/include and in the
+    # libraries' include folders (libs/<name>/include), and are written
+    # from public documentation; the same names anywhere else, or vendor
+    # libraries anywhere, are refused.
     if find "$repo" -path "$repo/.git" -prune -o $prune -path "$repo/runtime/include" -prune \
+        -o -path "$repo/libs/*/include" -prune \
         -o -type f \( -name 'cuda_runtime*.h' -o -name 'cuda.h' -o -name 'cublas*.h' \
            -o -name 'cudnn*.h' \) -print | grep .; then
         found=1

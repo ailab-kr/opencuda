@@ -27,6 +27,7 @@
 #include <cstdint>
 
 #include "ocu_device_math_tables.h"
+#include "ocu_fma_exact.h"
 
 #ifndef OCU_DM_FN
 #define OCU_DM_FN static inline
@@ -52,7 +53,9 @@ OCU_DM_FN double copysign(double x, double y)
 }
 OCU_DM_FN double inf() { return from_bits(0x7ff0000000000000ull); }
 OCU_DM_FN double qnan() { return from_bits(0x7ff8000000000000ull); }
-OCU_DM_FN double fma(double a, double b, double c) { return __builtin_fma(a, b, c); }
+/* Hardware fma in a device pass; on a host without the instruction, exact
+   software rather than the C library's (ocu_fma_exact.h). */
+OCU_DM_FN double fma(double a, double b, double c) { return ::ocu_fma_rn(a, b, c); }
 OCU_DM_FN double sqrt(double x) { return __builtin_sqrt(x); }
 OCU_DM_FN double floor(double x) { return __builtin_floor(x); }
 OCU_DM_FN double ceil(double x) { return __builtin_ceil(x); }

@@ -484,8 +484,10 @@ def toolkit_libdir() -> Path | None:
     return None
 
 
-def runtime_link(libdir: Path, blas: bool) -> list[str]:
-    names = (["ocu_blas"] if blas else []) + \
+def runtime_link(libdir: Path, blas: bool, target: str = "cpu") -> list[str]:
+    # -lcublas: the cublas_v2.h library built for the same target as the
+    # CUDA code (libs/cublas), then the internal BLAS layer.
+    names = ([f"ocu_cublas_{target}", "ocu_blas"] if blas else []) + \
         ["ocu_cudart", "ocu_core", "ocu_backend_cpu", "ocu_backend_nvidia", "ocu_backend_metal"]
     files = [str(libdir / f"lib{n}.a") for n in names if (libdir / f"lib{n}.a").is_file()]
     if sys.platform == "darwin":
@@ -685,7 +687,7 @@ class Driver:
             if libdir is None:
                 raise UsageError("runtime libraries not found next to the driver "
                                  "(build the ocu_toolkit target, or set OCU_TOOLKIT_LIBDIR)")
-            extra = runtime_link(libdir, want_blas)
+            extra = runtime_link(libdir, want_blas, o.target)
         cmd = [self.cxx, *(["-shared"] if o.shared else []), *o.host,
                *(["-v"] if o.verbose else []),
                *line, "-o", out, *[f"-L{d}" for d in o.libdirs], *o.linker, *extra]

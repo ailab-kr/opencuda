@@ -43,6 +43,7 @@
 #define OCU_DMF_TABLE constexpr
 #endif
 #include "ocu_device_mathf_tables.h"
+#include "ocu_fma_exact.h"
 
 #if defined(__clang__)
 #define OCU_DMF_STRICT _Pragma("clang fp contract(off)")
@@ -67,7 +68,10 @@ OCU_DM_FN float fabs_(float x) { return ffrom(fbits(x) & 0x7fffffffu); }
 OCU_DM_FN float copysign_(float x, float y) { return ffrom((fbits(x) & 0x7fffffffu) | (fbits(y) & 0x80000000u)); }
 OCU_DM_FN bool isnan_(float x) { return (fbits(x) & 0x7fffffffu) > 0x7f800000u; }
 OCU_DM_FN bool isfinite_(float x) { return (fbits(x) & 0x7f800000u) != 0x7f800000u; }
-OCU_DM_FN float fma_(float a, float b, float c) { return __builtin_fmaf(a, b, c); }
+/* Hardware fma in a device pass; on a host without the instruction, exact
+   software rather than the C library's fmaf, which is not correctly
+   rounded everywhere (ocu_fma_exact.h). */
+OCU_DM_FN float fma_(float a, float b, float c) { return ::ocu_fmaf_rn(a, b, c); }
 OCU_DM_FN float rint_(float x) { return __builtin_rintf(x); }
 OCU_DM_FN float sqrt_(float x) { return __builtin_sqrtf(x); }
 OCU_DM_FN float inf_() { return ffrom(0x7f800000u); }

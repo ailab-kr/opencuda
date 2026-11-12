@@ -3,7 +3,8 @@
  * (cudaDataType_t and the CUDA_R_* / CUDA_C_* values).
  *
  * Written for this project from the public CUDA library-types
- * documentation (the "cudaDataType" enumeration). Values are the
+ * documentation (the "cudaDataType" and "libraryPropertyType"
+ * enumerations). Values are the
  * documented ones; not derived from any vendor header.
  *
  * Whether a library function accepts a given type is that function's
@@ -45,5 +46,13 @@ typedef enum cudaDataType_t {
     CUDA_R_8F_E5M2 = 29
 } cudaDataType;
 typedef enum cudaDataType_t cudaDataType_t;
+
+/* What a library's GetProperty function reports. */
+typedef enum libraryPropertyType_t {
+    MAJOR_VERSION = 0,
+    MINOR_VERSION = 1,
+    PATCH_LEVEL = 2
+} libraryPropertyType;
+typedef enum libraryPropertyType_t libraryPropertyType_t;
 
 #endif /* OCU_LIBRARY_TYPES_H */

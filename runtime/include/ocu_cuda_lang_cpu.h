@@ -22,6 +22,7 @@
 #include "ocu_rt.h"
 #include "ocu_backend.h"
 #include "ocu_cpu_kernel.h"
+#include "ocu_fma_exact.h"
 
 /* C headers whose names CUDA programs use without including them: the
    vendor toolchain's own headers bring them in. */
@@ -456,7 +457,20 @@ inline float __saturatef(float x) { return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : 
 inline float rsqrtf(float x) { return 1.0f / std::sqrt(x); }
 inline double rsqrt(double x) { return 1.0 / std::sqrt(x); }
 inline float __fsqrt_rn(float x) { return std::sqrt(x); }
-inline float __fmaf_rn(float a, float b, float c) { return std::fma(a, b, c); }
+/* Fused multiply-add, one rounding in the named mode (ocu_fma_exact.h:
+   hardware or exact software, never a C library fma that may round
+   twice). Plain fma/fmaf come from <math.h>; where that library's are not
+   correctly rounded the runtime library replaces them (cudart/libm_fma.c). */
+inline float __fmaf_rn(float a, float b, float c) { return ::ocu_fmaf_rn(a, b, c); }
+inline double __fma_rn(double a, double b, double c) { return ::ocu_fma_rn(a, b, c); }
+#if defined(OCU_FMA_HAVE_SOFT_DOUBLE)
+inline float __fmaf_rz(float a, float b, float c) { return ::ocu_fmaf_soft(a, b, c, OCU_FMA_RZ); }
+inline float __fmaf_ru(float a, float b, float c) { return ::ocu_fmaf_soft(a, b, c, OCU_FMA_RU); }
+inline float __fmaf_rd(float a, float b, float c) { return ::ocu_fmaf_soft(a, b, c, OCU_FMA_RD); }
+inline double __fma_rz(double a, double b, double c) { return ::ocu_fma_soft(a, b, c, OCU_FMA_RZ); }
+inline double __fma_ru(double a, double b, double c) { return ::ocu_fma_soft(a, b, c, OCU_FMA_RU); }
+inline double __fma_rd(double a, double b, double c) { return ::ocu_fma_soft(a, b, c, OCU_FMA_RD); }
+#endif
 inline float __fmul_rn(float a, float b) { return a * b; }
 inline float __fadd_rn(float a, float b) { return a + b; }
 inline float __fsub_rn(float a, float b) { return a - b; }

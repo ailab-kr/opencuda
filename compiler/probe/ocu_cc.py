@@ -148,13 +148,14 @@ def normalized_copies(src: Path, dest: Path):
 
 def header_dirs() -> list[Path]:
     """Our headers: one folder in an installed package (<prefix>/include/ocu
-    next to <prefix>/libexec/ocu/ocu_cc.py), three in the source tree. The
-    first holds cuda_runtime.h."""
+    next to <prefix>/libexec/ocu/ocu_cc.py), four in the source tree (the
+    last: the library headers, cublas_v2.h). The first holds
+    cuda_runtime.h."""
     installed = HERE.parent.parent / "include" / "ocu"
     if (installed / "cuda_runtime.h").is_file() and not (REPO / "runtime" / "include").is_dir():
         return [installed]
     return [REPO / "runtime" / "include", REPO / "backends" / "interface",
-            REPO / "backends" / "cpu"]
+            REPO / "backends" / "cpu", REPO / "libs" / "cublas" / "include"]
 
 
 # Clang's CUDA default (-ffp-contract=fast) fuses a*b+c into fma everywhere,

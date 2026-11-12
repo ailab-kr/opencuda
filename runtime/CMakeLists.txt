@@ -34,6 +34,44 @@ if(OCU_BACKEND_NVIDIA)
   target_link_libraries(ocu_cudart PUBLIC ocu_backend_nvidia)
 endif()
 
+# CUDA's fma/fmaf round once (IEEE 754 fusedMultiplyAdd). Some C libraries'
+# do not (MinGW-w64). A configure check compares the C library with the
+# exact software fma (include/ocu_fma_exact.h); when they differ, ocu_cudart
+# carries replacements that programs link ahead of the C library. When the
+# check cannot run (cross build without an emulator), the replacements are
+# used: they are exact everywhere. -DOCU_LIBM_FMA_EXACT=ON/OFF overrides.
+if(NOT DEFINED OCU_LIBM_FMA_EXACT)
+  set(_ocu_fma_exact OFF)
+  if(CMAKE_CROSSCOMPILING AND NOT CMAKE_CROSSCOMPILING_EMULATOR)
+    set(_ocu_fma_why "cross build without an emulator")
+  else()
+    set(_ocu_libm "")
+    if(UNIX)
+      set(_ocu_libm m)
+    endif()
+    try_run(_ocu_fma_run _ocu_fma_compile ${CMAKE_CURRENT_BINARY_DIR}/check_libm_fma
+      ${CMAKE_CURRENT_SOURCE_DIR}/cudart/check_libm_fma.c
+      CMAKE_FLAGS "-DINCLUDE_DIRECTORIES=${CMAKE_CURRENT_SOURCE_DIR}/include"
+      LINK_LIBRARIES ${_ocu_libm}
+      RUN_OUTPUT_VARIABLE _ocu_fma_out)
+    string(REGEX MATCH "fma/fmaf: [a-z ]+" _ocu_fma_why "${_ocu_fma_out}")
+    if(_ocu_fma_compile AND "${_ocu_fma_run}" STREQUAL "0")
+      set(_ocu_fma_exact ON)
+    endif()
+  endif()
+  message(STATUS "C library fma/fmaf correctly rounded: ${_ocu_fma_exact} (${_ocu_fma_why})")
+  set(OCU_LIBM_FMA_EXACT ${_ocu_fma_exact} CACHE BOOL
+    "The C library's fma and fmaf are correctly rounded (else ocu_cudart replaces them)")
+endif()
+# The headers' own fma (ocu_fma_exact.h) follows the same result in every
+# program that links ocu_cudart.
+if(OCU_LIBM_FMA_EXACT)
+  target_compile_definitions(ocu_cudart PUBLIC OCU_LIBM_FMA_EXACT=1)
+else()
+  target_compile_definitions(ocu_cudart PUBLIC OCU_LIBM_FMA_EXACT=0)
+  target_sources(ocu_cudart PRIVATE cudart/libm_fma.c)
+endif()
+
 install(TARGETS ocu_core ocu_cudart EXPORT OcuTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(FILES core/ocu_core.h DESTINATION ${OCU_INSTALL_INCLUDEDIR})
 # The whole tree, so headers in subfolders (cooperative_groups/) and headers
