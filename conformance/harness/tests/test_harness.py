@@ -123,3 +123,18 @@ class ScoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReportTests(unittest.TestCase):
+    def test_render_counts_and_escapes(self):
+        from ocu_conf import report
+        record = example()
+        record["device"]["model"] = "<script>x</script>"
+        page = report.render([record, record])
+        self.assertIn("<!DOCTYPE html>", page)
+        self.assertNotIn("<script>x", page)  # escaped
+        self.assertIn("&lt;script&gt;", page)
+        # blas-saxpy: 1 pass of 1; runtime-malloc: 0 of 1; totals 2 of 4
+        self.assertIn('<td class="all">1 / 1</td>', page)
+        self.assertIn('<td class="none">0 / 1</td>', page)
+        self.assertIn('<td class="some">2 / 4</td>', page)
