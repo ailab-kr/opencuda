@@ -32,6 +32,11 @@
 #include "ptx_shift_local.h"
 #include "sub/ptx_shift_sub.h"
 
+// Shifts by the width or more are what this file checks; the warning about
+// them (C++: undefined) is expected here. GCC and Clang read this pragma.
+#pragma GCC diagnostic ignored "-Wshift-count-overflow"
+#pragma GCC diagnostic ignored "-Wshift-count-negative"
+
 #define CK(x)                                                                              \
     do {                                                                                   \
         cudaError_t e_ = (x);                                                              \
