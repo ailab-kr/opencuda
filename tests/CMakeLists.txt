@@ -31,7 +31,8 @@ if(OCU_BACKEND_CPU)
   target_link_libraries(test_cpu_warp PRIVATE ocu_backend_cpu)
   foreach(mode "warp32;OCU_CPU_WARP=32" "warp64;OCU_CPU_WARP=64"
                "warp32_random;OCU_CPU_WARP=32\;OCU_CPU_ORDER=random"
-               "warp64_random;OCU_CPU_WARP=64\;OCU_CPU_ORDER=random\;OCU_CPU_SEED=5")
+               "warp64_random;OCU_CPU_WARP=64\;OCU_CPU_ORDER=random\;OCU_CPU_SEED=5"
+               "warp32_strict;OCU_CPU_WARP=32\;OCU_CPU_STRICT=1")
     list(GET mode 0 tag)
     list(GET mode 1 envs)
     add_test(NAME cpu_${tag} COMMAND test_cpu_warp)

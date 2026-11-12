@@ -114,12 +114,41 @@ static void k_two_level(void **a)
     }
 }
 
+/* Lanes 0-30 make three full-mask gathers; lane 31 skips the second one
+   and returns early (third review). Undefined in CUDA; strict mode fails. */
+static void k_skip_iteration(void **a)
+{
+    uint64_t *out = *(uint64_t **)a[0];
+    uint32_t lane = ocu_cpu_lane_id();
+    uint64_t all[OCU_CPU_MAX_WARP];
+    uint64_t acc = 0;
+    for (int it = 0; it < 3; ++it) {
+        if (lane == 31 && it == 1) continue;
+        ocu_cpu_warp_gather_masked(100u * (uint64_t)it + lane, 0xABC, 0xffffffffu, all);
+        acc += all[0];
+    }
+    out[ocu_cpu_thread_idx().x] = acc;
+}
+
+/* Two different calls at the same sequence position: always a mismatch. */
+static void k_two_sites(void **a)
+{
+    (void)a;
+    uint64_t all[OCU_CPU_MAX_WARP];
+    if (ocu_cpu_lane_id() % 2 == 0) {
+        ocu_cpu_warp_gather_masked(1, 0x111, 0xffffffffu, all);
+    } else {
+        ocu_cpu_warp_gather_masked(2, 0x222, 0xffffffffu, all);
+    }
+}
+
 static const ocu_cpu_kernel_entry g_entries[] = {
     {"gather", k_gather}, {"early_exit", k_early_exit},
     {"split", k_split}, {"two_level", k_two_level},
+    {"skip_iteration", k_skip_iteration}, {"two_sites", k_two_sites},
 };
 static const ocu_cpu_image g_image = {OCU_CPU_IMAGE_MAGIC, OCU_CPU_IMAGE_VERSION,
-                                      4, g_entries};
+                                      6, g_entries};
 
 static ocu_kernel *kernel(const char *name)
 {
@@ -215,6 +244,26 @@ static void test_two_level(void)
     B->mem_free(D, out);
 }
 
+static void test_mismatched_calls(void)
+{
+    g_test = "mismatched_warp_calls";
+    uint64_t *out = NULL;
+    B->mem_alloc(D, 64 * sizeof(uint64_t), (void **)&out);
+    void *args[] = {&out};
+    size_t sz[] = {sizeof(out)};
+    ocu_launch_params p = params(1, 32, args, sz, 1);
+    CHECK(B->kernel_launch(NULL, kernel("two_sites"), &p) == OCU_ERR_LAUNCH_FAILED);
+    const char *strict = getenv("OCU_CPU_STRICT");
+    int is_strict = strict != NULL && strcmp(strict, "1") == 0;
+    ocu_status st = B->kernel_launch(NULL, kernel("skip_iteration"), &p);
+    if (is_strict) {
+        CHECK(st == OCU_ERR_LAUNCH_FAILED); /* lane 31 named in the mask, gone */
+    } else {
+        CHECK(st == OCU_OK); /* tolerated by default, like exited threads at a barrier */
+    }
+    B->mem_free(D, out);
+}
+
 int main(void)
 {
     B = ocu_backend_cpu();
@@ -229,6 +278,7 @@ int main(void)
     test_early_exit();
     test_split_is_reported();
     test_two_level();
+    test_mismatched_calls();
     B->module_unload(M);
     if (g_failures == 0) {
         printf("test_cpu_warp: ok (%d checks, warp %u)\n", g_checks, W);
