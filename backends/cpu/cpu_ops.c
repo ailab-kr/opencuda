@@ -181,7 +181,7 @@ static ocu_status cpu_op_execute(ocu_op_plan *plan, ocu_queue *queue,
     if (l.rows_per_block < 1) l.rows_per_block = 1;
     int64_t blocks = (l.rows + l.rows_per_block - 1) / l.rows_per_block;
 
-    struct ocu_kernel k = {NULL, k_op};
+    struct ocu_kernel k = {NULL, k_op, NULL};
     void *args[1] = {&l};
     size_t sizes[1] = {sizeof(l)};
     ocu_launch_params p;

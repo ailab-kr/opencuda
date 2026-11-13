@@ -190,6 +190,7 @@ struct cpu_op {
         } set;
         struct {
             ocu_cpu_kernel_fn fn;
+            ocu_cpu_block_fn  block_fn;
             uint32_t          grid[3];
             uint32_t          block[3];
             size_t            shared_bytes;
@@ -221,7 +222,7 @@ static ocu_status op_run(cpu_op *op)
         return OCU_OK;
     }
     case OP_LAUNCH:
-        return cpu_run_grid(op->u.launch.fn, op->u.launch.grid,
+        return cpu_run_grid(op->u.launch.fn, op->u.launch.block_fn, op->u.launch.grid,
                             op->u.launch.block, op->u.launch.shared_bytes,
                             op->u.launch.args);
     case OP_MARKER:
@@ -552,7 +553,7 @@ ocu_status cpu_kernel_launch(ocu_queue *queue, ocu_kernel *kernel,
         return st;
     }
     if (queue == NULL) {
-        return cpu_run_grid(kernel->fn, p->grid, p->block,
+        return cpu_run_grid(kernel->fn, kernel->block_fn, p->grid, p->block,
                             p->shared_memory_bytes, p->args);
     }
 
@@ -587,6 +588,7 @@ ocu_status cpu_kernel_launch(ocu_queue *queue, ocu_kernel *kernel,
     }
     op->kind = OP_LAUNCH;
     op->u.launch.fn = kernel->fn;
+    op->u.launch.block_fn = kernel->block_fn;
     memcpy(op->u.launch.grid, p->grid, sizeof(op->u.launch.grid));
     memcpy(op->u.launch.block, p->block, sizeof(op->u.launch.block));
     op->u.launch.shared_bytes = p->shared_memory_bytes;

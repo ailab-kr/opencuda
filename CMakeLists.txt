@@ -13,6 +13,7 @@ option(OCU_BACKEND_OPENCL "Build the OpenCL backend (uses the installed OpenCL l
 option(OCU_BACKEND_AMD "Build the AMD GPU backend (not available yet)" OFF)
 option(OCU_BACKEND_INTEL "Build the Intel GPU backend (not available yet)" OFF)
 option(OCU_BUILD_TESTS "Build smoke tests" ON)
+option(OCU_CPU_LOOPS "CPU path: give kernels without synchronisation points a loop entry (LLVM pass plugin, needs LLVM 18+ development files)" ON)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -38,6 +39,8 @@ set(OCU_CC_SCRIPT ${PROJECT_SOURCE_DIR}/compiler/probe/ocu_cc.py)
 set(OCU_CUDART_TARGET ocu_cudart)
 file(GLOB OCU_CC_DEPENDS ${PROJECT_SOURCE_DIR}/runtime/include/*.h)
 list(APPEND OCU_CC_DEPENDS ${PROJECT_SOURCE_DIR}/backends/cpu/ocu_cpu_kernel.h)
+# The whole-block pass the CPU path loads (sets OCU_CPU_LOOPS_ENV).
+add_subdirectory(compiler/cpu_loops)
 
 add_subdirectory(backends)
 add_subdirectory(runtime)

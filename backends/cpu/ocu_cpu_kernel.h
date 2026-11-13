@@ -13,6 +13,10 @@
  * block never needs locks for its own shared memory. Different blocks run
  * on different OS threads at the same time, so device memory shared across
  * blocks needs real atomics, as on a GPU.
+ *
+ * Kernels without synchronisation points may also have a whole-block entry
+ * (image version 2, made by the CPU-path compiler pass) that runs the
+ * threads of a block as a loop, in the same order as the fibers would.
  */
 #ifndef OCU_CPU_KERNEL_H
 #define OCU_CPU_KERNEL_H
@@ -26,12 +30,19 @@ extern "C" {
 
 /* ---- module image ---------------------------------------------------- */
 
-#define OCU_CPU_IMAGE_MAGIC   0x4f435543u /* "OCUC" */
-#define OCU_CPU_IMAGE_VERSION 1u
+#define OCU_CPU_IMAGE_MAGIC     0x4f435543u /* "OCUC" */
+/* Version 1: `entries` is an array of ocu_cpu_kernel_entry. The language
+   layer writes version 1. */
+#define OCU_CPU_IMAGE_VERSION   1u
+/* Version 2: `entries` points at an array of ocu_cpu_kernel_entry2, which
+   adds an optional whole-block entry. The CPU-path compiler pass
+   (compiler/cpu_loops) upgrades images to version 2. */
+#define OCU_CPU_IMAGE_VERSION_2 2u
 
 /*
  * One kernel entry point. `args[i]` points at the i-th argument value, laid
- * out exactly as the caller passed it to kernel_launch.
+ * out exactly as the caller passed it to kernel_launch. It runs one GPU
+ * thread (on a fiber, see below).
  */
 typedef void (*ocu_cpu_kernel_fn)(void **args);
 
@@ -40,19 +51,64 @@ typedef struct ocu_cpu_kernel_entry {
     ocu_cpu_kernel_fn fn;
 } ocu_cpu_kernel_entry;
 
-/* Pass a pointer to this as `image`, and sizeof(ocu_cpu_image) as `bytes`. */
-typedef struct ocu_cpu_image {
-    uint32_t                    magic;   /* OCU_CPU_IMAGE_MAGIC */
-    uint32_t                    version; /* OCU_CPU_IMAGE_VERSION */
-    uint32_t                    count;
-    const ocu_cpu_kernel_entry *entries; /* must outlive the module */
-} ocu_cpu_image;
-
-/* ---- device-side API (valid only inside a running kernel) ------------- */
-
+/*
+ * What a whole-block entry is told about the block it runs.
+ *   order    NULL: run the threads in the fixed order (x fastest, then y,
+ *            then z; linear index x + dim.x * (y + dim.y * z)). Otherwise
+ *            `nthreads` linear indices, the order to run them in (random
+ *            order, OCU_CPU_ORDER=random).
+ *   tids     threadIdx of each linear index (read with `order`).
+ *   current  where the entry stores the linear index of the thread it is
+ *            about to run when the kernel asks the backend for it
+ *            (ocu_cpu_thread_idx, ocu_cpu_lane_id).
+ * Before each thread the entry stores its threadIdx into
+ * ocu_cpu_tls_thread_idx (it may leave that out where nothing can read it).
+ */
 typedef struct ocu_cpu_dim3 {
     uint32_t x, y, z;
 } ocu_cpu_dim3;
+
+typedef struct ocu_cpu_block_info {
+    const uint32_t     *order;
+    const ocu_cpu_dim3 *tids;
+    uint32_t           *current;
+    ocu_cpu_dim3        dim;
+    uint32_t            nthreads;
+} ocu_cpu_block_info;
+
+/*
+ * Runs every thread of one block, one after another, each from its start to
+ * its end, and returns 0. Only for kernels without synchronisation points
+ * (no block barrier, no warp operation) that do not change the
+ * floating-point control state: the compiler pass checks this. Called on a
+ * fiber stack of the block, so stack limits and checks are those of the
+ * fiber form.
+ *
+ * May decline instead, before running any thread, by returning nonzero:
+ * the launch then runs on fibers. An entry that reaches its kernel through
+ * a pointer (cudaLaunchKernel, a launch helper taking the kernel as a
+ * parameter) declines when the pointer is not a kernel the compiler checked.
+ * The answer depends only on the arguments, so it is the same for every
+ * block of a launch.
+ */
+typedef int (*ocu_cpu_block_fn)(void **args, const ocu_cpu_block_info *info);
+
+typedef struct ocu_cpu_kernel_entry2 {
+    const char       *name;
+    ocu_cpu_kernel_fn fn;    /* one thread; always present */
+    ocu_cpu_block_fn  block; /* whole block, or NULL: fibers only */
+} ocu_cpu_kernel_entry2;
+
+/* Pass a pointer to this as `image`, and sizeof(ocu_cpu_image) as `bytes`. */
+typedef struct ocu_cpu_image {
+    uint32_t                    magic;   /* OCU_CPU_IMAGE_MAGIC */
+    uint32_t                    version; /* OCU_CPU_IMAGE_VERSION or _2 */
+    uint32_t                    count;
+    /* must outlive the module; ocu_cpu_kernel_entry2 entries in version 2 */
+    const ocu_cpu_kernel_entry *entries;
+} ocu_cpu_image;
+
+/* ---- device-side API (valid only inside a running kernel) ------------- */
 
 ocu_cpu_dim3 ocu_cpu_thread_idx(void);
 ocu_cpu_dim3 ocu_cpu_block_idx(void);

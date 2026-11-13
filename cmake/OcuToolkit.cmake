@@ -70,6 +70,15 @@ foreach(t IN LISTS _ocu_tk_libs)
   list(APPEND _ocu_tk_cmds COMMAND ${CMAKE_COMMAND} -E create_symlink
        $<TARGET_FILE:${t}> ${_tk}/lib/$<TARGET_FILE_NAME:${t}>)
 endforeach()
+# The CPU path's whole-block pass and the name of its Clang (ocu-nvcc
+# passes it to ocu_cc when it is there).
+if(OCU_CPU_LOOPS_PLUGIN AND TARGET ocu_cpu_loops)
+  list(APPEND _ocu_tk_cmds
+       COMMAND ${CMAKE_COMMAND} -E create_symlink ${OCU_CPU_LOOPS_PLUGIN} ${_tk}/lib/libocu_cpu_loops.so
+       COMMAND ${CMAKE_COMMAND} -E create_symlink
+               ${PROJECT_BINARY_DIR}/compiler/cpu_loops/libocu_cpu_loops.clang ${_tk}/lib/libocu_cpu_loops.clang)
+  list(APPEND _ocu_tk_libs ocu_cpu_loops)
+endif()
 add_custom_target(ocu_toolkit ALL ${_ocu_tk_cmds}
   DEPENDS ${_ocu_tk_libs}
   COMMENT "ocu toolkit folder: ${_tk}")

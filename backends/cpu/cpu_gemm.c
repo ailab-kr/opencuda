@@ -170,9 +170,13 @@ static void k_gemm_tile(void **args)
                B column c, p = B[c*ldb + p] when transposed, else B[p*ldb + c]. */
 #if GEMM_HAVE
             if (j->avx2) {
+                /* Only where the AVX2 variant is compiled (x86-64); j->avx2
+                   is never set elsewhere. */
+#if defined(OCU_CPU_GEMM_AVX2)
                 cpu_gemm_panel_avx2(ap, kcp, A, j->in, j->lda, !j->ta, i0, rows, rows_pad, k0, kc);
                 cpu_gemm_panel_avx2(bp, kcp, B, j->in, j->ldb, j->tb, j0, cols, cols_pad, k0, kc);
                 cpu_gemm_dots_avx2(acc, cols_pad, ap, bp, rows_pad, cols_pad, kcp);
+#endif
             } else {
                 cpu_gemm_panel_generic(ap, kcp, A, j->in, j->lda, !j->ta, i0, rows, rows_pad, k0, kc);
                 cpu_gemm_panel_generic(bp, kcp, B, j->in, j->ldb, j->tb, j0, cols, cols_pad, k0, kc);
@@ -260,7 +264,7 @@ ocu_status cpu_gemm_launch(ocu_queue *queue, const ocu_op_desc *d, void *const *
     const int64_t blocks = j.batch * j.tiles_m * j.tiles_n;
     if (blocks > 0x7fffffffLL) return OCU_ERR_NOT_SUPPORTED;
 
-    struct ocu_kernel k = {NULL, k_gemm_tile};
+    struct ocu_kernel k = {NULL, k_gemm_tile, NULL};
     void *args[1] = {&j};
     size_t sizes[1] = {sizeof(j)};
     ocu_launch_params p;

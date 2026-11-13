@@ -31,6 +31,11 @@ typedef struct cpu_config {
                                  watch for work before sleeping (50) */
     bool      stats;          /* OCU_CPU_STATS=1: count launches, fiber
                                  switches and time; printed at exit */
+    const char *trace;        /* OCU_CPU_TRACE=<file>: after every launch,
+                                 append a hash of all device memory */
+    bool      loops;          /* OCU_CPU_FORM: run whole-block entries where
+                                 the image has them (default, "loop",
+                                 "dispatch"), or fibers only ("fiber") */
 } cpu_config;
 
 const cpu_config *cpu_get_config(void);
@@ -61,6 +66,7 @@ struct ocu_module {
 struct ocu_kernel {
     ocu_module       *module;
     ocu_cpu_kernel_fn fn;
+    ocu_cpu_block_fn  block_fn; /* whole-block entry (image version 2), or NULL */
 };
 
 typedef enum marker_state {
@@ -105,13 +111,19 @@ ocu_status cpu_host_free_pinned(ocu_device *dev, void *ptr);
 /* OCU_OK when [ptr, ptr + bytes) lies inside one device allocation. */
 ocu_status cpu_check_device_range(const void *ptr, size_t bytes);
 uint64_t   cpu_total_memory(void);
+/* OCU_CPU_TRACE: a hash of the contents of every live device and pinned
+   allocation, independent of where they lie. */
+uint64_t   cpu_mem_digest(void);
 
 /* ---- execution (cpu_exec.c) ------------------------------------------- */
 
 /* Validate launch dimensions against the limits above. */
 ocu_status cpu_check_launch(const ocu_launch_params *params);
-/* Run a whole grid now, on the calling thread plus worker threads. */
-ocu_status cpu_run_grid(ocu_cpu_kernel_fn fn, const uint32_t grid[3],
+/* Run a whole grid now, on the calling thread plus worker threads.
+   `block_fn` (may be NULL) runs a whole block as a loop; it is used unless
+   OCU_CPU_FORM=fiber. */
+ocu_status cpu_run_grid(ocu_cpu_kernel_fn fn, ocu_cpu_block_fn block_fn,
+                        const uint32_t grid[3],
                         const uint32_t block[3], size_t shared_bytes,
                         void **args);
 

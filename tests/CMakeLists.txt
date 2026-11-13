@@ -904,3 +904,26 @@ if(OCU_BACKEND_NPUSIM)
       SKIP_RETURN_CODE 77 ENVIRONMENT "${envs}")
   endforeach()
 endif()
+
+# ---- the CPU path's two kernel forms (docs/cpu-region-loops.md, stage 1):
+# every CPU-path test program run with OCU_CPU_FORM=fiber and =loop, fixed
+# and random order, must exit the same, print the same and leave the same
+# device memory after every launch (cpu_forms/form_diff.cmake). Only where
+# the whole-block pass is built; elsewhere there is one form.
+if(OCU_BACKEND_CPU AND OCU_CPU_LOOPS_PLUGIN)
+  find_program(OCU_SETARCH setarch)
+  # Not ptx_shift_run_plain: it shows what C++ makes of shifts by the width
+  # or more (undefined behaviour), which may differ between the forms as
+  # between optimisation levels.
+  foreach(t rt_api rt_lang rt_warp_lang rt_mem rt_misc rt_fp16 rt_bf16 ptx_shift_run
+            fma_exact_test rt_gaps_intrin rt_gaps_api rt_review rt_review2
+            rt_launch_api rt_pdl cub_device cub_block ocu_cc_saxpy cublas_accuracy)
+    if(TARGET ${t})
+      add_test(NAME cpu_forms_${t}
+        COMMAND ${CMAKE_COMMAND} -DRUN=$<TARGET_FILE:${t}> -DNAME=${t}
+                -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cpu_forms
+                -DSETARCH=${OCU_SETARCH} -DARCH=${CMAKE_HOST_SYSTEM_PROCESSOR}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/cpu_forms/form_diff.cmake)
+    endif()
+  endforeach()
+endif()

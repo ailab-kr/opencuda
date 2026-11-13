@@ -66,6 +66,24 @@ static ocu_status cpu_dev_close(ocu_device *dev)
 
 /* ---- modules ----------------------------------------------------------- */
 
+/* Entry i of an image of either version (ocu_cpu_kernel.h). */
+static const ocu_cpu_kernel_entry2 *entry2(const ocu_cpu_image *img, uint32_t i)
+{
+    return &((const ocu_cpu_kernel_entry2 *)(const void *)img->entries)[i];
+}
+
+static const char *entry_name(const ocu_cpu_image *img, uint32_t i)
+{
+    return img->version == OCU_CPU_IMAGE_VERSION_2 ? entry2(img, i)->name
+                                                   : img->entries[i].name;
+}
+
+static ocu_cpu_kernel_fn entry_fn(const ocu_cpu_image *img, uint32_t i)
+{
+    return img->version == OCU_CPU_IMAGE_VERSION_2 ? entry2(img, i)->fn
+                                                   : img->entries[i].fn;
+}
+
 typedef struct module_box {
     ocu_module module;   /* first member: the handle points here */
     ocu_kernel *kernels; /* one per image entry */
@@ -82,14 +100,15 @@ static ocu_status cpu_module_load(ocu_device *dev, const void *image,
     }
     const ocu_cpu_image *img = image;
     if (img->magic != OCU_CPU_IMAGE_MAGIC ||
-        img->version != OCU_CPU_IMAGE_VERSION) {
+        (img->version != OCU_CPU_IMAGE_VERSION &&
+         img->version != OCU_CPU_IMAGE_VERSION_2)) {
         return OCU_ERR_INVALID_VALUE;
     }
     if (img->count > 0 && img->entries == NULL) {
         return OCU_ERR_INVALID_VALUE;
     }
     for (uint32_t i = 0; i < img->count; ++i) {
-        if (img->entries[i].name == NULL || img->entries[i].fn == NULL) {
+        if (entry_name(img, i) == NULL || entry_fn(img, i) == NULL) {
             return OCU_ERR_INVALID_VALUE;
         }
     }
@@ -107,7 +126,10 @@ static ocu_status cpu_module_load(ocu_device *dev, const void *image,
     box->module.image = img;
     for (uint32_t i = 0; i < img->count; ++i) {
         box->kernels[i].module = &box->module;
-        box->kernels[i].fn = img->entries[i].fn;
+        box->kernels[i].fn = entry_fn(img, i);
+        box->kernels[i].block_fn = img->version == OCU_CPU_IMAGE_VERSION_2
+                                       ? entry2(img, i)->block
+                                       : NULL;
     }
     *module = &box->module;
     return OCU_OK;
@@ -136,7 +158,7 @@ static ocu_status cpu_module_get_kernel(ocu_module *module, const char *name,
     module_box *box = (module_box *)module;
     const ocu_cpu_image *img = module->image;
     for (uint32_t i = 0; i < img->count; ++i) {
-        if (strcmp(img->entries[i].name, name) == 0) {
+        if (strcmp(entry_name(img, i), name) == 0) {
             *kernel = &box->kernels[i];
             return OCU_OK;
         }
