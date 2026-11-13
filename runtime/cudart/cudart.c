@@ -1221,6 +1221,26 @@ cudaError_t cudaMalloc3D(struct cudaPitchedPtr *pitched, struct cudaExtent exten
     return cudaSuccess;
 }
 
+/* False when the 3D region (x, y, z offsets, extent) of a pitched block starts at
+   `base` and ends past the allocation holding `base`. A block whose size is
+   not known to the runtime (not allocated by it) is not checked. */
+static bool region3d_fits(const void *base, size_t pitch, size_t ysize, size_t x, size_t y,
+                          size_t z, struct cudaExtent ext)
+{
+    rt_device *d;
+    mem_range r;
+    if (current(&d) != cudaSuccess || !range_find(d, base, 1, &r)) return true;
+    size_t avail = r.size - (size_t)((const char *)base - r.base);
+    size_t rows, last, end;
+    if (__builtin_add_overflow(z, ext.depth - 1, &last) || __builtin_mul_overflow(last, ysize, &rows) ||
+        __builtin_add_overflow(rows, y, &rows) || __builtin_add_overflow(rows, ext.height - 1, &rows) ||
+        __builtin_mul_overflow(rows, pitch, &end) || __builtin_add_overflow(end, x, &end) ||
+        __builtin_add_overflow(end, ext.width, &end)) {
+        return false;
+    }
+    return end <= avail;
+}
+
 static cudaError_t memset3d(struct cudaPitchedPtr pp, int value, struct cudaExtent ext,
                             cudaStream_t stream)
 {
@@ -1228,6 +1248,7 @@ static cudaError_t memset3d(struct cudaPitchedPtr pp, int value, struct cudaExte
     if (pp.ptr == NULL || ext.width > pp.pitch) return set_error(cudaErrorInvalidValue);
     if (pp.ysize != 0 && ext.height > pp.ysize) return set_error(cudaErrorInvalidValue);
     size_t ysize = pp.ysize != 0 ? pp.ysize : ext.height;
+    if (!region3d_fits(pp.ptr, pp.pitch, ysize, 0, 0, 0, ext)) return set_error(cudaErrorInvalidValue);
     for (size_t z = 0; z < ext.depth; ++z) {
         cudaError_t e = memset2d((char *)pp.ptr + z * ysize * pp.pitch, pp.pitch, value,
                                  ext.width, ext.height, stream);
@@ -1260,6 +1281,11 @@ static cudaError_t copy3d(const struct cudaMemcpy3DParms *p, cudaStream_t stream
     size_t dy = d.ysize != 0 ? d.ysize : ext.height;
     if (ext.width + p->srcPos.x > s.pitch || ext.width + p->dstPos.x > d.pitch ||
         ext.height + p->srcPos.y > sy || ext.height + p->dstPos.y > dy) {
+        return set_error(cudaErrorInvalidValue);
+    }
+    /* Whole request checked before any slice is written. */
+    if (!region3d_fits(s.ptr, s.pitch, sy, p->srcPos.x, p->srcPos.y, p->srcPos.z, ext) ||
+        !region3d_fits(d.ptr, d.pitch, dy, p->dstPos.x, p->dstPos.y, p->dstPos.z, ext)) {
         return set_error(cudaErrorInvalidValue);
     }
     for (size_t z = 0; z < ext.depth; ++z) {
