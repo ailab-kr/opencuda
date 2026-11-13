@@ -207,9 +207,9 @@ divergence against the oracle instead
 
 | Check | Result |
 |---|---|
-| Rodinia (18 CUDA programs, unmodified) | 17 build. 14 match an independent reference (OpenMP version, serial reference, or the program's own check). 15 match with the opt-in PTX shift semantics. |
+| Rodinia (21 CUDA programs, unmodified, CPU path) | 21 build. 16 match an independent reference (OpenMP version, serial reference, or the program's own check), including the texture programs hybridsort and mummergpu. With the opt-in PTX shift semantics huffman passes too, but mummergpu and kmeans stop in its Clang syntax pass (16). |
 | PolyBench-ACC (21 programs, unmodified) | 21 build and run; 20 pass the program's own CPU-vs-GPU check (the other has a race the CPU path exposes: [details](cards/apps/app-corpus.md)) |
-| Parboil (11 programs, unmodified) | 8 build (3 need the texture API); 5 checked, all match the suite's CPU version exactly |
+| Parboil (11 programs, unmodified) | 11 build; 9 run; 7 match the suite's CPU version exactly (bfs differs because of the program's own GPU algorithm, see card `runtime-texture`) |
 | llm.c GPT-2 training (fp32, unmodified) | builds and trains; losses match the reference C trainer to 6 digits once a race in the loss read is ordered |
 | Linux · Windows under Wine | 232 / 232 · 152 / 152 |
 | Windows 10 laptop · macOS M3 and M1 Pro | 37 / 38 (1 skipped) · 124 / 124 on each |
@@ -401,7 +401,7 @@ Short answers to the questions we hear most. The full list is in [docs/FAQ.md](d
 | Why CUDA C++ and not PyTorch or Triton? | Frameworks still sit on CUDA C++ engines, kernels and libraries. New chips need that layer first; OpenCuda complements framework backends. |
 | Will NVIDIA-tuned code be fast on other chips? | Not automatically. Correctness comes first; speed is measured against each chip's native software and published as it is. |
 | How is "correct" defined for floating point? | Documented behaviour, then high-precision math. Applications are compared with a high-precision oracle by KL divergence, within the band that the app's own official backends show. |
-| What is not supported yet? | CUDA graphs, textures and surfaces, cuBLASLt matmul, cuDNN, cuFFT, cuRAND, cuSPARSE, NCCL, Thrust, and native MSVC builds. Each returns "not supported" rather than failing silently. |
+| What is not supported yet? | CUDA graphs, hardware texture units (textures are sampled in software), surfaces, cuBLASLt matmul, cuDNN, cuFFT, cuRAND, cuSPARSE, NCCL, Thrust, and native MSVC builds. Each returns "not supported" rather than failing silently. |
 | Isn't it all about llama.cpp? | So far, mostly. Next targets add hundreds of benchmark programs, a training code base, a Thrust/CUB-heavy library and classic HPC suites. |
 | Is it production-ready? | No. Pre-release (0.x); the backend ABI is versioned. |
 

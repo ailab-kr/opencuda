@@ -42,23 +42,23 @@ PolyBench-ACC (SMALL 데이터셋과 기본 STANDARD 데이터셋 둘 다):
 - 어긋난 하나는 `mvt`: 프로그램 결함이다. 블록을 32×8로 띄우면서 색인은 `threadIdx.x`만 써서 8개 스레드가 같은 `x1[i]`·`x2[i]`에 더한다. 워프가 박자를 맞춰 도는 GPU에서는 가려지지만(같은 값을 읽고 같은 값을 쓴다), 스레드를 차례로 도는 CPU 백엔드에서는 값이 직렬 결과의 8배가 된다(SMALL 4094개, STANDARD 8190개 차이). 작업 폴더의 복사본에서 `DIM_THREAD_BLOCK_Y`를 1로 바꾸면 차이 0.
 - 점검이 CPU 판과 GPU 판을 같은 컴파일러·같은 부동소수점 규칙으로 돌려 비교하는 것이라 칼같이 일치한다(나머지 20개 모두 차이 0). 같은 연산 순서로 짜인 프로그램이라는 뜻이다.
 
-Parboil (11개 중 이름 선언률 100%인 9개 + 텍스처가 필요한 3개 중 bfs·sad. spmv는 `texture` 참조를 쓴다):
+Parboil (11개 모두. bfs·sad·spmv는 텍스처 참조를 쓴다: 카드 `runtime-texture`, 2026-11-13 추가):
 
 | 프로그램 | 빌드 | 실행 | CPU 판과 비교 |
 |---|---|---|---|
-| bfs | 아니오 (`texture<>` 참조) | - | - |
+| bfs | 예 (텍스처 추가 후) | 예 | 다름: 4,096개 노드 중 782개. 원인은 프로그램의 GPU 알고리즘(텍스처를 보통 읽기로 바꾼 복사본도 같은 782개, RTX 5070 Ti에서도 CPU 판과 615개 다름; 카드 `runtime-texture`) |
 | cutcp | 예 | 예 (원자 300개) | 기준 없음: 출력만 확인 |
 | histo | 예 | 예 | 일치 (비트맵 147,510바이트 동일) |
 | lbm | 예 | 예 (2걸음) | 일치 (6,480,000개 값 모두 허용 오차 안, 실제로는 동일) |
 | mri-gridding | 예 | 아니오 | 입력 형식(궤적 파일) 생성기 없음: 빌드만 |
 | mri-q | 예 | 예 | 일치 (2048개 값) |
-| sad | 아니오 (텍스처 참조) | - | - |
+| sad | 예 (텍스처 추가 후) | 예 | 일치 (SAD 4,286,312바이트 동일, 128×96 두 프레임) |
 | sgemm | 예 | 예 (128×64 · 64×64) | 일치 (8192개 값) |
-| spmv | 아니오 (텍스처 참조) | - | - |
+| spmv | 예 (텍스처 추가 후) | 예 | 일치 (fidapm05.mtx, 42개 값; 패턴 행렬은 묶음의 변환기가 두 판 모두에서 죽음) |
 | stencil | 예 | 예 | 일치 (4096개 값) |
 | tpacf | 예 | 아니오 | 입력(카탈로그 파일) 생성기 없음: 빌드만 |
 
-합계: 11개 중 8개 빌드, 5개 실행, 5개가 CPU 판과 일치(cutcp는 기준 없음이라 일치 칸에서 뺌). 빌드 실패 3개는 모두 CUDA 12에서 사라진 `texture` 참조 API가 원인이다(텍스처 API는 이 저장소에 아직 없음).
+합계: 11개 모두 빌드, 9개 실행, 7개가 CPU 판과 일치(cutcp는 기준 없음이라 일치 칸에서 뺌). 텍스처 전에는 8개 빌드·5개 실행·5개 일치였다(빌드 실패 3개는 모두 CUDA 12에서 사라진 `texture` 참조 API가 원인).
 
 Parboil 빌드에 쓴 컴파일러 옵션(소스는 그대로): `-Xcompiler -Wno-c++11-narrowing`(histo의 좁히기 초기화, nvcc의 호스트 컴파일러는 경고만 냄), `-Xcompiler -fno-strict-return`(sgemm의 `readColMajorMatrixFile`은 `bool`을 돌려주는 함수인데 `return` 없이 끝난다. C++에서 정의되지 않은 동작이고 Clang은 최적화에서 그 길을 없앤다). 기준(CPU 판)도 같은 이유로 gcc가 아니라 clang으로 빌드한다(gcc는 그 지점에 `ud2`를 넣어 실행이 죽는다).
 입력 크기는 프로그램의 가정에 맞췄다: sgemm은 행이 128의 배수·열이 16의 배수, histo는 히스토그램 너비 = 영상 너비이고 24576칸 단위.
@@ -85,8 +85,8 @@ llm.c `train_gpt2_fp32.cu` (CPU 경로, 소스 그대로, `cublas`는 `ocu_blas`
 
 ## 경계 조건
 
-- 텍스처 참조(`texture<>`, `cudaBindTexture`)는 없다: Parboil bfs·sad·spmv는 빌드하지 못한다.
-- `cudaMemcpy3D`의 배열 인자는 "지원 안 함"(`cudaErrorNotSupported`).
+- 텍스처: 카드 `runtime-texture`(객체·배열·CPU 경로의 참조, 소프트웨어 표본 추출).
+- `cudaMemcpy3D`의 배열 인자: 텍스처 작업에서 구현(살아 있는 배열이 아닌 손잡이는 `cudaErrorInvalidValue`).
 - `cudaDeviceSetLimit`: 스택·printf FIFO·말록 힙은 값을 기록해 돌려주기만 하며 효과가 없다. 0은 `cudaErrorInvalidValue`. 장치 런타임 한도(동기화 깊이, 대기 실행 수)와 L2 상주 한도는 `cudaErrorUnsupportedLimit`, `cudaLimitMaxL2FetchGranularity`는 힌트라 0을 돌려준다.
 - 무동기 워프 함수와 NVIDIA 경로의 시스템 범위 원자는 컴파일 오류(위).
 - PolyBench `mvt`와 llm.c 손실 값은 프로그램의 경쟁 상태 때문에 CPU 백엔드에서 GPU와 다르게 보인다(위). 백엔드의 스레드 실행 순서가 GPU와 닮을수록 덜 드러나지만 보장은 아니다.
@@ -100,11 +100,11 @@ llm.c `train_gpt2_fp32.cu` (CPU 경로, 소스 그대로, `cublas`는 `ocu_blas`
 3. 무동기 워프 함수: 부르는 코드는 컴파일되지 않고 메시지에 대체 함수 이름이 있다. 부르지 않으면 영향이 없다.
 4. `math_constants.h`: 단정밀도 값은 해당 수학 상수를 float로 한 번 반올림한 값과 같고 배정밀도도 같다. `_HI + _LO`가 상수에 더 가깝다. `CUDART_INF_F`는 무한대, `CUDART_NAN_F`는 NaN, `CUDART_NEG_ZERO_F`는 부호 비트가 선 0.
 5. `cuda_profiler_api.h`: Start/Stop이 `cudaSuccess`, 여러 번 불러도 같음.
-6. `cudaMalloc3D`: 피치 ≥ 너비, `xsize`=너비, `ysize`=높이, 할당 크기 = 피치 × 높이 × 깊이. 너비 0 등 경계. `cudaMemset3D`: 지정한 범위(너비×높이×깊이)만 채운다(피치 패딩과 범위 밖은 그대로). `cudaMemcpy3D`: 네 방향, `srcPos`·`dstPos` 오프셋, 피치와 `ysize`가 다른 원본·대상, 범위 초과는 `cudaErrorInvalidValue`, 배열 인자는 `cudaErrorNotSupported`. `Async` 쪽은 스트림 순서를 따른다. 너비·높이·깊이 중 하나가 0이면 성공하고 아무것도 안 함.
+6. `cudaMalloc3D`: 피치 ≥ 너비, `xsize`=너비, `ysize`=높이, 할당 크기 = 피치 × 높이 × 깊이. 너비 0 등 경계. `cudaMemset3D`: 지정한 범위(너비×높이×깊이)만 채운다(피치 패딩과 범위 밖은 그대로). `cudaMemcpy3D`: 네 방향, `srcPos`·`dstPos` 오프셋, 피치와 `ysize`가 다른 원본·대상, 범위 초과는 `cudaErrorInvalidValue`, 배열 인자는 카드 `runtime-texture`의 시험 목록 3. `Async` 쪽은 스트림 순서를 따른다. 너비·높이·깊이 중 하나가 0이면 성공하고 아무것도 안 함.
 7. `cudaDeviceGetLimit`/`SetLimit`: 설정한 값을 그대로 돌려준다(스택·printf FIFO·말록 힙). 모르는 열거값은 `cudaErrorInvalidValue`, 장치 런타임·L2 상주 한도는 `cudaErrorUnsupportedLimit`.
 8. Cooperative Groups: `tiled_partition<N>(this_thread_block())`로 얻은 타일의 `meta_group_size()` = 블록 스레드 수 / N, `meta_group_rank()` = 블록 내 선형 스레드 번호 / N. `tiled_partition<M>(타일<N>)`에서는 N/M과 (타일 내 순번)/M. `thread_block_tile<N> t = tiled_partition<N>(block);`로 부모 없는 형에 담아도 같은 값. `cg::reduce`가 부모 있는 타일에서 동작.
 9. 번역기: `struct S {int a; int b;} __align__(8);`가 CPU 경로에서 컴파일되고 `alignof(S) == 8`.
-10. 응용 시험(자동화 후보): 위 세 스크립트를 그대로 돌려 각 묶음의 숫자(PolyBench 21/21/21/20, Parboil 8 빌드·5 실행·5 일치, llm.c 8걸음 손실 차이 그대로 0.0648·막은 복사본 0.000002)가 줄지 않을 것.
+10. 응용 시험(자동화 후보): 위 세 스크립트를 그대로 돌려 각 묶음의 숫자(PolyBench 21/21/21/20, Parboil 11 빌드·9 실행·7 일치, llm.c 8걸음 손실 차이 그대로 0.0648·막은 복사본 0.000002)가 줄지 않을 것.
 
 ## 이의
 

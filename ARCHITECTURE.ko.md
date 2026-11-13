@@ -47,8 +47,8 @@ compiler/         runtime/         libs/
 | `backends/npusim/` | NPU 제약 흉내 백엔드: 커널 없음, 연산 표만, 호스트가 못 읽는 장치 메모리, 온칩 메모리 한도 | 연산 5종 |
 | `backends/ops_ref/` | 연산 표의 공통 검사와 기준 계산(백엔드 아님, 연산 표를 내놓는 백엔드가 링크) | 있음 |
 | `runtime/core/` | 백엔드 등록과 선택 | 있음 |
-| `runtime/include/` | 사용자 프로그램이 보는 헤더: `cuda_runtime_api.h`·`cuda_runtime.h`·`cuda.h`·`cuda_fp16.h`, 벡터 형, CPU 경로 언어 지원 `ocu_cuda_lang_cpu.h`, 헤더만으로 된 병렬 기본 연산 부분집합 `cub/cub.cuh`(프로그램과 함께 대상마다 컴파일, `cards/libs/cub-subset.md`) | 함수 80여 개 |
-| `runtime/cudart/` | 실행 API 구현(`ocu_cudart`): 장치·오류·메모리·스트림·사건·실행. 백엔드 규격만 부른다 | 있음 |
+| `runtime/include/` | 사용자 프로그램이 보는 헤더: `cuda_runtime_api.h`·`cuda_runtime.h`·`cuda.h`·`cuda_fp16.h`, 벡터 형, 텍스처 형과 소프트웨어 텍스처 페치 `ocu_texture_fetch.h`(CPU 경로·NVPTX 경로 공용), CPU 경로 언어 지원 `ocu_cuda_lang_cpu.h`, 헤더만으로 된 병렬 기본 연산 부분집합 `cub/cub.cuh`(프로그램과 함께 대상마다 컴파일, `cards/libs/cub-subset.md`) | 함수 80여 개 |
+| `runtime/cudart/` | 실행 API 구현(`ocu_cudart`): 장치·오류·메모리·스트림·사건·실행, CUDA 배열과 텍스처(`texture.c`, 다른 런타임 호출 위에 만듦). 백엔드 규격만 부른다 | 있음 |
 | `libs/` | 라이브러리별 호환 층 | `libs/cublas`: `cublas_v2.h` 부분집합(핸들·스트림·GEMM 계열·1·2단계 일부·strsm 배치), CUDA C 소스 하나로 CPU·NVIDIA 모두 통과. `libs/blas`: 20개 함수(내부 이름), CPU에서 기준 사례 526건 통과 |
 | `compiler/` | 명령 호환, 빌드 도구 연동, 장치용 수학 함수 | 실험 단계 드라이버 `compiler/probe/ocu_cc.py`(CPU 경로는 실제 프로그램 빌드에 씀), CMake 함수 `ocu_add_cpu_cu_executable`, nvcc 명령 호환 드라이버 `compiler/driver/ocu-nvcc`와 툴킷 폴더(CMake 도구 사슬 파일 `OcuCUDA.cmake`, `docs/compiler-driver.md`) |
 | `conformance/` | 적합성 시험, 채점기, 결과 형식 | BLAS 20개 함수의 기준 답 526건, 오차 한계, 자체 검증 |
@@ -171,7 +171,9 @@ CPU 백엔드에서는 "장치 코드 묶음"이 CPU용으로 컴파일된 함�
 - 예전 기본 스트림: 기본 스트림 작업은 막는 스트림들을 먼저 끝내고, 막는 스트림 작업은 기본 스트림을 먼저 끝낸다. 순서 확인부터 대기열에 넣기까지 장치별 잠금을 쥔다(여러 호스트 스레드에서도 성립).
 - 일반(고정 안 된) 호스트 메모리와의 비동기 복사는 돌아오기 전에 끝난다. 런타임이 할당·등록한 고정 메모리만 나중에 읽힌다. 런타임은 자기가 할당한 범위를 기록해 포인터 종류와 `cudaMemcpyDefault`의 방향을 정한다.
 - 커널 실패는 장치에 남아, `cudaDeviceReset` 전까지 이후의 동기화·제출 호출이 같은 오류를 낸다.
-- 구현하지 않은 기능(그래프, 텍스처, 피어 접근, 장치가 호스트 메모리를 공유하지 않을 때의 통합 메모리 등)은 선언하지 않거나 "지원 안 함"을 돌려준다.
+- 구현하지 않은 기능(그래프, 하드웨어 텍스처 장치, 서피스, 피어 접근, 장치가 호스트 메모리를 공유하지 않을 때의 통합 메모리 등)은 선언하지 않거나 "지원 안 함"을 돌려준다.
+
+텍스처(카드 `runtime-texture`): CUDA 배열은 보통 장치 할당이다(행을 붙여 둠). 텍스처 객체는 런타임이 장치 메모리에 복사한 설명자(`ocu_texture_desc.h`)의 장치 주소이고, 장치 코드가 소프트웨어로 표본 추출한다(`ocu_texture_fetch.h`: 주소 모드, 선형 필터의 9비트 가중치, 읽기 방식을 프로그래밍 가이드의 "Texture Fetching" 부록대로). 그래서 커널을 돌리는 백엔드는 백엔드 코드 없이 같은 동작을 얻는다. 엔비디아 경로도 같다(드라이버의 텍스처 장치는 쓰지 않음). 옛 텍스처 참조(`texture<>`)는 묶음을 참조 안에 들고 있어 CPU 경로가 직접 읽고, 엔비디아 경로에서는 참조로 페치하면 빌드가 멈춘다. 묶기·풀기는 장치의 대기 작업을 먼저 끝낸다. Metal·OpenCL 소스 번역기는 자체 텍스처 선언(`compiler/metal/compat`)을 쓰고 텍스처 커널은 뺀다.
 
 ## 6. 상태와 스레드
 
