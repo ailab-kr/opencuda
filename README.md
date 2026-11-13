@@ -26,7 +26,7 @@ An open reference, an open conformance suite, and a thin contract that any chip 
 | **Real application** | llama.cpp (about 150 CUDA source files) builds **unmodified**. Its operator test passes **15,894 / 15,894** on the CPU path and on the GPU path. |
 | **Libraries** | BLAS-compatible library **1,395 / 1,395**; CUB subset **5,500** independent checks; fp32 GEMM **14.0 TFLOP/s** with portable C++ kernels |
 | **Chips** | CPU (x86-64, ARM64) · NVIDIA GPU · Apple GPU (Metal) · OpenCL · NPU simulator |
-| **Operating systems** | Linux 231 / 231 · Windows 151 / 151 (cross-built, Wine) · macOS 124 / 124 (M3, M1 Pro) · Windows 10 laptop 37 / 38 (1 skipped) |
+| **Operating systems** | Linux 232 / 232 · Windows 152 / 152 (cross-built, Wine) · macOS 124 / 124 (M3, M1 Pro) · Windows 10 laptop 37 / 38 (1 skipped) |
 | **Status** | Pre-release (0.x). See the [FAQ](docs/FAQ.md) for what is not supported yet. |
 | **Clean room** | public documentation only; no vendor headers, SDK files, sources or binaries |
 
@@ -208,7 +208,10 @@ divergence against the oracle instead
 | Check | Result |
 |---|---|
 | Rodinia (18 CUDA programs, unmodified) | 17 build. 14 match an independent reference (OpenMP version, serial reference, or the program's own check). 15 match with the opt-in PTX shift semantics. |
-| Linux · Windows under Wine | 231 / 231 · 151 / 151 |
+| PolyBench-ACC (21 programs, unmodified) | 21 build and run; 20 pass the program's own CPU-vs-GPU check (the other has a race the CPU path exposes: [details](cards/apps/app-corpus.md)) |
+| Parboil (11 programs, unmodified) | 8 build (3 need the texture API); 5 checked, all match the suite's CPU version exactly |
+| llm.c GPT-2 training (fp32, unmodified) | builds and trains; losses match the reference C trainer to 6 digits once a race in the loss read is ordered |
+| Linux · Windows under Wine | 232 / 232 · 152 / 152 |
 | Windows 10 laptop · macOS M3 and M1 Pro | 37 / 38 (1 skipped) · 124 / 124 on each |
 
 ---
