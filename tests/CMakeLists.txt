@@ -219,6 +219,52 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   add_test(NAME runtime_misc COMMAND rt_misc)
   ocu_add_cpu_cu_executable(rt_apps_gaps runtime/rt_apps_gaps.cu)
   add_test(NAME runtime_apps_gaps COMMAND rt_apps_gaps)
+  # Full tests for the app-corpus additions (card runtime-cudart, "small
+  # additions"; card apps-app-corpus): constants, 3D memory / limits /
+  # profiler, device-side hints / scoped atomics / tile meta groups, and
+  # __align__ after a struct body.
+  foreach(t rt_apps_consts rt_apps_mem3d rt_apps_dev rt_apps_align)
+    ocu_add_cpu_cu_executable(${t} runtime/${t}.cu)
+    add_test(NAME runtime_${t} COMMAND ${t})
+  endforeach()
+  add_test(NAME runtime_rt_apps_dev_random COMMAND rt_apps_dev)
+  set_tests_properties(runtime_rt_apps_dev_random PROPERTIES
+    ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_THREADS=3;OCU_CPU_SEED=5")
+  add_test(NAME runtime_rt_apps_dev_w64 COMMAND rt_apps_dev)
+  set_tests_properties(runtime_rt_apps_dev_w64 PROPERTIES ENVIRONMENT "OCU_CPU_WARP=64")
+  add_test(NAME runtime_rt_apps_mem3d_random COMMAND rt_apps_mem3d)
+  set_tests_properties(runtime_rt_apps_mem3d_random PROPERTIES
+    ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_THREADS=3;OCU_CPU_SEED=6")
+  # Compile-time cases: removed non-sync warp functions (the message names the
+  # _sync replacement), alignment after a struct body, system-scope atomics.
+  # Each entry: case|expect|regex the diagnostic must contain ("-" = none).
+  set(OCU_APPS_COMPILE_CASES
+    "0|ok|-" "1|fail|__shfl_sync" "2|fail|__shfl_up_sync" "3|fail|__shfl_down_sync"
+    "4|fail|__shfl_xor_sync" "5|fail|__ballot_sync" "6|fail|__any_sync" "7|fail|__all_sync"
+    "8|fail|__shfl_sync" "9|fail|__shfl_sync" "10|fail|__shfl_sync" "11|ok|-"
+    "30|ok|-" "31|ok|-" "32|ok|-" "33|ok|-" "34|ok|-" "35|ok|-" "36|ok|-" "37|ok|-" "38|fail|-")
+  foreach(c ${OCU_APPS_COMPILE_CASES} "20|ok|-")
+    string(REPLACE "|" ";" c "${c}")
+    list(GET c 0 cn)
+    list(GET c 1 cx)
+    list(GET c 2 cm)
+    if(cm STREQUAL "-")
+      set(cm "")
+    endif()
+    add_test(NAME runtime_apps_compile_case${cn}_cpu
+      COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DCC=${OCU_CC} -DCXX=${CMAKE_CXX_COMPILER}
+              -DCC_COMPILER=${CMAKE_C_COMPILER}
+              -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/runtime/apps_compile_cases.cu
+              -DOUT=${CMAKE_CURRENT_BINARY_DIR}/apps_case${cn}_cpu.o -DTARGET=cpu -DCASE=${cn} -DEXPECT=${cx}
+              "-DMATCH=${cm}"
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/runtime/compile_case.cmake)
+  endforeach()
+  # Known defect (expected failure; remove this line when fixed): on the CPU
+  # path the translator drops the alignment in
+  #   case 32:  typedef struct { float x, y; } __align__(8) S;     (alignof(S) is 4, want 8)
+  #   case 34:  struct S { int a; int b; } __align__(8) g_s;       (alignof(S) is 4, want 8)
+  # The NVIDIA path compiles both with the right alignment.
+  set_tests_properties(runtime_apps_compile_case32_cpu runtime_apps_compile_case34_cpu PROPERTIES WILL_FAIL TRUE)
   ocu_add_cpu_cu_executable(rt_fp16 runtime/rt_fp16.cu)
   add_test(NAME runtime_fp16 COMMAND rt_fp16)
   ocu_add_cpu_cu_executable(rt_bf16 runtime/rt_bf16.cu)
@@ -552,6 +598,24 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
                 -DOUT=${CMAKE_CURRENT_BINARY_DIR}/cg_case${cn}_nvidia.o -DTARGET=nvidia -DCASE=${cn} -DEXPECT=${cx}
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/runtime/compile_case.cmake)
     endforeach()
+    # Compile cases of the app-corpus additions on the NVIDIA path; case 20
+    # (a system-scope atomic) is only enforceable here.
+    foreach(c ${OCU_APPS_COMPILE_CASES} "20|fail|system")
+      string(REPLACE "|" ";" c "${c}")
+      list(GET c 0 cn)
+      list(GET c 1 cx)
+      list(GET c 2 cm)
+      if(cm STREQUAL "-")
+        set(cm "")
+      endif()
+      add_test(NAME runtime_apps_compile_case${cn}_nvidia
+        COMMAND ${CMAKE_COMMAND} -DPY=${Python3_EXECUTABLE} -DCC=${OCU_CC} -DCXX=${CMAKE_CXX_COMPILER}
+                -DCC_COMPILER=${CMAKE_C_COMPILER}
+                -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/runtime/apps_compile_cases.cu
+                -DOUT=${CMAKE_CURRENT_BINARY_DIR}/apps_case${cn}_nvidia.o -DTARGET=nvidia -DCASE=${cn} -DEXPECT=${cx}
+                "-DMATCH=${cm}"
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/runtime/compile_case.cmake)
+    endforeach()
     foreach(c "2|warn|ptx_shift_cases.cu" "3|warn|outside_shift.h"
               "4|warn|ptx_shift_cases.cu" "9|warn|ptx_shift_cases.cu" "1|quiet|-" "8|quiet|-" "5|quiet|-" "0|quiet|-" "6|error|-")
       string(REPLACE "|" ";" c "${c}")
@@ -627,6 +691,13 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
     ocu_add_nvidia_cu_executable(rt_gaps_intrin_nv runtime/rt_gaps_intrin.cu)
     add_test(NAME gpu_rt_gaps_intrin COMMAND run_if_nvidia $<TARGET_FILE:rt_gaps_intrin_nv>)
     set_tests_properties(gpu_rt_gaps_intrin PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+    # The app-corpus additions again on the GPU (system-scope atomics are not
+    # provided on this path, so rt_apps_dev leaves them out).
+    foreach(t rt_apps_consts rt_apps_mem3d rt_apps_dev rt_apps_align)
+      ocu_add_nvidia_cu_executable(${t}_nv runtime/${t}.cu)
+      add_test(NAME gpu_${t} COMMAND run_if_nvidia $<TARGET_FILE:${t}_nv>)
+      set_tests_properties(gpu_${t} PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+    endforeach()
     ocu_add_nvidia_cu_executable(rt_gaps_api_nv runtime/rt_gaps_api.cu)
     foreach(v "default||5 0" "cc80|OCU_COMPUTE_CAPABILITY=8.0|8 0"
               "cc_bad_x|OCU_COMPUTE_CAPABILITY=x|5 0" "cc_bad_50|OCU_COMPUTE_CAPABILITY=50|5 0")
