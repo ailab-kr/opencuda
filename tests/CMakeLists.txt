@@ -222,6 +222,16 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   # Implementer's smoke test for textures (card runtime-texture).
   ocu_add_cpu_cu_executable(rt_texture_smoke runtime/rt_texture_smoke.cu)
   add_test(NAME runtime_texture_smoke COMMAND rt_texture_smoke)
+  # Independent texture tests (card runtime-texture, "시험 목록"): arrays,
+  # copies, object creation, filter weights, address modes, read modes,
+  # tex1Dfetch, layered textures, texture references. Also in random order.
+  ocu_add_cpu_cu_executable(rt_texture_full runtime/rt_texture_full.cu)
+  add_test(NAME runtime_texture_full COMMAND rt_texture_full)
+  add_test(NAME runtime_texture_full_random COMMAND rt_texture_full)
+  set_tests_properties(runtime_texture_full_random PROPERTIES
+    ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_THREADS=3;OCU_CPU_SEED=11")
+  add_test(NAME runtime_texture_full_w64 COMMAND rt_texture_full)
+  set_tests_properties(runtime_texture_full_w64 PROPERTIES ENVIRONMENT "OCU_CPU_WARP=64")
   # Full tests for the app-corpus additions (card runtime-cudart, "small
   # additions"; card apps-app-corpus): constants, 3D memory / limits /
   # profiler, device-side hints / scoped atomics / tile meta groups, and
@@ -699,6 +709,9 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
     ocu_add_nvidia_cu_executable(rt_texture_smoke_nv runtime/rt_texture_smoke.cu)
     add_test(NAME gpu_texture_smoke COMMAND run_if_nvidia $<TARGET_FILE:rt_texture_smoke_nv>)
     set_tests_properties(gpu_texture_smoke PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+    ocu_add_nvidia_cu_executable(rt_texture_full_nv runtime/rt_texture_full.cu)
+    add_test(NAME gpu_texture_full COMMAND run_if_nvidia $<TARGET_FILE:rt_texture_full_nv>)
+    set_tests_properties(gpu_texture_full PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
     ocu_add_nvidia_cu_executable(rt_gaps_api_nv runtime/rt_gaps_api.cu)
     foreach(v "default||5 0" "cc80|OCU_COMPUTE_CAPABILITY=8.0|8 0"
               "cc_bad_x|OCU_COMPUTE_CAPABILITY=x|5 0" "cc_bad_50|OCU_COMPUTE_CAPABILITY=50|5 0")
