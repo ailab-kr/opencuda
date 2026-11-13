@@ -128,7 +128,7 @@ static void test_3d()
     CHECK(back == src);
     cudaMemcpy3DParms arr = up;
     arr.dstArray = reinterpret_cast<cudaArray_t>(0x10);
-    CHECK(cudaMemcpy3D(&arr) == cudaErrorNotSupported);
+    CHECK(cudaMemcpy3D(&arr) == cudaErrorInvalidValue); /* not a live array */
     cudaFree(p.ptr);
 }
 

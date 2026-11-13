@@ -509,6 +509,11 @@ inline unsigned __umul24(unsigned a, unsigned b) { return a * b; }
 #include "ocu_cuda_lang_scoped.h"
 #undef OCU_LANG_FN
 
+/* Texture fetches (objects and references), sampled in software. */
+#define OCU_TEX_FN inline
+#define OCU_TEX_MFN inline
+#include "ocu_texture_fetch.h"
+
 /*
  * __trap: the kernel hit something it must never do (for example a
  * NO_DEVICE_CODE body for an architecture that was not compiled). On a GPU

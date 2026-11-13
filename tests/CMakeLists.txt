@@ -219,6 +219,9 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   add_test(NAME runtime_misc COMMAND rt_misc)
   ocu_add_cpu_cu_executable(rt_apps_gaps runtime/rt_apps_gaps.cu)
   add_test(NAME runtime_apps_gaps COMMAND rt_apps_gaps)
+  # Implementer's smoke test for textures (card runtime-texture).
+  ocu_add_cpu_cu_executable(rt_texture_smoke runtime/rt_texture_smoke.cu)
+  add_test(NAME runtime_texture_smoke COMMAND rt_texture_smoke)
   # Full tests for the app-corpus additions (card runtime-cudart, "small
   # additions"; card apps-app-corpus): constants, 3D memory / limits /
   # profiler, device-side hints / scoped atomics / tile meta groups, and
@@ -692,6 +695,10 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
       add_test(NAME gpu_${t} COMMAND run_if_nvidia $<TARGET_FILE:${t}_nv>)
       set_tests_properties(gpu_${t} PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
     endforeach()
+    # Texture objects on the GPU (software sampling; no texture references).
+    ocu_add_nvidia_cu_executable(rt_texture_smoke_nv runtime/rt_texture_smoke.cu)
+    add_test(NAME gpu_texture_smoke COMMAND run_if_nvidia $<TARGET_FILE:rt_texture_smoke_nv>)
+    set_tests_properties(gpu_texture_smoke PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
     ocu_add_nvidia_cu_executable(rt_gaps_api_nv runtime/rt_gaps_api.cu)
     foreach(v "default||5 0" "cc80|OCU_COMPUTE_CAPABILITY=8.0|8 0"
               "cc_bad_x|OCU_COMPUTE_CAPABILITY=x|5 0" "cc_bad_50|OCU_COMPUTE_CAPABILITY=50|5 0")

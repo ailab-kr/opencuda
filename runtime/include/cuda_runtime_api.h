@@ -179,8 +179,8 @@ struct cudaPointerAttributes {
 };
 
 /* Three-dimensional allocations and copies. Positions and extents are in
-   bytes along x when no array is involved. Arrays (cudaArray_t) are not
-   implemented: a copy that names one returns cudaErrorNotSupported. */
+   bytes along x when no array is involved, in elements of the array when
+   one is (cudaMemcpy3D). CUDA arrays: see "textures and CUDA arrays". */
 typedef struct cudaArray *cudaArray_t;
 typedef const struct cudaArray *cudaArray_const_t;
 
@@ -241,6 +241,195 @@ static inline struct cudaExtent make_cudaExtent(size_t w, size_t h, size_t d)
     e.depth = d;
     return e;
 }
+
+/* The source translators for Metal and OpenCL (compiler/metal/cu2msl.py with
+   OCU_METAL_PATH, compiler/opencl/cu2ocl.py with OCU_OPENCL_PATH) bring their
+   own declarations of the texture reference API (compiler/metal/compat) and
+   do not translate texture fetches yet, so these are left out there. */
+#if defined(OCU_METAL_PATH) || defined(OCU_OPENCL_PATH)
+#define OCU_NO_TEXTURE_DECLS 1
+#endif
+#if !defined(OCU_NO_TEXTURE_DECLS)
+/* ---- textures and CUDA arrays: types ------------------------------------
+ * Names and values as in the public API reference (cudaChannelFormatDesc,
+ * cudaResourceDesc, cudaTextureDesc, cudaResourceViewDesc,
+ * textureReference) and the programming guide ("Texture and Surface
+ * Memory"). The layout of the structures is this project's own; the
+ * documented members are all there. Behaviour: runtime/cudart/texture.c and
+ * ocu_texture_fetch.h.
+ */
+enum cudaChannelFormatKind {
+    cudaChannelFormatKindSigned = 0,
+    cudaChannelFormatKindUnsigned = 1,
+    cudaChannelFormatKindFloat = 2,
+    cudaChannelFormatKindNone = 3,
+    cudaChannelFormatKindNV12 = 4,
+    cudaChannelFormatKindUnsignedNormalized8X1 = 5,
+    cudaChannelFormatKindUnsignedNormalized8X2 = 6,
+    cudaChannelFormatKindUnsignedNormalized8X4 = 7,
+    cudaChannelFormatKindUnsignedNormalized16X1 = 8,
+    cudaChannelFormatKindUnsignedNormalized16X2 = 9,
+    cudaChannelFormatKindUnsignedNormalized16X4 = 10,
+    cudaChannelFormatKindSignedNormalized8X1 = 11,
+    cudaChannelFormatKindSignedNormalized8X2 = 12,
+    cudaChannelFormatKindSignedNormalized8X4 = 13,
+    cudaChannelFormatKindSignedNormalized16X1 = 14,
+    cudaChannelFormatKindSignedNormalized16X2 = 15,
+    cudaChannelFormatKindSignedNormalized16X4 = 16
+};
+
+/* Bits of each component (x, y, z, w) and their kind. */
+struct cudaChannelFormatDesc {
+    int x, y, z, w;
+    enum cudaChannelFormatKind f;
+};
+
+typedef struct cudaMipmappedArray *cudaMipmappedArray_t;
+typedef const struct cudaMipmappedArray *cudaMipmappedArray_const_t;
+
+/* cudaMallocArray / cudaMalloc3DArray flags. */
+#define cudaArrayDefault          0x00u
+#define cudaArrayLayered          0x01u
+#define cudaArraySurfaceLoadStore 0x02u
+#define cudaArrayCubemap          0x04u
+#define cudaArrayTextureGather    0x08u
+#define cudaArrayColorAttachment  0x20u
+#define cudaArraySparse           0x40u
+#define cudaArrayDeferredMapping  0x80u
+
+/* Texture reference types (the second template argument of texture<>). */
+#define cudaTextureType1D              0x01
+#define cudaTextureType2D              0x02
+#define cudaTextureType3D              0x03
+#define cudaTextureTypeCubemap         0x0C
+#define cudaTextureType1DLayered       0xF1
+#define cudaTextureType2DLayered       0xF2
+#define cudaTextureTypeCubemapLayered  0xFC
+
+enum cudaResourceType {
+    cudaResourceTypeArray = 0x00,
+    cudaResourceTypeMipmappedArray = 0x01,
+    cudaResourceTypeLinear = 0x02,
+    cudaResourceTypePitch2D = 0x03
+};
+
+enum cudaResourceViewFormat {
+    cudaResViewFormatNone = 0x00,
+    cudaResViewFormatUnsignedChar1 = 0x01,
+    cudaResViewFormatUnsignedChar2 = 0x02,
+    cudaResViewFormatUnsignedChar4 = 0x03,
+    cudaResViewFormatSignedChar1 = 0x04,
+    cudaResViewFormatSignedChar2 = 0x05,
+    cudaResViewFormatSignedChar4 = 0x06,
+    cudaResViewFormatUnsignedShort1 = 0x07,
+    cudaResViewFormatUnsignedShort2 = 0x08,
+    cudaResViewFormatUnsignedShort4 = 0x09,
+    cudaResViewFormatSignedShort1 = 0x0a,
+    cudaResViewFormatSignedShort2 = 0x0b,
+    cudaResViewFormatSignedShort4 = 0x0c,
+    cudaResViewFormatUnsignedInt1 = 0x0d,
+    cudaResViewFormatUnsignedInt2 = 0x0e,
+    cudaResViewFormatUnsignedInt4 = 0x0f,
+    cudaResViewFormatSignedInt1 = 0x10,
+    cudaResViewFormatSignedInt2 = 0x11,
+    cudaResViewFormatSignedInt4 = 0x12,
+    cudaResViewFormatHalf1 = 0x13,
+    cudaResViewFormatHalf2 = 0x14,
+    cudaResViewFormatHalf4 = 0x15,
+    cudaResViewFormatFloat1 = 0x16,
+    cudaResViewFormatFloat2 = 0x17,
+    cudaResViewFormatFloat4 = 0x18
+};
+
+enum cudaTextureAddressMode {
+    cudaAddressModeWrap = 0,
+    cudaAddressModeClamp = 1,
+    cudaAddressModeMirror = 2,
+    cudaAddressModeBorder = 3
+};
+
+enum cudaTextureFilterMode {
+    cudaFilterModePoint = 0,
+    cudaFilterModeLinear = 1
+};
+
+enum cudaTextureReadMode {
+    cudaReadModeElementType = 0,
+    cudaReadModeNormalizedFloat = 1
+};
+
+struct cudaResourceDesc {
+    enum cudaResourceType resType;
+    union {
+        struct { cudaArray_t array; } array;
+        struct { cudaMipmappedArray_t mipmap; } mipmap;
+        struct {
+            void *devPtr;
+            struct cudaChannelFormatDesc desc;
+            size_t sizeInBytes;
+        } linear;
+        struct {
+            void *devPtr;
+            struct cudaChannelFormatDesc desc;
+            size_t width;
+            size_t height;
+            size_t pitchInBytes;
+        } pitch2D;
+    } res;
+};
+
+struct cudaResourceViewDesc {
+    enum cudaResourceViewFormat format;
+    size_t width;
+    size_t height;
+    size_t depth;
+    unsigned int firstMipmapLevel;
+    unsigned int lastMipmapLevel;
+    unsigned int firstLayer;
+    unsigned int lastLayer;
+};
+
+struct cudaTextureDesc {
+    enum cudaTextureAddressMode addressMode[3];
+    enum cudaTextureFilterMode filterMode;
+    enum cudaTextureReadMode readMode;
+    int sRGB;
+    float borderColor[4];
+    int normalizedCoords;
+    unsigned int maxAnisotropy;
+    enum cudaTextureFilterMode mipmapFilterMode;
+    float mipmapLevelBias;
+    float minMipmapLevelClamp;
+    float maxMipmapLevelClamp;
+    int disableTrilinearOptimization;
+    int seamlessCubemap;
+};
+
+/* A texture object: an opaque value (here the device address of the
+   object's descriptor). 0 is never a valid object. */
+typedef unsigned long long cudaTextureObject_t;
+
+#include "ocu_texture_desc.h"
+
+/* The legacy texture reference (removed from the vendor runtime in 12.0,
+   still used by older programs): the documented mutable members, then what
+   it is bound to (this project's own; set by the cudaBindTexture* calls). */
+struct textureReference {
+    int normalized;
+    enum cudaTextureFilterMode filterMode;
+    enum cudaTextureAddressMode addressMode[3];
+    struct cudaChannelFormatDesc channelDesc;
+    int sRGB;
+    unsigned int maxAnisotropy;
+    enum cudaTextureFilterMode mipmapFilterMode;
+    float mipmapLevelBias;
+    float minMipmapLevelClamp;
+    float maxMipmapLevelClamp;
+    int disableTrilinearOptimization;
+    struct ocu_tex_desc ocu_bound;
+};
+
+#endif /* !OCU_NO_TEXTURE_DECLS */
 
 /* Device limits (cudaDeviceGetLimit / cudaDeviceSetLimit). */
 enum cudaLimit {
@@ -572,6 +761,83 @@ cudaError_t cudaMemcpyFromSymbolAsync(void *dst, const void *symbol, size_t coun
                                       size_t offset, enum cudaMemcpyKind kind,
                                       cudaStream_t stream);
 
+#if !defined(OCU_NO_TEXTURE_DECLS)
+/* ---- textures and CUDA arrays: functions ---------------------------------
+ * CUDA arrays live in device memory, rows packed without padding (row bytes
+ * = width x element size), layers and slices one after the other.
+ * Texture fetches are done by device code (ocu_texture_fetch.h), the same on
+ * every backend that runs kernels. Not supported: mipmapped arrays, sRGB,
+ * cubemap fetches, surfaces, sparse and deferred-mapping arrays.
+ */
+struct cudaChannelFormatDesc cudaCreateChannelDesc(int x, int y, int z, int w,
+                                                   enum cudaChannelFormatKind f);
+cudaError_t cudaMallocArray(cudaArray_t *array, const struct cudaChannelFormatDesc *desc,
+                            size_t width, size_t height, unsigned int flags);
+cudaError_t cudaMalloc3DArray(cudaArray_t *array, const struct cudaChannelFormatDesc *desc,
+                              struct cudaExtent extent, unsigned int flags);
+cudaError_t cudaFreeArray(cudaArray_t array);
+cudaError_t cudaArrayGetInfo(struct cudaChannelFormatDesc *desc, struct cudaExtent *extent,
+                             unsigned int *flags, cudaArray_t array);
+cudaError_t cudaGetChannelDesc(struct cudaChannelFormatDesc *desc, cudaArray_const_t array);
+cudaError_t cudaMemcpyToArray(cudaArray_t dst, size_t wOffset, size_t hOffset, const void *src,
+                              size_t count, enum cudaMemcpyKind kind);
+cudaError_t cudaMemcpyFromArray(void *dst, cudaArray_const_t src, size_t wOffset, size_t hOffset,
+                                size_t count, enum cudaMemcpyKind kind);
+cudaError_t cudaMemcpyToArrayAsync(cudaArray_t dst, size_t wOffset, size_t hOffset,
+                                   const void *src, size_t count, enum cudaMemcpyKind kind,
+                                   cudaStream_t stream);
+cudaError_t cudaMemcpyFromArrayAsync(void *dst, cudaArray_const_t src, size_t wOffset,
+                                     size_t hOffset, size_t count, enum cudaMemcpyKind kind,
+                                     cudaStream_t stream);
+cudaError_t cudaMemcpyArrayToArray(cudaArray_t dst, size_t wOffsetDst, size_t hOffsetDst,
+                                   cudaArray_const_t src, size_t wOffsetSrc, size_t hOffsetSrc,
+                                   size_t count, enum cudaMemcpyKind kind);
+cudaError_t cudaMemcpy2DToArray(cudaArray_t dst, size_t wOffset, size_t hOffset, const void *src,
+                                size_t spitch, size_t width, size_t height,
+                                enum cudaMemcpyKind kind);
+cudaError_t cudaMemcpy2DFromArray(void *dst, size_t dpitch, cudaArray_const_t src, size_t wOffset,
+                                  size_t hOffset, size_t width, size_t height,
+                                  enum cudaMemcpyKind kind);
+cudaError_t cudaMemcpy2DToArrayAsync(cudaArray_t dst, size_t wOffset, size_t hOffset,
+                                     const void *src, size_t spitch, size_t width, size_t height,
+                                     enum cudaMemcpyKind kind, cudaStream_t stream);
+cudaError_t cudaMemcpy2DFromArrayAsync(void *dst, size_t dpitch, cudaArray_const_t src,
+                                       size_t wOffset, size_t hOffset, size_t width,
+                                       size_t height, enum cudaMemcpyKind kind,
+                                       cudaStream_t stream);
+cudaError_t cudaMemcpy2DArrayToArray(cudaArray_t dst, size_t wOffsetDst, size_t hOffsetDst,
+                                     cudaArray_const_t src, size_t wOffsetSrc, size_t hOffsetSrc,
+                                     size_t width, size_t height, enum cudaMemcpyKind kind);
+
+cudaError_t cudaCreateTextureObject(cudaTextureObject_t *pTexObject,
+                                    const struct cudaResourceDesc *pResDesc,
+                                    const struct cudaTextureDesc *pTexDesc,
+                                    const struct cudaResourceViewDesc *pResViewDesc);
+cudaError_t cudaDestroyTextureObject(cudaTextureObject_t texObject);
+cudaError_t cudaGetTextureObjectResourceDesc(struct cudaResourceDesc *pResDesc,
+                                             cudaTextureObject_t texObject);
+cudaError_t cudaGetTextureObjectTextureDesc(struct cudaTextureDesc *pTexDesc,
+                                            cudaTextureObject_t texObject);
+cudaError_t cudaGetTextureObjectResourceViewDesc(struct cudaResourceViewDesc *pResViewDesc,
+                                                 cudaTextureObject_t texObject);
+
+/* The legacy texture reference API (see struct textureReference). Binding
+   waits for the device's queued work first, so kernels launched before a
+   rebind keep reading what they were launched with. */
+cudaError_t cudaBindTexture(size_t *offset, const struct textureReference *texref,
+                            const void *devPtr, const struct cudaChannelFormatDesc *desc,
+                            size_t size);
+cudaError_t cudaBindTexture2D(size_t *offset, const struct textureReference *texref,
+                              const void *devPtr, const struct cudaChannelFormatDesc *desc,
+                              size_t width, size_t height, size_t pitch);
+cudaError_t cudaBindTextureToArray(const struct textureReference *texref, cudaArray_const_t array,
+                                   const struct cudaChannelFormatDesc *desc);
+cudaError_t cudaUnbindTexture(const struct textureReference *texref);
+cudaError_t cudaGetTextureAlignmentOffset(size_t *offset, const struct textureReference *texref);
+cudaError_t cudaGetTextureReference(const struct textureReference **texref, const void *symbol);
+
+#endif /* !OCU_NO_TEXTURE_DECLS */
+
 /* ---- streams ----------------------------------------------------------- */
 
 cudaError_t cudaStreamCreate(cudaStream_t *stream);
@@ -765,6 +1031,11 @@ static inline cudaError_t cudaLaunchCooperativeKernel(void (*func)(P...), dim3 g
     return cudaLaunchCooperativeKernel(reinterpret_cast<const void *>(func), grid, block, args,
                                        shared_mem, stream);
 }
+#endif
+
+/* Texture references, channel descriptors and the C++ texture overloads. */
+#if !defined(OCU_NO_TEXTURE_DECLS)
+#include "ocu_texture_types.h"
 #endif
 #endif /* __cplusplus */
 
