@@ -442,6 +442,10 @@ _SHARED_ALIGNED = re.compile(r"\b__ocu_shared__((?:\s*" + _ALIGNAS + r")+)")
 # specifier after cv-qualifiers and storage classes, C++ only before them.
 _LATE_ALIGNAS = re.compile(
     r"\b((?:(?:const|volatile|static|thread_local|constexpr|register)\s+)+)(" + _ALIGNAS + r")")
+# `struct S { ... } __align__(8);` (alignment after the closing brace, which
+# the CUDA compiler takes): after preprocessing it reads `} alignas(8);`, which
+# C++ rejects, so it becomes the equivalent attribute.
+_TRAILING_ALIGNAS = re.compile(r"\}\s*alignas\s*\(((?:[^()]|\([^()]*\))*)\)\s*;")
 
 
 def rewrite(src: str, preprocessed: bool = False) -> tuple[str, dict]:
@@ -455,6 +459,7 @@ def rewrite(src: str, preprocessed: bool = False) -> tuple[str, dict]:
             lambda m: " ".join(m.group(1).split()) + " static thread_local", src)
         src = _SHARED_MARK.sub("static thread_local", src)
         src = _LATE_ALIGNAS.sub(lambda m: m.group(2) + " " + m.group(1), src)
+        src = _TRAILING_ALIGNAS.sub(lambda m: "} __attribute__((aligned(" + m.group(1) + ")));", src)
     return src, {"launches": launches, "extern_shared": shared}
 
 
