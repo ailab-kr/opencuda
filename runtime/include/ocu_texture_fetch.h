@@ -610,15 +610,23 @@ OCU_TEX_FN OCU_TEX_REF_RESULT tex2DLayered(const texture<T, t, m> &r, float x, f
 #else
 /* NVIDIA path: device code cannot read a host variable, and the vendor
    runtime removed texture references in 12.0. A fetch through one stops
-   the build with this message. */
+   the device compilation with this message. The host pass (which also reads
+   device code, for example the CPU path's --ptx-shift syntax pass) only
+   sees a declaration that is never emitted. */
 template <class T> struct ocu_tex_ref_unsupported { static const bool value = false; };
+#if defined(__CUDA_ARCH__)
+#define OCU_TEX_REF_CHECK(T)                                                                  \
+    static_assert(ocu_tex_ref_unsupported<T>::value,                                          \
+                  "texture references are not supported on this path (removed in CUDA "       \
+                  "12): use texture objects");
+#else
+#define OCU_TEX_REF_CHECK(T)
+#endif
 #define OCU_TEX_REF_UNSUPPORTED(name, ...)                                                    \
     template <class T, int t, enum cudaTextureReadMode m>                                     \
     OCU_TEX_FN T name(const texture<T, t, m> &, __VA_ARGS__)                                  \
     {                                                                                         \
-        static_assert(ocu_tex_ref_unsupported<T>::value,                                      \
-                      "texture references are not supported on this path (removed in CUDA "   \
-                      "12): use texture objects");                                            \
+        OCU_TEX_REF_CHECK(T)                                                                  \
         return ocu_tex::zero_value<T>();                                                      \
     }
 OCU_TEX_REF_UNSUPPORTED(tex1Dfetch, int)
@@ -626,6 +634,7 @@ OCU_TEX_REF_UNSUPPORTED(tex1D, float)
 OCU_TEX_REF_UNSUPPORTED(tex2D, float, float)
 OCU_TEX_REF_UNSUPPORTED(tex3D, float, float, float)
 #undef OCU_TEX_REF_UNSUPPORTED
+#undef OCU_TEX_REF_CHECK
 #endif
 
 #endif /* OCU_TEXTURE_FETCH_H */
