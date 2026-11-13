@@ -50,7 +50,7 @@ compiler/         runtime/         libs/
 | `runtime/include/` | 사용자 프로그램이 보는 헤더: `cuda_runtime_api.h`·`cuda_runtime.h`·`cuda.h`·`cuda_fp16.h`, 벡터 형, CPU 경로 언어 지원 `ocu_cuda_lang_cpu.h`, 헤더만으로 된 병렬 기본 연산 부분집합 `cub/cub.cuh`(프로그램과 함께 대상마다 컴파일, `cards/libs/cub-subset.md`) | 함수 80여 개 |
 | `runtime/cudart/` | 실행 API 구현(`ocu_cudart`): 장치·오류·메모리·스트림·사건·실행. 백엔드 규격만 부른다 | 있음 |
 | `libs/` | 라이브러리별 호환 층 | `libs/cublas`: `cublas_v2.h` 부분집합(핸들·스트림·GEMM 계열·1·2단계 일부·strsm 배치), CUDA C 소스 하나로 CPU·NVIDIA 모두 통과. `libs/blas`: 20개 함수(내부 이름), CPU에서 기준 사례 526건 통과 |
-| `compiler/` | 명령 호환, 빌드 도구 연동, 장치용 수학 함수 | 실험 단계 드라이버 `compiler/probe/ocu_cc.py`(CPU 경로는 실제 프로그램 빌드에 씀), CMake 함수 `ocu_add_cpu_cu_executable`, nvcc 명령 호환 드라이버 `compiler/driver/ocu-nvcc`와 툴킷 폴더(CMake 도구 사슬 파일 `OcuCUDA.cmake`, `docs/compiler-driver.md`) |
+| `compiler/` | 명령 호환, 빌드 도구 연동, 장치용 수학 함수 | 실험 단계 드라이버 `compiler/probe/ocu_cc.py`(CPU 경로는 실제 프로그램 빌드에 씀), CMake 함수 `ocu_add_cpu_cu_executable`, nvcc 명령 호환 드라이버 `compiler/driver/ocu-nvcc`와 툴킷 폴더(CMake 도구 사슬 파일 `OcuCUDA.cmake`, `docs/compiler-driver.md`), CPU 경로의 블록 통째 변환 `compiler/cpu_loops`(LLVM 패스 플러그인, 7장) |
 | `conformance/` | 적합성 시험, 채점기, 결과 형식 | BLAS 20개 함수의 기준 답 526건, 오차 한계, 자체 검증 |
 | `tuning/` | 속도 측정, 자동 튜닝, 칩별 설정 표 | 측정 규칙(중앙값과 느린 10%)을 지키는 측정기 `ocu_bench`와 BLAS 측정 `bench_blas` |
 | `cards/` | 기능 카드 | 양식, 부품 카드 2장, BLAS 카드 20장 |
@@ -164,6 +164,7 @@ CPU 백엔드에서는 "장치 코드 묶음"이 CPU용으로 컴파일된 함�
 1. **전처리**: `.cu`를 C++17로 전처리한다. nvcc처럼 `cuda_runtime.h`를 먼저 넣고 `__CUDACC__`를 정의한다. 그래서 포함한 파일과 매크로 안의 실행 구문도 한 덩어리로 보인다.
 2. **변환**(`cpu_rewrite.py`): `K<<<cfg>>>(args)`를 `::ocu_cpu::launch(cfg, 람다, args)`로, 함수 안의 `extern __shared__ T a[]`를 블록별 공유 메모리를 가리키는 포인터로 바꾼다. 나머지는 바이트 그대로 두고 줄 수를 지킨다(오류 위치가 원래 파일을 가리킴).
 3. **컴파일과 실행**: 결과를 C++로 컴파일하고 `ocu_cudart`와 링크한다. `launch`는 인자를 복사해 `ocu_rt_launch`로 넘기고, 실행 API는 스트림 순서 규칙을 적용해 백엔드의 `kernel_launch`를 부른다. 커널 안의 `threadIdx` 등은 백엔드가 GPU 스레드를 바꿀 때마다 채우는 스레드 지역 변수다.
+4. **블록 통째 진입점**(패스가 빌드된 곳): 1·3단계를 `compiler/cpu_loops` 패스를 빌드한 그 Clang으로 하고 `-fpass-plugin`을 준다. 동기화 지점이 없는 커널의 실행 자리마다 블록의 스레드를 도는 반복문을 더하고 모듈 이미지를 판 2로 표시한다(7장 "블록 통째 반복문"). 컴파일 때 `OCU_CPU_LOOPS=off`면 빼고 만든다.
 
 자리 옮김: 기본은 표준 C++이다(너비 이상으로 옮기면 정의되지 않음). 선택 옵션 `--ptx-shift`(CMake `PTX_SHIFT`)를 주면 장치 함수의 자리 옮김을 Clang 구문 트리로 찾아 PTX `shl`/`shr`의 정의(양을 너비로 줄임)를 따르는 도우미 호출로 바꾼다. CPU 경로와 엔비디아 경로 모두 해당한다(`compiler/probe/ptx_shift.py`, 카드 `compiler-ptx-shift`).
 
@@ -200,6 +201,10 @@ GPU 코드를 CPU에서 그대로 실행한다. 속도가 아니라 정확성 �
 - **남겨 둔 것**: 묶음 스레드는 마지막으로 쓴 블록 모양의 스택을 계속 쥔다(1024 스레드 블록이면 스레드당 약 8MB).
 - **한계**: 블록 안의 진짜 동시 실행에서만 나는 경쟁 상태는 무작위 순서로도 다 잡지 못한다. 동기화 없이 다른 스레드를 기다리며 도는 코드는 끝나지 않는다.
 - **워프 연산**: 워프 단위 동기화와 값 모으기(`ocu_cpu_warp_gather`)가 있고, 셔플·투표는 그 위에 만든다. 한 워프의 일부는 워프 연산에서, 일부는 블록 동기화에서 서로를 기다리면 멈추지 않고 실행 실패로 알린다. 워프 연산마다 표식(연산·마스크·폭)과 순번을 붙여, 한 워프의 레인들이 서로 다른 호출이나 서로 다른 순번에서 만나면(부분 마스크 코드) 조용히 틀린 값을 내지 않고 실행 실패로 알린다. 마스크가 이름 붙인 레인만 기다리고 검사하므로, 서로 겹치지 않는 마스크(한쪽 절반 `0x0000ffff`, 다른 절반 `0xffff0000`)나 절반만 워프 동기화하고 나머지는 블록 동기화로 가는 코드처럼 CUDA에서 합법인 부분 마스크 코드가 그대로 돈다. 마스크에 이름이 있는 레인이 이미 끝난 경우(CUDA에서는 정의되지 않은 동작)는 블록 동기화처럼 기본은 허용하고, `OCU_CPU_STRICT=1`이면 실패로 알린다. `*_masked` 함수의 마스크 0은 워프 전체를 뜻하며 `0xffffffff`와 똑같이 검사한다. 마스크 없는 형태(`ocu_cpu_warp_sync`, `ocu_cpu_warp_gather`)는 아직 도는 레인만 기다리고, 끝난 레인은 어느 모드에서나 허용한다. 묶음 단위 크기 32와 64 모두 시험한다.
+- **블록 통째 반복문**(`docs/cpu-region-loops.md` 1단계): 동기화 지점이 없는 커널에는 파이버가 필요 없다. `compiler/cpu_loops` 패스(CPU 경로에서 Clang이 싣는 LLVM 패스 플러그인)가 프런트엔드 직후 실행 자리마다 호출 그래프를 본다: 블록 동기화·워프 연산 없음, 인라인 어셈블리 없음, 부동소수점 제어 상태를 바꾸는 호출 없음, C·C++ 런타임 라이브러리와 백엔드의 읽기 전용 장치 호출 말고는 외부 호출 없음. 통과한 자리에는 블록 통째 진입점을 더한다: 블록을 z, y, x 순으로 돌며 스레드마다 `threadIdx`(커널이 백엔드에 물으면 선형 번호도)를 써 넣고, 반복문 안에 인라인한 스레드 본문을 돌린다. 커널을 포인터로 부르는 자리(`cudaLaunchKernel`, 커널을 매개변수로 받는 실행 도우미)는 먼저 포인터를 계산해, 같은 형의 이 모듈 커널 중 검사를 통과한 것이 아니면 거절하고(실행은 파이버로) 맞으면 반복문을 돈다. 반복문 벡터화 직전, 더는 읽는 곳이 없는 스레드별 쓰기는 지운다. 이미지는 판 2(`ocu_cpu_kernel_entry2`: 파이버 진입점, 블록 통째 진입점 또는 NULL)가 되고, 모든 이미지가 파이버 진입점을 그대로 가진다.
+    - 백엔드는 블록 통째 진입점을 블록의 파이버 하나 위에서 부른다(파이버가 맨 먼저 쓸 스택: 같은 크기·카나리·검사 도구 알림). 고정 순서, 또는 파이버의 유일한 라운드가 쓸 블록별 섞기와 같은 순서(`OCU_CPU_ORDER=random`)로 돌므로 스레드들이 파이버에서와 같은 명령을 같은 차례로 실행한다. `OCU_CPU_FORM=fiber`면 끄고, `OCU_CPU_STATS`는 커널별 형태를 보여 준다. 엄격 모드는 영향이 없다(검사할 동기화가 없다).
+    - 패스에는 LLVM 18 이상의 개발 파일과 같은 판 `clang++`이 필요하다. Windows(MinGW)와 교차 빌드(ARM64 빌드)에서는 빌드하지 않으며 모든 커널이 파이버로 돈다. 판 2 이미지를 다루는 백엔드 코드는 모든 플랫폼에서 같다.
+    - 확인: `cpu_forms_*`(tests/cpu_forms/form_diff.cmake). CPU 경로 시험 프로그램 전부를 두 형태로, 고정·무작위 순서로 돌려 종료 코드·출력, 그리고 실행마다 전체 장치 메모리의 해시(`OCU_CPU_TRACE`)가 같아야 한다.
 - **부동소수점 제어 상태**: GPU 스레드는 모두 블록을 돌리는 OS 스레드의 반올림 방향·FTZ/DAZ·x87 정밀도로 시작한다(x86-64: MXCSR 제어 비트와 x87 제어어, ARM64: FPCR, 그 밖의 칩: C11 `<fenv.h>` 반올림 방향). 바꾼 스레드는 전환을 지나도 자기 값을 유지하고, 다음 스레드(같은 스택에서 시작하는 스레드 포함)에는 번지지 않는다. 비용: 그렇게 시작하는 스레드마다 레지스터 읽기 두 번, 약 0.3 ns.
 
 ## 8. 환경 변수
@@ -214,7 +219,11 @@ GPU 코드를 CPU에서 그대로 실행한다. 속도가 아니라 정확성 �
 | `OCU_CPU_STACK_KB` | 정수 | 파이버 스택 크기. 기본 128 | 동작 |
 | `OCU_CPU_STRICT` | `1` | 동기화 전에 끝난 스레드를 오류로 | 동작 |
 | `OCU_CPU_SPIN_US` | 정수 | 쉬는 묶음 스레드가 잠들기 전 새 실행을 지켜보는 시간(µs). 기본 50, 0이면 바로 잠듦 | 동작 |
-| `OCU_CPU_STATS` | `1` | 끝날 때 커널별 실행 수·블록·파이버 전환·기다림·시간과 복사 시간을 표준 오류로 | 동작 |
+| `OCU_CPU_STATS` | `1` | 끝날 때 커널별 실행 수·블록·파이버 전환·기다림·시간·형태(fiber, loop, mixed)와 복사 시간을 표준 오류로 | 동작 |
+| `OCU_CPU_FORM` | `fiber`, `loop`, `dispatch` | CPU 백엔드의 커널 형태: `fiber`는 모든 커널을 파이버로, `loop`(기본)은 컴파일러가 만든 곳에서 블록 통째 진입점을, `dispatch`는 영역 분배기가 생기기 전까지 `loop`와 같음 | 동작 |
+| `OCU_CPU_TRACE` | 파일 경로 | 실행마다 격자·블록·상태·형태와 전체 장치·고정 메모리의 해시를 덧붙임(새 할당은 정해진 바이트로 채움). 실행 비교용, 느림 | 동작 |
+| `OCU_CPU_LOOPS` | 플러그인 경로, `off` | 컴파일 때(`ocu_cc.py`, `ocu-nvcc`): 실을 블록 통째 변환 패스, 또는 없음. 기본은 이 트리에서 빌드한 것이나 `ocu_cc.py` 옆에 설치된 것 | 동작 |
+| `OCU_CPU_LOOPS_REPORT` | 파일 경로 | 컴파일 때: 패스가 실행 자리마다 한 줄(형태, 커널, 이유)을 덧붙임 | 동작 |
 | `OCU_CPU_GEMM` | `ref`, `generic` | CPU 백엔드 연산 표의 GEMM: `ref`는 행 단위 기준 구현, `generic`은 AVX2 없는 블록 루틴. 기본은 블록 루틴(프로세서에 있으면 AVX2·FMA·F16C) | 동작 |
 | `OCU_OPENCL_LIBRARY` | 파일 경로 | OpenCL 백엔드가 여는 라이브러리. 없으면 `libOpenCL.so.1` | 동작 |
 | `OCU_OPENCL_VERBOSE` | `1` | 빠진 장치의 이유, 빌드 실패 기록 | 동작 |
@@ -243,10 +252,12 @@ GPU 코드를 CPU에서 그대로 실행한다. 속도가 아니라 정확성 �
 | `ocu_cublas_cpu`, `ocu_cublas_nvidia` | 정적 라이브러리 | `cublas_v2.h` 구현, 대상별 변형(4장) |
 | `cublas_cpu*`, `gpu_cublas_*`, `conformance_cublas_cpu*`, `gpu_conformance_cublas` | 시험 | `cublas_v2.h`의 정확도(고정밀 기준)와 기준 사례, CPU와 NVIDIA GPU(장치가 없으면 건너뜀) |
 | `bench_cublas` | 측정 | NVIDIA GPU의 GEMM 처리량(중앙값·90% 구간) |
+| `ocu_cpu_loops` | LLVM 패스 플러그인 | CPU 경로의 블록 통째 변환(7장). LLVM 18 이상 개발 파일이 있으면 빌드 |
+| `cpu_forms_*` | 시험 | CPU 경로 시험 프로그램을 `OCU_CPU_FORM=fiber`와 `=loop`로: 결과·출력·장치 메모리가 같아야 함 |
 
 설치: `cmake --install <빌드 폴더> --prefix <위치>`가 라이브러리, 공개 헤더(한 폴더에 모아 `<cuda_runtime.h>`가 우리 것을 찾게 함), CPU 경로 드라이버, CMake 패키지를 놓는다. 다른 프로젝트는 `find_package(Ocu)` 뒤 `ocu::cudart`와 `ocu_add_cpu_cu_executable()`를 쓴다.
 
-빌드 옵션: `OCU_BACKEND_CPU`(기본 켬), `OCU_BACKEND_NPUSIM`(기본 켬, 등록 순서가 마지막이라 기본 선택이 되지 않음), `OCU_BACKEND_AMD`, `OCU_BACKEND_INTEL`(아직 없음, 켜면 오류), `OCU_BACKEND_OPENCL`(리눅스에서 기본 켬), `OCU_BUILD_TESTS`(기본 켬), `OCU_CPU_UCONTEXT`(기본 끔).
+빌드 옵션: `OCU_BACKEND_CPU`(기본 켬), `OCU_BACKEND_NPUSIM`(기본 켬, 등록 순서가 마지막이라 기본 선택이 되지 않음), `OCU_BACKEND_AMD`, `OCU_BACKEND_INTEL`(아직 없음, 켜면 오류), `OCU_BACKEND_OPENCL`(리눅스에서 기본 켬), `OCU_BUILD_TESTS`(기본 켬), `OCU_CPU_UCONTEXT`(기본 끔), `OCU_CPU_LOOPS`(기본 켬: LLVM 18 이상이 있으면 블록 통째 변환 패스를 빌드해 씀, `OCU_LLVM_DIR`로 다른 LLVM의 CMake 패키지를 가리킴).
 
 전체 검증은 `tools/check.sh` 하나로 한다. gcc·clang 빌드(경고는 실패), 주소·정의되지 않은 동작·스레드 검사, ARM64 교차 빌드와 에뮬레이터(qemu-user) 실행(도구가 있을 때), 채점기 시험, 컴파일러 실험, 클린룸 점검을 돈다.
 
@@ -274,7 +285,7 @@ GPU 코드를 CPU에서 그대로 실행한다. 속도가 아니라 정확성 �
 |---|---|
 | 프로젝트 이름과 코드 접두어 | 정함: OpenCuda, 식별자는 접두어 `ocu` 유지 |
 | 사용자에게 보이는 헤더의 작성 방식 | 정함: CUDA 호환 이름, 공개 문서만 보고 작성 |
-| CPU 백엔드의 실행 단위 | 정함: 파이버, 결정적 순서와 무작위 순서, 워프 폭 32·64 |
+| CPU 백엔드의 실행 단위 | 정함: 파이버, 결정적 순서와 무작위 순서, 워프 폭 32·64. 동기화 지점이 없는 커널은 같은 순서의 블록 통째 반복문으로도(7장) |
 | 문서와 주석의 언어 | 정함: 영어가 기본, 주요 문서는 한국어판(`*.ko.md`) |
 | 장치 코드 묶음의 형식과 등록 기록의 모양 | 남음: 더 많은 컴파일러·칩을 다룬 뒤 정한다 |
 | AMD 백엔드를 칩 회사 런타임의 어느 층 위에 올릴지 | 남음: 실제 장비에서 정한다 |

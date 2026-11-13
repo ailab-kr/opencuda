@@ -1,6 +1,6 @@
 # Design note: running CPU-path kernels as loops over threads
 
-Status: proposal; stage 0 (measurement) done, see "Stage 0 results" (2026-11-13). Component: CPU path (`compiler/probe`, `backends/cpu`).
+Status: stage 0 (measurement) and stage 1 (kernels without cuts) done, see "Stage 0 results" and "Stage 1 results" (2026-11-13); stages 2 to 4 proposed. Component: CPU path (`compiler/cpu_loops`, `compiler/probe`, `backends/cpu`).
 
 ## Problem
 
@@ -210,5 +210,114 @@ Recommendation: proceed with stages 1 and 2, with three changes to the plan.
 1. Compile converted modules with Clang (the pass is an LLVM plugin anyway): the gate is met with Clang and missed by 10 % with GCC.
 2. Add warp-level uniformity to stage 2: for a warp operation, a condition that is the same within each warp (`threadIdx.x / 32` with warp-aligned block shapes) is enough; the fast check compares the next pc per warp, and warps that skip the warp operation wait at the next block barrier. Without it `mul_mat_vec_f` (17 % of generation) stays on fibers and stage 2 gives 3.3 to 3.6 t/s instead of 5 to 6.
 3. Bring the launch-cost work (stage 4) forward or run it alongside: after stage 2 it is the largest fixed cost left.
+
+## Stage 1 results (2026-11-13)
+
+### What was built
+
+- **Pass** `compiler/cpu_loops/ocu_cpu_loops.cpp`, an LLVM 18 pass plugin (`libocu_cpu_loops.so`) that Clang loads with `-fpass-plugin` on the CPU path. `ocu_cc.py` (and through it `ocu-nvcc`) preprocesses and compiles `.cu` files with the Clang the plugin was built for when the plugin is there (build tree: `OCU_CPU_LOOPS_ENV`; toolkit: `lib/libocu_cpu_loops.so`; installed: next to `ocu_cc.py`; `OCU_CPU_LOOPS=off` turns it off). It runs at the start of the optimisation pipeline (not at `-O0`):
+  1. It finds every module image the language layer emits (version 1) and checks each entry's call graph: no `ocu_cpu_barrier` or `ocu_cpu_warp_*` call (a cut), no inline assembly, no call that changes the floating-point control state (`fesetround` and the like, `llvm.set.rounding`), no replaceable (weak) definition, no external call other than the C and C++ runtime libraries and the backend's read-only device calls (block index and size, dynamic shared memory, warp size). `ocu_cpu_thread_idx` and `ocu_cpu_lane_id` are allowed; the entry then keeps the backend's current-thread index up to date.
+  2. For an entry that passes, it adds `<entry>.ocu_block(args, info)`: loops z, y, x over the block; per thread it stores `threadIdx` into the per-thread variable and runs the body (entry, thunk, launch lambda and kernel inlined into the loop). In random order (`info->order` not NULL) it calls a separate function that visits the threads in the backend's order.
+  3. An entry whose only obstacle is one call through a pointer (the kernel passed as a value: `cudaLaunchKernel`, launch helpers such as llama.cpp's `ggml_cuda_kernel_launch`, `auto k = c ? k1 : k2; k<<<...>>>`) gets a guarded entry: `<entry>.ocu_target(args)` computes the pointer (the plumbing inlined, the call replaced by returning its target; refused if the plumbing does anything but read memory and write its own locals first), and the block entry declines (returns 1, nothing run) unless the pointer is one of the module's kernels of that type that pass step 1 themselves (at most 256). The backend then runs that launch on fibers.
+  4. Just before the loop vectoriser, the per-thread stores are deleted where nothing in the block entry can read them any more (every read of `threadIdx` was forwarded, no call that could read it is left).
+  5. The image is rewritten to version 2: entries `{name, fiber entry, block entry or NULL}`. `OCU_CPU_LOOPS_REPORT=<file>` gets one line per entry (form, kernel, reason).
+- **Image version 2 and backend** (`backends/cpu/ocu_cpu_kernel.h`, `cpu_backend.c`, `cpu_exec.c`): `module_load` accepts versions 1 and 2. A block with a whole-block entry runs it on fiber 0's context (the slot the fibers would use first, so stack size, canary and sanitizer hooks are unchanged), after a per-block start that skips the per-thread fiber set-up (that set-up alone cost about 1 ns per thread). Random order: the same per-block shuffle as the fibers' first round. A declining entry: the block restarts on fibers from the same state. `OCU_CPU_FORM=fiber|loop|dispatch` (`dispatch` equals `loop` until stage 3); `OCU_CPU_STATS` gains a form column (fiber, loop, mixed) and the loop count; `OCU_CPU_TRACE=<file>` appends after every launch a hash of all device and pinned memory (new allocations filled with a fixed byte so runs compare).
+- `runtime/` and `libs/` are unchanged.
+
+### Differential harness
+
+`tests/cpu_forms/form_diff.cmake`, ctest `cpu_forms_<program>` for the 19 CPU-path test programs (`rt_*`, `cub_*`, `ptx_shift_run`, `fma_exact_test`, `ocu_cc_saxpy`, `cublas_accuracy`): each runs with `OCU_CPU_FORM=fiber` and `=loop` in fixed order and random order with seeds 7 and 1234, one OS thread, address randomisation off (`setarch -R`), and the two runs must have the same exit code, standard output and error, and the same `OCU_CPU_TRACE` (a hash of all device memory after every launch). All 19 pass; with the rest, ctest 249/249 (x86-64, GCC 13 build, plugin LLVM 18). `ptx_shift_run_plain` is left out: it exercises shifts by the width or more, which C++ leaves undefined, and its results differ between the forms (fixed order: 69242 against 62498 failed checks) as they may between optimisation levels. A first harness run also showed a difference in `cub_device` that was the content of uninitialised device memory (it does not recur with allocations filled under `OCU_CPU_TRACE`; the launches involved ran on fibers in both runs).
+
+Coverage of the tests' own launch sites: 236 of 522 have a whole-block entry (223 direct, 13 through a pointer); refused: 248 block barrier, 35 warp operation, 3 pointer with no eligible kernel of that type.
+
+### llama.cpp kernels
+
+Build: the existing CPU-path configuration (`cards/apps/llama-cpp.md`, 12030 profile), all 146 `.cu` files, against this tree's toolkit. Report, deduplicated by launch site (5088 sites; a kernel instantiation launched from two places counts twice):
+
+| Form | Sites | Share |
+|---|---|---|
+| loop, direct | 3269 | 64 % |
+| loop, through a pointer (guarded) | 426 | 8 % |
+| fiber: block barrier | 1135 | 22 % |
+| fiber: warp operation | 64 | 1 % |
+| fiber: pointer, no eligible kernel of that type | 194 | 4 % |
+
+So 73 % of the launch sites have a loop entry (the census, which counted instantiations and ignored launches through pointers, gave 50 % without cuts). At run time (Qwen2.5-0.5B Q8_0, `llama-bench`, 8 OS threads, `OCU_CPU_STATS=1`): prompt (32 tokens) 1054 of 1642 launches ran as loops, generation (16 tokens) 4114 of 11917. Kernels that ran as loops: `dequantize_block` (Q8_0 to f16, the prompt's GEMM input), `convert_unary`, `rope` (f32 and to f16), `swiglu` by signature, `k_bin_bcast` (add), `cpy_scalar` (KV cache), `k_get_rows`, `k_set_rows`. Still on fibers: `mul_mat_vec_q/f`, `quantize_q8_1`, `rms_norm`, `soft_max`, `mul_mat_q` (stage 2 material).
+
+Kernel time per form, same binary (`OCU_CPU_STATS`, ms, sum over launches):
+
+| Run | fiber | loop | Largest change |
+|---|---|---|---|
+| prompt 32 | 1627.5 | 1437.9 (−12 %) | `dequantize_block` 491.9 → 316.9 |
+| generation 16 | 11393.0 | 11391.4 (0 %) | none: the converted kernels are a few blocks per launch and their time is the launch itself (for example `rope` 408 launches, 240 ms in both forms) |
+
+### Speed
+
+One OS thread, 4 M threads (16384 blocks of 256), median / slow 10 % of 15 launches, ns per GPU thread:
+
+| Kernel | fiber | loop |
+|---|---|---|
+| `y[i] = a * x[i] + y[i]` with `if (i >= n) return` | 4.85 / 5.06 | 0.85 / 0.88 |
+| the same without the bounds check | 4.51 / 4.73 | 0.64 / 0.70 |
+| empty kernel | 3.89 / 3.96 | 0.11 / 0.11 |
+
+llama.cpp (Qwen2.5-0.5B Q8_0, `llama-bench`, 8 OS threads, same binary, `OCU_CPU_FORM` alternated; two sessions of 2 and 3 rounds, each round 5 prompt runs and 3 generation runs per form; load average 1 to 7.6 from other work on the PC), tokens/s, median / slow 10 %:
+
+| | fiber | loop |
+|---|---|---|
+| prompt 32 tokens, both sessions (25 runs each) | 31.5 / 27.3 | 41.1 / 33.9 |
+| prompt, first session (10 runs) | 38.0 / 9.0 | 43.1 / 35.8 |
+| prompt, second session (15 runs) | 30.4 / 27.3 | 41.1 / 21.9 |
+| generation 16 tokens, both sessions (15 runs each) | 1.34 / 0.93 | 1.27 / 0.97 |
+
+The prompt is faster in every round (round medians fiber against loop: 36.2 / 39.9, 39.9 / 46.3, 31.5 / 42.9, 30.0 / 42.9, 29.9 / 39.0), more than the 12 % less kernel time alone suggests: under load the fiber form loses more. Generation runs spread from 0.9 to 1.5 tokens/s in both forms; the difference of the medians is inside that spread, and the kernel time per token is the same in both forms (table above).
+
+### Correctness on llama.cpp
+
+Same binary, `OCU_CPU_FORM=fiber` against `=loop`:
+- greedy generation, 64 tokens (prompt 26 tokens): identical text ("... The city of Paris has a rich history that dates back to the 6th century. The city was founded by the Romans, who built a city on the site of an old Roman settlement. ...");
+- teacher-forced logits (`tools/llama-logits`, the Paris text, 90 positions × 151936 logits): bit-identical dump files both as one batch and with 8 tokens batched then one token at a time, so the KL divergence is exactly 0;
+- test-backend-ops (CUDA0 against CPU, the filter of `cards/apps/llama-cpp.md`), loop form: 15894 of 15894 pass, 11390 not supported, the same counts as the last fiber-form record; 15.5 minutes with 8 OS threads.
+
+### Vectorisation
+
+None of the converted loops vectorised in the samples examined. In llama.cpp's `convert.cu` (and `getrows`, `binbcast`, `rope`, `unary`) no loop is vectorised; the vectoriser's reasons in `convert.cu`: calls left in the body (132 loops), the kernels' own loops of unknown trip count (82), floating-point reductions it may not reorder (72), a `switch` (57), array bounds it cannot identify (18). In a plain `axpy` the index is `int i = blockIdx.x * blockDim.x + threadIdx.x`, 32-bit arithmetic that may wrap, so the address is not an affine function of the loop variable, and the bounds check makes the store conditional. As in stage 0, vectorisation is no part of the gain.
+
+### Limits
+
+- Platforms: the pass needs LLVM 18 or later with development files and the matching `clang++`; it is not built on Windows (MinGW cross build: configured, built, tests run under Wine on fibers) or in cross builds (AArch64 with qemu: built and tested on fibers). The backend's version 2 path is common code. A native AArch64 or macOS build with LLVM 18 would build the plugin; not tried.
+- Converted modules are compiled by the plugin's Clang even when another host compiler was chosen (`-ccbin g++`); `OCU_CPU_LOOPS=off` keeps the chosen compiler. Optimisation level 0: no conversion.
+- Kernels that look up a per-thread value the pass cannot see (an external function from another translation unit, a function pointer that is not a kernel of this module) are refused, as are kernels that change the rounding mode.
+- Code with undefined behaviour may behave differently in the two forms (the body is inlined into the loop and optimised there), as between optimisation levels.
+- Generation does not get faster: its converted kernels are dominated by the launch path, which stage 4 addresses.
+
+### Other builds, and what they showed
+
+- Address and undefined-behaviour sanitizers (Clang 18, plugin built without sanitizers): 245 of 246 tests pass, the `cpu_forms_*` tests included (`cub_device` not run, for time). The one failure, `ocu_nvcc_cpu_rt_fp16`, is a left shift of a negative value in the test's host-side reference (`tests/runtime/rt_fp16.cu:133`); it fails the same with the pass off. Thread sanitizer: 245 of 245 pass (`cub_device` and that test not run).
+- AArch64 cross build: it did not link before this work (`cpu_gemm.c` called the AVX2 routines on every processor); fixed in a separate commit. Then 104 of 106 CPU and runtime tests pass under qemu, on fibers; `runtime_gaps_intrin` and its random variant fail one floating-point min/max comparison of the tiled reduce, unrelated to the forms.
+- MinGW cross build: builds; `cpu_backend`, `runtime_api`, `runtime_lang`, `probe_cpu`, `cpu_regressions` pass under Wine, on fibers.
+
+### Decision
+
+Stage 1 gives the prompt a measured gain (above) from `dequantize_block` and the other element-wise kernels, no gain in generation, and no vectorisation. Generation needs stage 2 (`mul_mat_vec_q`, `quantize_q8_1`, `rms_norm`, `soft_max`: 76 % of generation kernel time) and the launch-cost work; the machinery of stage 1 (image version 2, decline path, `OCU_CPU_FORM`, `OCU_CPU_TRACE`, the differential harness) carries over.
+
+### Tests for an independent session (stage 1)
+
+Every item in both forms (`OCU_CPU_FORM=fiber` and `=loop`) × fixed order and several random seeds × warp size 32 and 64 × `OCU_CPU_THREADS=1` and many, unless the item says otherwise; results compared bit for bit (`OCU_CPU_TRACE`), the form read from `OCU_CPU_STATS` and `OCU_CPU_LOOPS_REPORT`.
+
+1. Golden lists: kernels without synchronisation points convert; each of these, anywhere in the call graph, makes the site fiber with the stated reason: `__syncthreads` (direct, in a helper, in a non-inlined function, under an `if` on a kernel argument, in dead code after `return`), `__syncthreads_count/and/or`, every warp function (`__shfl*_sync` at each width, `__ballot_sync`, `__any_sync`, `__all_sync`, `__syncwarp`, `__activemask` combined with a shuffle), cub block and warp primitives, inline assembly, `fesetround`/`fesetenv`, a function defined in another translation unit, a virtual call, a `__attribute__((weak))` device function. One mutant per refusal reason.
+2. Launch through a pointer: `cudaLaunchKernel`, a template helper taking the kernel as a parameter, `auto k = c ? k1 : k2; k<<<...>>>`, a kernel pointer stored in device or host memory, two kernels of the same type of which one has a barrier (that one declines at run time and runs on fibers with the right results; the launch shows as fiber or mixed), a pointer to a kernel of another translation unit, 257 kernels of one type, a launch lambda that does more than copy its arguments before the call.
+3. Thread indices and shapes: 1-, 2- and 3-dimensional blocks (3×5×7, 1×1×64, 1024×1×1, 1×1024×1, 1 thread), large grids (millions of blocks), `threadIdx`/`blockIdx`/`blockDim`/`gridDim`/`warpSize`, kernels that call `__activemask()` or the backend's `ocu_cpu_thread_idx`/`ocu_cpu_lane_id`, short last warp.
+4. Order: a last-writer-wins kernel (`o[0] = threadIdx.x`) gives the same value in both forms for the same seed and changes with the seed; per-thread `printf` output in the same order in both forms; kernels whose result depends on the thread order through shared memory without a barrier.
+5. Early return: on the thread index, inside a loop, for every thread at once, before and after writes.
+6. Locals and stack: a local array that uses most of the stack (`OCU_CPU_STACK_KB` small); an overflow reported as a launch failure in both forms and the next launch of the same shape fine; variable-length arrays and `alloca` in the body; a local whose address is written to global or shared memory and read back by the same thread; uninitialised locals (undefined: only check that nothing crashes).
+7. Floating-point control state: the host sets the rounding mode or flush-to-zero before a launch, a converted kernel sees it in every thread and leaves it unchanged for the host; a kernel that changes it is refused (fiber) and behaves as before.
+8. Memory: dynamic shared memory (`extern __shared__`) and static `__shared__` written and read per thread (fresh per block, 0xA5 at start), atomics between blocks with many OS threads, pinned and managed memory.
+9. Strict mode (`OCU_CPU_STRICT=1`) and `OCU_CPU_FORM=dispatch`: the same results as the default.
+10. Compilation: `-O0` (no conversion), `-g` (builds, debuggable), `OCU_CPU_LOOPS=off`, a wrong `OCU_CPU_LOOPS` path (warning, fibers), the toolkit (`ocu-nvcc`) and an installed package finding the plugin, `-ccbin g++`, objects with and without the pass linked together (the same `inline` kernel launched from both).
+11. Hand-made images: version 2 with `block` NULL, version 3 refused, a block entry that returns 1 (fibers, same results), a block entry that calls `ocu_cpu_barrier` (launch failure with a message, no hang).
+12. Address and thread sanitizer builds with converted kernels.
+13. Generated kernels: a random generator of race-free kernels without synchronisation points (uniform and per-thread `if`s, loops, early returns, local arrays, helper calls), both forms identical.
+14. Applications: llama.cpp test-backend-ops with the card's filter, greedy generation and teacher-forced logits bit-identical between the forms; Rodinia programs our path builds.
 
 OpenCuda is not affiliated with or endorsed by NVIDIA. CUDA is a trademark of NVIDIA Corporation. No warranty.

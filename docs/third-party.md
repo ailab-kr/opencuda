@@ -6,6 +6,7 @@ Add a row before the first use.
 | Component | Used for | Licence | How it is used | Added |
 |---|---|---|---|---|
 | Clang / LLVM 18.1.3 | Compiling `.cu` sources for each target | Apache-2.0 WITH LLVM-exception | External tool, not vendored | 2026-11-12 |
+| LLVM 18 C++ API headers and CMake package (`llvm-18-dev`) | Building the CPU path's pass plugin `compiler/cpu_loops` | Apache-2.0 WITH LLVM-exception | Headers at build time; the plugin is loaded into Clang and links no LLVM library itself; nothing vendored | 2026-11-13 |
 | CMake | Build | BSD-3-Clause | External tool | 2026-11-12 |
 | Python 3.10+ standard library | Conformance harness | PSF | External runtime | 2026-11-12 |
 | OpenCL ICD loader / drivers (any) | Run time of the OpenCL backend | per driver | Loaded with dlopen; nothing vendored, no SDK header used (`backends/opencl/ocl_api.h` written from the Khronos specification) | 2026-11-13 |
