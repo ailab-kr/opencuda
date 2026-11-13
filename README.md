@@ -154,7 +154,7 @@ Speed is given as **median / slow 10 %**.
 | Builds unmodified (about 150 CUDA sources, default settings) | ✅ | ✅ |
 | `test-backend-ops`: every operator compared with llama.cpp's own CPU backend | **15,894 / 15,894** | **15,894 / 15,894** |
 | Generation, 0.5B-parameter model, Q8_0 (tokens/s) | 1.25 / 1.08 | 95.5 / 93.3 |
-| Prompt processing (tokens/s) | 19.8 / 19.5 | 1,373 / 1,350 |
+| Prompt processing (tokens/s) | 39.3 / 38.2 | 1,373 / 1,350 |
 
 Sample output, prompt *"The city of Paris"*, greedy decoding:
 
