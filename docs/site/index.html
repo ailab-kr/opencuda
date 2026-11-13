@@ -170,14 +170,14 @@ const BLOCKS = [
 
   // chips
   { id: 'cpu', kind: 'chip', path: 'simt', pos: [-5.4, -2.2, 0], size: [1.5, 0.7, 1.2],
-    en: ['CPU', 'The reference backend on x86-64 and ARM64. GPU threads run as fibers, with warps of 32 or 64 lanes.', ['Linux 204 / 204, Windows under Wine 143 / 143', 'macOS 116 / 116, Windows 10 laptop 37 / 38']],
-    ko: ['CPU', 'x86-64과 ARM64용 기준 백엔드. GPU 스레드를 파이버로 돌리며, 워프 폭은 32 또는 64.', ['Linux 204 / 204, Wine의 Windows 143 / 143', 'macOS 116 / 116, Windows 10 노트북 37 / 38']] },
+    en: ['CPU', 'The reference backend on x86-64 and ARM64. GPU threads run as fibers, with warps of 32 or 64 lanes.', ['Linux 231 / 231, Windows under Wine 151 / 151', 'macOS 124 / 124, Windows 10 laptop 37 / 38']],
+    ko: ['CPU', 'x86-64과 ARM64용 기준 백엔드. GPU 스레드를 파이버로 돌리며, 워프 폭은 32 또는 64.', ['Linux 231 / 231, Wine의 Windows 151 / 151', 'macOS 124 / 124, Windows 10 노트북 37 / 38']] },
   { id: 'nvidia', kind: 'chip', path: 'simt', pos: [-3.6, -2.2, 0], size: [1.5, 0.7, 1.2],
     en: ['NVIDIA GPU', 'Loads the installed driver\'s public API when the program runs, so building needs no vendor files. Used as one backend among several, as a check rather than as the source of truth.', ['PTX from an open-source compiler', 'llama.cpp 15,894 / 15,894']],
     ko: ['NVIDIA GPU', '설치된 드라이버의 공개 API를 실행할 때 불러오므로 빌드에 칩 회사 파일이 필요 없다. 여러 백엔드 중 하나로, 정답의 원천이 아니라 대조용으로 쓴다.', ['PTX는 오픈소스 컴파일러가 만든다', 'llama.cpp 15,894 / 15,894']] },
   { id: 'apple', kind: 'chip', path: 'simt', pos: [-1.8, -2.2, 0], size: [1.5, 0.7, 1.2],
-    en: ['Apple GPU', 'A Metal backend and a CUDA C++ → Metal Shading Language translator.', ['Backend tests 53 / 53 on M3 and M1 Pro', '35 of 79 Rodinia kernels translate today']],
-    ko: ['Apple GPU', 'Metal 백엔드와 CUDA C++ → Metal Shading Language 번역기.', ['M3와 M1 Pro에서 백엔드 시험 53 / 53', 'Rodinia 커널 79개 중 35개를 현재 변환']] },
+    en: ['Apple GPU', 'A Metal backend and a CUDA C++ → Metal Shading Language translator.', ['Backend tests 53 / 53 on M3 and M1 Pro', '49 of 79 Rodinia kernels translate today']],
+    ko: ['Apple GPU', 'Metal 백엔드와 CUDA C++ → Metal Shading Language 번역기.', ['M3와 M1 Pro에서 백엔드 시험 53 / 53', 'Rodinia 커널 79개 중 49개를 현재 변환']] },
   { id: 'opencl', kind: 'chip', path: 'simt', pos: [0, -2.2, 0], size: [1.5, 0.7, 1.2],
     en: ['OpenCL', 'Kernels are translated and compiled through SPIR-V. Tested on an open implementation (PoCL).', ['103 / 103 tests', 'Rodinia: 17 build, 14 match']],
     ko: ['OpenCL', '커널을 변환해 SPIR-V로 컴파일한다. 공개 구현(PoCL)에서 시험했다.', ['시험 103 / 103', 'Rodinia 17개 빌드, 14개 일치']] },

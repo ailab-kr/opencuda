@@ -15,12 +15,12 @@ Measured so far (details in [README.md](../../README.md)):
   the CUB subset passes 5,500 independent checks.
 - Backends: CPU (reference) and NVIDIA GPU work; the Apple GPU (Metal)
   backend is a first cut (backend tests 53 / 53; the CUDA to Metal Shading
-  Language translator handles 35 of 79 Rodinia kernels); the OpenCL backend
+  Language translator handles 49 of 79 Rodinia kernels); the OpenCL backend
   works on PoCL (103 / 103 tests); the NPU simulator is a design target. AMD
   and Intel GPUs have device code that compiles but no runtime backend yet.
 - Rodinia (18 CUDA programs, unmodified): 17 build and 14 match an
   independent reference.
-- Check suites: Linux 204 / 204, macOS 116 / 116, Windows 10 37 / 38
+- Check suites: Linux 231 / 231, macOS 124 / 124, Windows 10 37 / 38
   (1 skipped).
 - The conformance harness, result format and scoreboard exist.
 

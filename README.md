@@ -6,7 +6,7 @@
 
 An open reference, an open conformance suite, and a thin contract that any chip can plug into.
 
-[한국어](README.ko.md) · [Interactive overview](docs/site/index.html) · [Architecture](ARCHITECTURE.md) · [Add a chip](docs/public/BACKEND_GUIDE.md)
+[한국어](README.ko.md) · [Interactive overview](docs/site/index.html) · [Architecture](ARCHITECTURE.md) · [Add a chip](docs/public/BACKEND_GUIDE.md) · [FAQ](docs/FAQ.md)
 
 <img src="docs/img/overview.svg" alt="Overview: applications, compatibility layer, the three core parts, and chips" width="900">
 
@@ -26,7 +26,8 @@ An open reference, an open conformance suite, and a thin contract that any chip 
 | **Real application** | llama.cpp (about 150 CUDA source files) builds **unmodified**. Its operator test passes **15,894 / 15,894** on the CPU path and on the GPU path. |
 | **Libraries** | BLAS-compatible library **1,395 / 1,395**; CUB subset **5,500** independent checks; fp32 GEMM **14.0 TFLOP/s** with portable C++ kernels |
 | **Chips** | CPU (x86-64, ARM64) · NVIDIA GPU · Apple GPU (Metal) · OpenCL · NPU simulator |
-| **Operating systems** | Linux 204 / 204 · macOS 116 / 116 (M3, M1 Pro) · Windows 10 37 / 38 (1 skipped) |
+| **Operating systems** | Linux 231 / 231 · Windows 151 / 151 (cross-built, Wine) · macOS 124 / 124 (M3, M1 Pro) · Windows 10 laptop 37 / 38 (1 skipped) |
+| **Status** | Pre-release (0.x). See the [FAQ](docs/FAQ.md) for what is not supported yet. |
 | **Clean room** | public documentation only; no vendor headers, SDK files, sources or binaries |
 
 ---
@@ -197,7 +198,7 @@ divergence against the oracle instead
 |---|---|---|
 | **CPU** (x86-64, ARM64) | reference | GPU threads run as fibers in deterministic or randomised order; warps of 32 or 64 lanes |
 | **NVIDIA GPU** | working | Uses the driver's public API, loaded when the program runs, so no vendor files are needed to build. PTX comes from an open-source compiler. |
-| **Apple GPU (Metal)** | first cut | Backend tests 53 / 53 on M3 and M1 Pro. The CUDA → Metal Shading Language translator handles 35 of 79 Rodinia kernels. |
+| **Apple GPU (Metal)** | first cut | Backend tests 53 / 53 on M3 and M1 Pro. The CUDA → Metal Shading Language translator handles 49 of 79 Rodinia kernels. |
 | **OpenCL** | working on PoCL | 103 / 103 tests. Rodinia: 17 build, 14 match. Kernels go through SPIR-V. |
 | **NPU simulator** | design target | No kernel launches, device memory the host cannot touch, a scratchpad limit, counted DMA traffic |
 | AMD, Intel GPUs | device code compiles | no runtime backend yet |
@@ -207,8 +208,8 @@ divergence against the oracle instead
 | Check | Result |
 |---|---|
 | Rodinia (18 CUDA programs, unmodified) | 17 build. 14 match an independent reference (OpenMP version, serial reference, or the program's own check). 15 match with the opt-in PTX shift semantics. |
-| Linux · Windows under Wine | 204 / 204 · 143 / 143 |
-| Windows 10 laptop · macOS M3 and M1 Pro | 37 / 38 (1 skipped) · 116 / 116 on each |
+| Linux · Windows under Wine | 231 / 231 · 151 / 151 |
+| Windows 10 laptop · macOS M3 and M1 Pro | 37 / 38 (1 skipped) · 124 / 124 on each |
 
 ---
 
@@ -368,15 +369,37 @@ flowchart LR
 1. **Results on real non-NVIDIA hardware.** llama.cpp on Apple GPUs, AMD and
    Intel GPUs, and NPUs through the operator table, each compared with that
    chip's native backend.
-2. **"The same answer" for floating-point applications.** Measure
-   per-position distribution distance and top-1 agreement. Set thresholds
-   from how much an application's official backends differ from each other.
-3. **A faster CPU path.** Send matrix work through the operator table, and
-   compile whole warps as vector loops.
-4. **Coverage driven by real applications.** ggml-based applications, then
-   cuBLASLt-style matmul, then Thrust on top of the CUB subset.
+2. **A broader application set.** Hundreds of benchmark programs for a build
+   rate, a training code base (backward passes), a Thrust/CUB-heavy library
+   and classic HPC suites, so the layer is not tuned to one program.
+3. **"The same answer" as a suite level.** The KL-based comparison already
+   used for llama.cpp becomes part of level L5, with thresholds set from how
+   much an application's official backends differ from each other.
+4. **Performance next to native software.** Every chip result is published
+   beside that chip's own backend. The CPU reference path gets faster by
+   sending matrix work to a fast library and compiling barrier-free regions
+   as vector loops.
+5. **Library coverage driven by applications.** cuBLASLt-style matmul, Thrust
+   on top of the CUB subset, then FFT and random numbers. PyTorch-level
+   libraries (cuDNN, NCCL) are a long-term goal.
+6. **Opening the process.** Public CI, versioned releases, a native MSVC
+   build, and a scoreboard that accepts results from other implementations.
 
 Exit measures for each item are in [docs/public/ROADMAP.md](docs/public/ROADMAP.md).
+
+## FAQ
+
+Short answers to the questions we hear most. The full list is in [docs/FAQ.md](docs/FAQ.md).
+
+| Question | Short answer |
+|---|---|
+| How is this different from HIPIFY, SYCLomatic, ZLUDA or chipStar? | They move code onto one stack. OpenCuda also publishes a reference and a conformance suite that can measure any of them, and supports NPUs through an operator table. |
+| Why CUDA C++ and not PyTorch or Triton? | Frameworks still sit on CUDA C++ engines, kernels and libraries. New chips need that layer first; OpenCuda complements framework backends. |
+| Will NVIDIA-tuned code be fast on other chips? | Not automatically. Correctness comes first; speed is measured against each chip's native software and published as it is. |
+| How is "correct" defined for floating point? | Documented behaviour, then high-precision math. Applications are compared with a high-precision oracle by KL divergence, within the band that the app's own official backends show. |
+| What is not supported yet? | CUDA graphs, textures and surfaces, cuBLASLt matmul, cuDNN, cuFFT, cuRAND, cuSPARSE, NCCL, Thrust, and native MSVC builds. Each returns "not supported" rather than failing silently. |
+| Isn't it all about llama.cpp? | So far, mostly. Next targets add hundreds of benchmark programs, a training code base, a Thrust/CUB-heavy library and classic HPC suites. |
+| Is it production-ready? | No. Pre-release (0.x); the backend ABI is versioned. |
 
 ## Contributing
 

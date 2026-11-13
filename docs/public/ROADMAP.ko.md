@@ -13,11 +13,11 @@
   15,894 / 15,894 통과.
 - BLAS 호환 라이브러리는 CPU와 GPU에서 1,395 / 1,395건을 통과하고, CUB 부분집합은 독립 확인 5,500건을 통과한다.
 - 백엔드: CPU(기준 구현)와 NVIDIA GPU는 동작한다. Apple GPU(Metal) 백엔드는 첫 단계다
-  (백엔드 시험 53 / 53, CUDA에서 Metal Shading Language로의 변환기는 Rodinia 커널 79개 중 35개를 처리).
+  (백엔드 시험 53 / 53, CUDA에서 Metal Shading Language로의 변환기는 Rodinia 커널 79개 중 49개를 처리).
   OpenCL 백엔드는 PoCL에서 동작한다(시험 103 / 103). NPU 시뮬레이터는 설계 목표다.
   AMD와 Intel GPU는 장치 코드가 컴파일되지만 실행 백엔드는 아직 없다.
 - Rodinia(CUDA 프로그램 18개, 수정 없음): 17개가 빌드되고 14개가 독립 기준과 일치한다.
-- 검사 모음: Linux 204 / 204, macOS 116 / 116, Windows 10 37 / 38(1건 건너뜀).
+- 검사 모음: Linux 231 / 231, macOS 124 / 124, Windows 10 37 / 38(1건 건너뜀).
 - 적합성 시험 하네스, 결과 형식, 점수판이 있다.
 
 ## 다음
