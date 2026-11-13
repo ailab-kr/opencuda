@@ -78,20 +78,17 @@ if(OCU_BACKEND_CPU)
       add_test(NAME cpu_fastpath_${tag} COMMAND test_cpu_fastpath)
       set_tests_properties(cpu_fastpath_${tag} PROPERTIES ENVIRONMENT "${envs}" TIMEOUT 600)
     endforeach()
-    # Card item 6 says the lane id is right outside a kernel; ocu_cpu_lane_id()
-    # called from host code crashes (SIGSEGV) instead.  Expected to fail until
-    # the implementation is fixed; remove WILL_FAIL then.
+    # Card item 6: the lane id is defined outside a kernel (0 from host code).
     add_test(NAME cpu_fastpath_lane_id_outside_kernel COMMAND test_cpu_fastpath lane_outside)
     # Card item 2 / header: mask 0 names the whole warp, and with
-    # OCU_CPU_STRICT=1 a named lane that already returned is an error.  With
-    # mask 0 the launch succeeds instead (mask 0xffffffff is detected).
+    # OCU_CPU_STRICT=1 a named lane that already returned is an error, as with
+    # mask 0xffffffff.
     add_test(NAME cpu_fastpath_strict_mask0_lane_gone COMMAND test_cpu_fastpath strict_mask0)
     set_tests_properties(cpu_fastpath_strict_mask0_lane_gone PROPERTIES
       ENVIRONMENT "OCU_CPU_STRICT=1")
     # Card item 9: control registers changed by one thread must not reach the
-    # next one.  A thread that ends with a changed rounding mode / FTZ+DAZ
-    # leaves it to the threads started after it on the same stack.  Expected
-    # to fail until fixed; remove WILL_FAIL then.
+    # next one: a thread that ends with a changed rounding mode / FTZ+DAZ
+    # must not pass it to threads started after it on the same stack.
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
       add_test(NAME cpu_fastpath_fpu_state_reaches_next_thread COMMAND test_cpu_fastpath fpu_dirty)
       add_test(NAME cpu_fastpath_fpu_state_reaches_next_thread_random COMMAND test_cpu_fastpath fpu_dirty)
