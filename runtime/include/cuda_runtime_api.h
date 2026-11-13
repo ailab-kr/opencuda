@@ -178,6 +178,81 @@ struct cudaPointerAttributes {
     void               *hostPointer;
 };
 
+/* Three-dimensional allocations and copies. Positions and extents are in
+   bytes along x when no array is involved. Arrays (cudaArray_t) are not
+   implemented: a copy that names one returns cudaErrorNotSupported. */
+typedef struct cudaArray *cudaArray_t;
+typedef const struct cudaArray *cudaArray_const_t;
+
+struct cudaExtent {
+    size_t width;
+    size_t height;
+    size_t depth;
+};
+
+struct cudaPos {
+    size_t x;
+    size_t y;
+    size_t z;
+};
+
+struct cudaPitchedPtr {
+    void  *ptr;
+    size_t pitch;
+    size_t xsize;
+    size_t ysize;
+};
+
+struct cudaMemcpy3DParms {
+    cudaArray_t           srcArray;
+    struct cudaPos        srcPos;
+    struct cudaPitchedPtr srcPtr;
+    cudaArray_t           dstArray;
+    struct cudaPos        dstPos;
+    struct cudaPitchedPtr dstPtr;
+    struct cudaExtent     extent;
+    enum cudaMemcpyKind   kind;
+};
+
+static inline struct cudaPitchedPtr make_cudaPitchedPtr(void *d, size_t p, size_t xsz, size_t ysz)
+{
+    struct cudaPitchedPtr s;
+    s.ptr = d;
+    s.pitch = p;
+    s.xsize = xsz;
+    s.ysize = ysz;
+    return s;
+}
+
+static inline struct cudaPos make_cudaPos(size_t x, size_t y, size_t z)
+{
+    struct cudaPos p;
+    p.x = x;
+    p.y = y;
+    p.z = z;
+    return p;
+}
+
+static inline struct cudaExtent make_cudaExtent(size_t w, size_t h, size_t d)
+{
+    struct cudaExtent e;
+    e.width = w;
+    e.height = h;
+    e.depth = d;
+    return e;
+}
+
+/* Device limits (cudaDeviceGetLimit / cudaDeviceSetLimit). */
+enum cudaLimit {
+    cudaLimitStackSize = 0x00,
+    cudaLimitPrintfFifoSize = 0x01,
+    cudaLimitMallocHeapSize = 0x02,
+    cudaLimitDevRuntimeSyncDepth = 0x03,
+    cudaLimitDevRuntimePendingLaunchCount = 0x04,
+    cudaLimitMaxL2FetchGranularity = 0x05,
+    cudaLimitPersistingL2CacheSize = 0x06
+};
+
 /* cudaMallocManaged flags. */
 #define cudaMemAttachGlobal 0x01u
 #define cudaMemAttachHost   0x02u
@@ -474,6 +549,16 @@ cudaError_t cudaMemcpy2DAsync(void *dst, size_t dpitch, const void *src, size_t 
 cudaError_t cudaMemset(void *ptr, int value, size_t count);
 cudaError_t cudaMemsetAsync(void *ptr, int value, size_t count, cudaStream_t stream);
 cudaError_t cudaMemset2D(void *ptr, size_t pitch, int value, size_t width, size_t height);
+cudaError_t cudaMemset2DAsync(void *ptr, size_t pitch, int value, size_t width, size_t height,
+                              cudaStream_t stream);
+cudaError_t cudaMalloc3D(struct cudaPitchedPtr *pitched, struct cudaExtent extent);
+cudaError_t cudaMemset3D(struct cudaPitchedPtr pitched, int value, struct cudaExtent extent);
+cudaError_t cudaMemset3DAsync(struct cudaPitchedPtr pitched, int value, struct cudaExtent extent,
+                              cudaStream_t stream);
+cudaError_t cudaMemcpy3D(const struct cudaMemcpy3DParms *p);
+cudaError_t cudaMemcpy3DAsync(const struct cudaMemcpy3DParms *p, cudaStream_t stream);
+cudaError_t cudaDeviceGetLimit(size_t *value, enum cudaLimit limit);
+cudaError_t cudaDeviceSetLimit(enum cudaLimit limit, size_t value);
 cudaError_t cudaMemcpyToSymbol(const void *symbol, const void *src, size_t count,
                                size_t offset, enum cudaMemcpyKind kind);
 cudaError_t cudaMemcpyFromSymbol(void *dst, const void *symbol, size_t count,

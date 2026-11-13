@@ -463,4 +463,6 @@ static inline cudaError_t cudaLaunchKernel(void (*func)(P...), dim3 grid, dim3 b
     return cudaLaunchKernel(reinterpret_cast<const void *>(func), grid, block, args, shared, stream);
 }
 
+#include "ocu_cuda_lang_scoped.h"
+
 #endif /* OCU_CUDA_LANG_NVPTX_H */

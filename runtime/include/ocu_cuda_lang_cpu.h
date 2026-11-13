@@ -505,6 +505,8 @@ inline unsigned __umul24(unsigned a, unsigned b) { return a * b; }
 
 #define OCU_LANG_FN inline
 #include "ocu_cuda_lang_common.h"
+#define OCU_SCOPED_SYSTEM_ATOMICS 1
+#include "ocu_cuda_lang_scoped.h"
 #undef OCU_LANG_FN
 
 /*

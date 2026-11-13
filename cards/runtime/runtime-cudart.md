@@ -44,6 +44,13 @@ cost: { hours: 5.0, ai_usage: 0 }
 
 - 반정밀도(`cuda_fp16.h`): `__half`·`__half2`, 변환(가장 가까운 짝수·0쪽·아래·위 반올림, 정수 변환은 넘치면 포화·NaN은 0), 사칙·fma(넓은 형에서 계산해 한 번 반올림 = 정확한 반올림), 순서·비순서 비교, 연산자, 수학 함수(float로 계산 후 반올림), `__half2` 묶음 연산.
 
+- 작은 추가 (실제 프로그램 조사 뒤, 11/13; 응용 결과는 카드 `apps-app-corpus`):
+  - 3차원 메모리: `cudaMalloc3D`, `cudaMemset3D`·`Async`, `cudaMemcpy3D`·`Async`(피치 있는 원본·대상, `srcPos`·`dstPos`, `ysize`; 배열이 얽히면 `cudaErrorNotSupported`), `cudaMemset2DAsync`, 형식 `cudaExtent`·`cudaPos`·`cudaPitchedPtr`·`cudaMemcpy3DParms`와 `make_cudaExtent` 등.
+  - `cudaDeviceGetLimit`·`cudaDeviceSetLimit`: 스택 크기·printf FIFO·말록 힙은 기록해 돌려줌(효과 없음, 0은 `cudaErrorInvalidValue`). 장치 런타임 한도 둘과 L2 상주 한도는 `cudaErrorUnsupportedLimit`. L2 가져오기 단위는 힌트라 0.
+  - `cuda_profiler_api.h`의 `cudaProfilerStart`·`cudaProfilerStop`: 붙은 도구가 없으므로 효과 없이 `cudaSuccess`.
+  - `math_constants.h`: `CUDART_*` 단·배정밀도 상수와 `_HI`/`_LO`.
+  - 장치 쪽: 캐시 힌트 적재·저장 9개(`__ldcg` 등), 범위 지정 원자(`atomicAdd_block`/`_system` 등; NVIDIA 경로의 `_system`은 컴파일 때 지원 안 함), 무동기 워프 함수(`__shfl` 등)는 컴파일 때 지원 안 함과 대체 함수 안내. Cooperative Groups 타일의 `meta_group_rank`·`meta_group_size`.
+
 ## 경계 조건
 
 - 선언하지 않은 API는 컴파일 오류로 드러난다(실행 중에 조용히 실패하지 않음).
@@ -60,6 +67,7 @@ cost: { hours: 5.0, ai_usage: 0 }
 - [x] 스트림 순서·조회, 안 막는 스트림 독립, 사건 시간, 예전 기본 스트림 순서, 사건 기다리기
 - [x] `tests/probe/main_saxpy.cu`: 프로브 커널을 실행 API로 돌림
 - [x] `tests/runtime/rt_lang.cu`(무작위 순서·스레드 3개·워프 64 모드 포함): 벡터 형 크기·정렬과 연산, 내장 변수 형과 이름 가리기, 리터럴 0·NULL 인자, 형 섞인 min·max, 원자 연산 변환, 포함 파일·매크로·띄어 쓴 실행 구문, 피치 할당·2차원 채우기, 스트림 위 기호 복사, 캐시 힌트, 오류 이름
+- [x] `tests/runtime/rt_apps_gaps.cu`(스모크 49개 점검): 캐시 힌트, 범위 지정 원자, 상수, 3D 할당·채우기·복사 왕복, 한도. 완전한 시험은 다른 세션이 쓴다(항목 목록은 카드 `apps-app-corpus`의 시험 목록)
 - [x] 외부: Rodinia 18개 중 17개 빌드, 8개 독립 기준과 일치(`conformance/external/rodinia/run.sh`)
 
 - [x] `tests/runtime/rt_mem.cu`: 포인터 종류(할당 안쪽 주소, 해제 뒤), `cudaMemcpyDefault` 네 방향과 범위 초과 오류, 통합 메모리를 호스트·커널이 함께 씀, 장치 속성과 속성 구조체 일치·잘못된 값

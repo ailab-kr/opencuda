@@ -74,6 +74,10 @@ typedef struct rt_device {
        the call returns; any other host memory is copied before. */
     mem_range            *ranges;
     size_t                range_count, range_cap;
+    /* cudaDeviceSetLimit values, guarded by `lock`. Recorded and returned;
+       they change nothing in this runtime. */
+    size_t                limit_value[3];
+    bool                  limit_set[3];
 } rt_device;
 
 static const ocu_backend *g_backend;
@@ -1176,15 +1180,176 @@ cudaError_t cudaMemsetAsync(void *ptr, int value, size_t count, cudaStream_t str
     return fill(ptr, value, count, stream);
 }
 
-cudaError_t cudaMemset2D(void *ptr, size_t pitch, int value, size_t width, size_t height)
+static cudaError_t memset2d(void *ptr, size_t pitch, int value, size_t width, size_t height,
+                            cudaStream_t stream)
 {
     if (width > pitch) return set_error(cudaErrorInvalidValue);
     if (width == 0 || height == 0) return cudaSuccess;
     for (size_t row = 0; row < height; ++row) {
-        cudaError_t e = fill((char *)ptr + row * pitch, value, width, NULL);
+        cudaError_t e = fill((char *)ptr + row * pitch, value, width, stream);
         if (e != cudaSuccess) return e;
     }
     return cudaSuccess;
+}
+
+cudaError_t cudaMemset2D(void *ptr, size_t pitch, int value, size_t width, size_t height)
+{
+    return memset2d(ptr, pitch, value, width, height, NULL);
+}
+
+cudaError_t cudaMemset2DAsync(void *ptr, size_t pitch, int value, size_t width, size_t height,
+                              cudaStream_t stream)
+{
+    return memset2d(ptr, pitch, value, width, height, stream);
+}
+
+/* ---- three-dimensional allocation, fill and copy ---------------------------
+ * A pitched 3D block is `depth` slices of `height` rows of `pitch` bytes;
+ * ysize is the row count of one slice (the allocation height).
+ */
+cudaError_t cudaMalloc3D(struct cudaPitchedPtr *pitched, struct cudaExtent extent)
+{
+    if (pitched == NULL) return set_error(cudaErrorInvalidValue);
+    void *p = NULL;
+    size_t pitch = 0;
+    if (extent.depth != 0 && extent.height > SIZE_MAX / extent.depth) {
+        return set_error(cudaErrorMemoryAllocation);
+    }
+    cudaError_t e = cudaMallocPitch(&p, &pitch, extent.width, extent.height * extent.depth);
+    if (e != cudaSuccess) return e;
+    *pitched = make_cudaPitchedPtr(p, pitch, extent.width, extent.height);
+    return cudaSuccess;
+}
+
+static cudaError_t memset3d(struct cudaPitchedPtr pp, int value, struct cudaExtent ext,
+                            cudaStream_t stream)
+{
+    if (ext.width == 0 || ext.height == 0 || ext.depth == 0) return cudaSuccess;
+    if (pp.ptr == NULL || ext.width > pp.pitch) return set_error(cudaErrorInvalidValue);
+    if (pp.ysize != 0 && ext.height > pp.ysize) return set_error(cudaErrorInvalidValue);
+    size_t ysize = pp.ysize != 0 ? pp.ysize : ext.height;
+    for (size_t z = 0; z < ext.depth; ++z) {
+        cudaError_t e = memset2d((char *)pp.ptr + z * ysize * pp.pitch, pp.pitch, value,
+                                 ext.width, ext.height, stream);
+        if (e != cudaSuccess) return e;
+    }
+    return cudaSuccess;
+}
+
+cudaError_t cudaMemset3D(struct cudaPitchedPtr pitched, int value, struct cudaExtent extent)
+{
+    return memset3d(pitched, value, extent, NULL);
+}
+
+cudaError_t cudaMemset3DAsync(struct cudaPitchedPtr pitched, int value, struct cudaExtent extent,
+                              cudaStream_t stream)
+{
+    return memset3d(pitched, value, extent, stream);
+}
+
+static cudaError_t copy3d(const struct cudaMemcpy3DParms *p, cudaStream_t stream, bool wait)
+{
+    if (p == NULL) return set_error(cudaErrorInvalidValue);
+    if (p->srcArray != NULL || p->dstArray != NULL) return set_error(cudaErrorNotSupported);
+    const struct cudaExtent ext = p->extent;
+    if (ext.width == 0 || ext.height == 0 || ext.depth == 0) return cudaSuccess;
+    if (p->srcPtr.ptr == NULL || p->dstPtr.ptr == NULL) return set_error(cudaErrorInvalidValue);
+    const struct cudaPitchedPtr s = p->srcPtr, d = p->dstPtr;
+    /* A missing ysize means one slice is exactly `height` rows. */
+    size_t sy = s.ysize != 0 ? s.ysize : ext.height;
+    size_t dy = d.ysize != 0 ? d.ysize : ext.height;
+    if (ext.width + p->srcPos.x > s.pitch || ext.width + p->dstPos.x > d.pitch ||
+        ext.height + p->srcPos.y > sy || ext.height + p->dstPos.y > dy) {
+        return set_error(cudaErrorInvalidValue);
+    }
+    for (size_t z = 0; z < ext.depth; ++z) {
+        const char *sp = (const char *)s.ptr + ((p->srcPos.z + z) * sy + p->srcPos.y) * s.pitch +
+                         p->srcPos.x;
+        char *dp = (char *)d.ptr + ((p->dstPos.z + z) * dy + p->dstPos.y) * d.pitch + p->dstPos.x;
+        cudaError_t e = copy2d(dp, d.pitch, sp, s.pitch, ext.width, ext.height, p->kind, stream,
+                               false);
+        if (e != cudaSuccess) return e;
+    }
+    if (wait) {
+        rt_device *dev;
+        cudaError_t e = current(&dev);
+        if (e != cudaSuccess) return set_error(e);
+        return dev_result(dev, g_backend->queue_sync(queue_of(dev, stream)));
+    }
+    return cudaSuccess;
+}
+
+cudaError_t cudaMemcpy3D(const struct cudaMemcpy3DParms *p)
+{
+    return copy3d(p, NULL, true);
+}
+
+cudaError_t cudaMemcpy3DAsync(const struct cudaMemcpy3DParms *p, cudaStream_t stream)
+{
+    return copy3d(p, stream, false);
+}
+
+/* ---- device limits ---------------------------------------------------------
+ * Stack size, printf FIFO and malloc heap are recorded and returned (no
+ * effect here). The device-runtime limits belong to device-side launches,
+ * which this runtime does not have, and persisting L2 needs a cache this
+ * runtime does not control: those report cudaErrorUnsupportedLimit.
+ * The L2 fetch granularity is a hint; it reads 0.
+ */
+static const size_t limit_default[3] = {1024u, 1048576u, 8388608u};
+
+cudaError_t cudaDeviceGetLimit(size_t *value, enum cudaLimit limit)
+{
+    if (value == NULL) return set_error(cudaErrorInvalidValue);
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    switch (limit) {
+    case cudaLimitStackSize:
+    case cudaLimitPrintfFifoSize:
+    case cudaLimitMallocHeapSize: {
+        int i = (int)limit;
+        pthread_mutex_lock(&d->lock);
+        *value = d->limit_set[i] ? d->limit_value[i] : limit_default[i];
+        pthread_mutex_unlock(&d->lock);
+        return cudaSuccess;
+    }
+    case cudaLimitMaxL2FetchGranularity:
+        *value = 0;
+        return cudaSuccess;
+    case cudaLimitDevRuntimeSyncDepth:
+    case cudaLimitDevRuntimePendingLaunchCount:
+    case cudaLimitPersistingL2CacheSize:
+        return set_error(cudaErrorUnsupportedLimit);
+    }
+    return set_error(cudaErrorInvalidValue);
+}
+
+cudaError_t cudaDeviceSetLimit(enum cudaLimit limit, size_t value)
+{
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    switch (limit) {
+    case cudaLimitStackSize:
+    case cudaLimitPrintfFifoSize:
+    case cudaLimitMallocHeapSize: {
+        if (value == 0) return set_error(cudaErrorInvalidValue);
+        int i = (int)limit;
+        pthread_mutex_lock(&d->lock);
+        d->limit_value[i] = value;
+        d->limit_set[i] = true;
+        pthread_mutex_unlock(&d->lock);
+        return cudaSuccess;
+    }
+    case cudaLimitMaxL2FetchGranularity:
+        return cudaSuccess;
+    case cudaLimitDevRuntimeSyncDepth:
+    case cudaLimitDevRuntimePendingLaunchCount:
+    case cudaLimitPersistingL2CacheSize:
+        return set_error(cudaErrorUnsupportedLimit);
+    }
+    return set_error(cudaErrorInvalidValue);
 }
 
 /*

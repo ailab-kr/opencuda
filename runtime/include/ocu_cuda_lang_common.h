@@ -62,6 +62,42 @@ OCU_LANG_FN T __ldg(const T *p)
 }
 
 /*
+ * Loads and stores with a cache hint (programming guide, "Load Functions
+ * Using Cache Hints" and "Store Functions Using Cache Hints"):
+ *   __ldcg  cache at the global level (L2 and below), not in L1
+ *   __ldca  cache at all levels
+ *   __ldcs  cache streaming, likely to be accessed once
+ *   __ldlu  last use
+ *   __ldcv  do not cache, fetch again (volatile)
+ *   __stcg  cache at global level      __stcs  cache streaming
+ *   __stwb  cache write-back, all coherent levels
+ *   __stwt  cache write-through (system)
+ * The hint changes where the data is kept, never the value read or written,
+ * so a plain access is a correct implementation on every path. The
+ * documented operand types are the integer, floating-point and vector types
+ * of that size; here any trivially copyable type is accepted. __ldcv also
+ * stops the compiler from reusing an earlier read.
+ */
+template <typename T> struct ocu_hint_nd { using type = T; }; /* the value converts to the pointee type */
+template <typename T> OCU_LANG_FN T __ldcg(const T *p) { return *p; }
+template <typename T> OCU_LANG_FN T __ldca(const T *p) { return *p; }
+template <typename T> OCU_LANG_FN T __ldcs(const T *p) { return *p; }
+template <typename T> OCU_LANG_FN T __ldlu(const T *p) { return *p; }
+template <typename T>
+OCU_LANG_FN T __ldcv(const T *p)
+{
+    T r;
+    __asm__ __volatile__("" ::: "memory");
+    __builtin_memcpy(&r, static_cast<const void *>(p), sizeof(T));
+    __asm__ __volatile__("" ::: "memory");
+    return r;
+}
+template <typename T> OCU_LANG_FN void __stcg(T *p, typename ocu_hint_nd<T>::type v) { *p = v; }
+template <typename T> OCU_LANG_FN void __stcs(T *p, typename ocu_hint_nd<T>::type v) { *p = v; }
+template <typename T> OCU_LANG_FN void __stwb(T *p, typename ocu_hint_nd<T>::type v) { *p = v; }
+template <typename T> OCU_LANG_FN void __stwt(T *p, typename ocu_hint_nd<T>::type v) { *p = v; }
+
+/*
  * Programmatic dependent launch, device side.
  *   cudaGridDependencySynchronize(): waits until the grids this grid
  *     depends on have completed and their memory operations are visible.
