@@ -53,4 +53,55 @@ A thread that returns before a cut counts as arrived (as now): it is marked inac
 
 How to treat a cut whose uniformity cannot be proven statically but holds at run time (for example a barrier under `if (n > 0)` where `n` is loaded from global memory: the same address for every thread, but a load is not uniform by the simple rule). Options: (a) refuse and use fibers (safe, loses some kernels); (b) treat loads from addresses that are themselves uniform, with no store to that memory earlier in the kernel, as uniform (needs alias reasoning); (c) run the converted form with a check at every cut that all active threads arrived at the same cut, and fall back to fibers for the rest of the block when they did not. Option (c) needs the converted and fiber forms to share thread state at the cut, which the context arrays make possible but complicate.
 
+## Review decisions (2026-11-13)
+
+A design review settled the open question and adjusted the plan.
+
+**Uniformity.** Option (c) is the default, with a different fallback. Each region is compiled once as `next_pc = region_k(ctx, tid)`. After a region loop, the fast path checks that all live threads return the same `next_pc`; this costs one compare per thread. If they differ, the block continues in a *pc dispatcher* that calls the same region functions per thread (`pc[tid] = R[pc[tid]](ctx, tid)`), which is exactly the fixed-order fiber schedule. Both forms read and write the same `ctx`, so no state has to be shared with fibers. Static uniformity (the simple rule: kernel arguments, `blockIdx`, constants) is only an optimisation that skips the check; it is never the correctness argument. Option (b) is rejected: a value loaded from memory can differ between threads when an earlier thread in the same region wrote it. Option (a) is only a stop-gap for the first stages.
+
+**State.** Values that cross a cut live in per-cut arrays, one array per SSA value (structure of arrays). Allocas that cross a cut get a fixed per-thread frame, so their addresses stay valid even when they escape to shared memory. This replaces condition 5. Dynamic allocas across a cut are refused.
+
+**Forms.** One set of region functions, three drivers:
+1. the uniform fast loop;
+2. the pc dispatcher;
+3. random order, which is the same loop over a shuffled thread order.
+
+Random order must exercise the loop form too, not only fibers. Fibers remain only for kernels that cannot be converted. Every module keeps the fiber entry, so differential testing and run-time choice stay possible.
+
+**Warp operations.** Shuffles and votes read the per-cut lane arrays, using the same value-selection helpers as the fiber path (out-of-range source, short last warp, width, negative source). Stage 2 handles full masks only. Partial masks are checked at run time from stage 3: if the named lanes are at the same cut with the same mask, run them; otherwise hand over to the dispatcher, which reports the existing mismatch errors.
+
+**Refused at compile time.**
+- barriers inside non-inlined or indirect calls, or recursion;
+- dynamic allocas across a cut;
+- calls that change floating-point control state;
+- external calls that look up the current thread.
+
+**Stages and measures.**
+
+| Stage | Work | Decides the next step |
+|---|---|---|
+| 0 | Hand-write `mul_mat_vec_q` in region-loop form and measure ns per thread. Add an analysis-only pass that counts convertible kernels and the reasons for refusing the rest, over llama.cpp, `tests/` and Rodinia. | 5 ns per thread or less; otherwise revisit |
+| 1 | Kernels without cuts (dequantise, element-wise), image v2 and backend plumbing | prompt tokens/s; whether the loops vectorise |
+| 2 | Statically uniform straight-line and loop cuts, block barriers, full-mask warp ops | `mul_mat_vec_q/f`, `quantize_q8_1`, `soft_max` converted; generation tokens/s (median, slow 10 %) |
+| 3 | Run-time pc check and dispatcher | only if the refused kernels hold more than about 5 % of time |
+| 4 | Partial masks at run time, launch cost, block batching | the remaining time breakdown |
+
+**Tests.**
+- **Differential.** `OCU_CPU_FORM=fiber|loop|dispatch` × fixed and several random seeds × warp 32/64 × 1 and many OS threads must give bit-identical results. This covers all of `tests/`, test-backend-ops and greedy generation.
+- **Generated kernels.** A random kernel generator builds race-free kernels with regions, cuts, uniform ifs and loops.
+- **Golden lists.** Golden files record which kernels convert and which are refused, with mutants for each refusal reason.
+- **Adversarial kernels:**
+  - barriers under memory-loaded conditions written in an earlier or the same region;
+  - per-thread loop counts;
+  - reduction trees;
+  - early return inside loops with barriers;
+  - escaped local arrays;
+  - long shuffle chains;
+  - odd block shapes;
+  - partial and vote-derived masks;
+  - `switch` and `goto` around barriers;
+  - rounding-mode changes.
+
+**Corrections to the estimate.** Vectorisation across threads may fail on aliasing between shared and global pointers, so it is measured separately and kept out of the gain estimate. Launch cost (about 700 launches per token) bounds the gain. `quantize_q8_1` has only 6 blocks, so it cannot use more OS threads. The estimate above is rewritten after stage 0. A pass plugin ties the CPU path to an LLVM version and loads poorly on Windows; the supported range has to be stated.
+
 OpenCuda is not affiliated with or endorsed by NVIDIA. CUDA is a trademark of NVIDIA Corporation. No warranty.
