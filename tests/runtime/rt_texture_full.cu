@@ -655,7 +655,7 @@ static void test_object_create()
         std::memset(&vd, 0, sizeof vd);
         {   // an all-zero view (format None, zero extent) is not a full-range view: the card allows refusing it
             cudaError_t ez = cudaCreateTextureObject(&o, &rd, &d, &vd);
-            XCHECK(ez == cudaSuccess, "all-zero resource view desc on an array: card says only none/same format with full range is accepted; zero extent is not full range");
+            CHECK(ez == cudaSuccess);
             if (ez == cudaSuccess && o) OK(cudaDestroyTextureObject(o));
         }
         vd.format = cudaResViewFormatFloat1;
@@ -975,19 +975,19 @@ static void test_edges()
                     if (std::fabs(got[j] - want) > 2e-5f) { if (b++ < 4) std::printf("  sweep mode %d lin %d norm %d x=%.9g got %.9g want %.9g\n", m, lin, norm, xs[j], got[j], want); }
                 }
                 CHECK(b == 0);
-                XCHECK(xamb == 0, "linear filter + border mode, coordinate outside the texture: pure border colour returned, a blend of the edge texel and the border colour expected");
+                CHECK(xamb == 0);
                 OK(cudaDestroyTextureObject(o));
             }
     {   // the two hand cases of the same kind (x = 4.25: .25 * T[3] + .75 * border; normalized 1.0: half and half)
         TD tb = mk(cudaAddressModeBorder, cudaFilterModeLinear, 0, B);
         cudaTextureObject_t ob = mkobj(a, tb);
         float g1 = s1<float>(ob, {4.25f})[0];
-        XCHECK(std::fabs(g1 - (0.25f * 40 + 0.75f * B)) < 1e-5f, "border + linear at x = 4.25 (N = 4): expected 4.75");
+        CHECK(std::fabs(g1 - (0.25f * 40 + 0.75f * B)) < 1e-5f);
         OK(cudaDestroyTextureObject(ob));
         tb.norm = 1;
         ob = mkobj(a, tb);
         g1 = s1<float>(ob, {1.0f})[0];
-        XCHECK(std::fabs(g1 - (0.5f * 40 + 0.5f * B)) < 1e-5f, "border + linear at normalized x = 1.0 (N = 4): expected 16.5");
+        CHECK(std::fabs(g1 - (0.5f * 40 + 0.5f * B)) < 1e-5f);
         OK(cudaDestroyTextureObject(ob));
     }
     cudaFreeArray(a);
@@ -1057,7 +1057,7 @@ static void test_edges()
                 if (std::fabs(got[j] - want) > 2e-3f) { if (b++ < 3) std::printf("  3D sweep rep %d (%g,%g,%g) got %.9g want %.9g\n", rep, xs[j], ys[j], zs[j], got[j], want); }
             }
             CHECK(b == 0);
-            XCHECK(xamb == 0, "3D linear + border mode with a coordinate outside the texture: pure border colour instead of a blend");
+            CHECK(xamb == 0);
             OK(cudaDestroyTextureObject(o));
         }
         cudaFreeArray(va);
@@ -1371,7 +1371,7 @@ static void test_layered()
                 if (std::fabs(got[j] - want) > 2e-2f) { if (bad++ < 4) std::printf("  2Dlayered variant %d (%g,%g) layer %d got %g want %g\n", variant, xs[j], ys[j], ls[j], got[j], want); }
             }
             CHECK(bad == 0);
-            XCHECK(xamb == 0, "2D layered linear + border mode with a coordinate outside the texture: pure border colour instead of a blend");
+            CHECK(xamb == 0);
             OK(cudaDestroyTextureObject(o));
         }
         cudaFreeArray(b);
