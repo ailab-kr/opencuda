@@ -82,13 +82,12 @@ if(OCU_BACKEND_CPU)
     # called from host code crashes (SIGSEGV) instead.  Expected to fail until
     # the implementation is fixed; remove WILL_FAIL then.
     add_test(NAME cpu_fastpath_lane_id_outside_kernel COMMAND test_cpu_fastpath lane_outside)
-    set_tests_properties(cpu_fastpath_lane_id_outside_kernel PROPERTIES WILL_FAIL TRUE)
     # Card item 2 / header: mask 0 names the whole warp, and with
     # OCU_CPU_STRICT=1 a named lane that already returned is an error.  With
     # mask 0 the launch succeeds instead (mask 0xffffffff is detected).
     add_test(NAME cpu_fastpath_strict_mask0_lane_gone COMMAND test_cpu_fastpath strict_mask0)
     set_tests_properties(cpu_fastpath_strict_mask0_lane_gone PROPERTIES
-      ENVIRONMENT "OCU_CPU_STRICT=1" WILL_FAIL TRUE)
+      ENVIRONMENT "OCU_CPU_STRICT=1")
     # Card item 9: control registers changed by one thread must not reach the
     # next one.  A thread that ends with a changed rounding mode / FTZ+DAZ
     # leaves it to the threads started after it on the same stack.  Expected
@@ -100,9 +99,6 @@ if(OCU_BACKEND_CPU)
         ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_SEED=5")
       # Random order starts every thread through the scheduler: no leak there.
       # Sanitizer builds always start threads through the scheduler: no leak there.
-      if(NOT CMAKE_C_FLAGS MATCHES "-fsanitize")
-        set_tests_properties(cpu_fastpath_fpu_state_reaches_next_thread PROPERTIES WILL_FAIL TRUE)
-      endif()
     endif()
   endif()
 

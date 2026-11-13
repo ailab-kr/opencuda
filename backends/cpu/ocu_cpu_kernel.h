@@ -104,6 +104,9 @@ void ocu_cpu_warp_sync(void);
  * the number of lanes in this warp (smaller than warp_size only for the
  * last warp of a block whose size is not a multiple of it). `all` must
  * hold OCU_CPU_MAX_WARP entries. Shuffles and votes are built on this.
+ * This form and ocu_cpu_warp_sync / ocu_cpu_warp_gather_tagged wait for the
+ * lanes still running: lanes that have returned are skipped in every mode,
+ * OCU_CPU_STRICT=1 included (unlike the *_masked forms below).
  */
 #define OCU_CPU_MAX_WARP 64
 uint32_t ocu_cpu_warp_gather(uint64_t value, uint64_t *all);
