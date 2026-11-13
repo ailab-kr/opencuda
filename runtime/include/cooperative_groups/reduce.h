@@ -44,8 +44,8 @@ struct bit_xor {
     __device__ T operator()(const T &a, const T &b) const { return a ^ b; }
 };
 
-template <unsigned N, typename T, typename Op>
-__device__ inline T reduce(const thread_block_tile<N> &g, T v, Op op)
+template <unsigned N, typename Q, typename T, typename Op>
+__device__ inline T reduce(const thread_block_tile<N, Q> &g, T v, Op op)
 {
     for (unsigned off = N / 2; off > 0; off >>= 1) {
         v = op(v, g.shfl_xor(v, off));
