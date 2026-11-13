@@ -1,7 +1,7 @@
 # Compiles cg_compile_cases.cu with -DCASE=<n> through ocu_cc.py and checks
 # the outcome.
 #   -DPY=<python> -DCC=<ocu_cc.py> -DSRC=<cases.cu> -DOUT=<object> -DTARGET=cpu|nvidia
-#   -DCASE=<n> -DEXPECT=ok|fail
+#   -DCASE=<n> -DEXPECT=ok|fail [-DMATCH=<regex the diagnostic must contain>]
 # A "fail" case must fail because of the compiler (an error message about
 # the source), not because the driver is broken: the control case (0) has
 # to compile in the same configuration, which is another test.
@@ -20,5 +20,10 @@ else()
   endif()
   if(NOT "${out}${err}" MATCHES "error")
     message(FATAL_ERROR "case ${CASE} (${TARGET}) failed without a compiler error message")
+  endif()
+  # Optional: -DMATCH=<regex> the diagnostic must contain (for example the
+  # name of the function to use instead).
+  if(DEFINED MATCH AND NOT "${MATCH}" STREQUAL "" AND NOT "${out}${err}" MATCHES "${MATCH}")
+    message(FATAL_ERROR "case ${CASE} (${TARGET}) failed, but the message does not contain '${MATCH}'")
   endif()
 endif()

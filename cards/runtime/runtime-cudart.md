@@ -68,6 +68,7 @@ cost: { hours: 5.0, ai_usage: 0 }
 - [x] `tests/probe/main_saxpy.cu`: 프로브 커널을 실행 API로 돌림
 - [x] `tests/runtime/rt_lang.cu`(무작위 순서·스레드 3개·워프 64 모드 포함): 벡터 형 크기·정렬과 연산, 내장 변수 형과 이름 가리기, 리터럴 0·NULL 인자, 형 섞인 min·max, 원자 연산 변환, 포함 파일·매크로·띄어 쓴 실행 구문, 피치 할당·2차원 채우기, 스트림 위 기호 복사, 캐시 힌트, 오류 이름
 - [x] `tests/runtime/rt_apps_gaps.cu`(스모크 49개 점검): 캐시 힌트, 범위 지정 원자, 상수, 3D 할당·채우기·복사 왕복, 한도. 완전한 시험은 다른 세션이 쓴다(항목 목록은 카드 `apps-app-corpus`의 시험 목록)
+- [x] 독립 시험(다른 세션, 11/13): `rt_apps_consts.cu`(math_constants 정확한 반올림 기준 116), `rt_apps_mem3d.cu`(3D 할당·채우기·복사 무작위 500건과 오류, 한도, 프로파일러), `rt_apps_dev.cu`(캐시 힌트 29형, 범위 지정 원자 순차·병렬, 타일 메타 그룹), `rt_apps_align.cu`, `apps_compile_cases.cu`(무동기 워프 함수 대체 이름 안내, 시스템 범위 원자, 구조체 뒤 정렬). 확인된 결함 2건은 기대 실패로 표시: CPU 경로에서 `typedef struct {..} __align__(8) S;`와 `struct S {..} __align__(8) g;`의 정렬이 빠짐, 3D 복사·채우기가 범위 초과 오류를 돌려주면서 앞 조각을 이미 씀
 - [x] 외부: Rodinia 18개 중 17개 빌드, 8개 독립 기준과 일치(`conformance/external/rodinia/run.sh`)
 
 - [x] `tests/runtime/rt_mem.cu`: 포인터 종류(할당 안쪽 주소, 해제 뒤), `cudaMemcpyDefault` 네 방향과 범위 초과 오류, 통합 메모리를 호스트·커널이 함께 씀, 장치 속성과 속성 구조체 일치·잘못된 값
