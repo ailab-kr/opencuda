@@ -35,9 +35,11 @@ static VOID CALLBACK fiber_main(LPVOID param)
     }
 }
 
-int cpu_ctx_make(cpu_ctx *ctx, void *stack, size_t bytes, void (*entry)(void))
+int cpu_ctx_make(cpu_ctx *ctx, void *stack, size_t bytes, void (*entry)(void),
+                 const cpu_fpctl *fp)
 {
     (void)stack; /* the system allocates fiber stacks */
+    (void)fp;    /* the entry resets the control state (cpu_fiber.h) */
     if (ctx->fiber != NULL && ctx->reusable && ctx->entry == entry) {
         ctx->reusable = 0;
         return 0;
@@ -101,7 +103,8 @@ void cpu_ctx_destroy(cpu_ctx *ctx) { (void)ctx; }
 
 #if defined(__x86_64__)
 
-int cpu_ctx_make(cpu_ctx *ctx, void *stack, size_t bytes, void (*entry)(void))
+int cpu_ctx_make(cpu_ctx *ctx, void *stack, size_t bytes, void (*entry)(void),
+                 const cpu_fpctl *fp)
 {
     if (bytes < 256) {
         return -1;
@@ -119,21 +122,20 @@ int cpu_ctx_make(cpu_ctx *ctx, void *stack, size_t bytes, void (*entry)(void))
     for (int i = 3; i <= 8; ++i) {
         t[-i] = 0;                /* rbp rbx r12 r13 r14 r15 */
     }
-    uint32_t mxcsr;
-    uint16_t fcw;
-    __asm__ volatile("stmxcsr %0" : "=m"(mxcsr));
-    __asm__ volatile("fnstcw %0" : "=m"(fcw));
+    /* The given state, not the caller's: the caller may be a fiber that
+       changed its own. */
     unsigned char *ctl = (unsigned char *)&t[-9];
     memset(ctl, 0, 8);
-    memcpy(ctl, &mxcsr, 4);
-    memcpy(ctl + 4, &fcw, 2);
+    memcpy(ctl, &fp->mxcsr, 4);
+    memcpy(ctl + 4, &fp->x87cw, 2);
     ctx->sp = &t[-9];
     return 0;
 }
 
 #elif defined(__aarch64__)
 
-int cpu_ctx_make(cpu_ctx *ctx, void *stack, size_t bytes, void (*entry)(void))
+int cpu_ctx_make(cpu_ctx *ctx, void *stack, size_t bytes, void (*entry)(void),
+                 const cpu_fpctl *fp)
 {
     if (bytes < 512) {
         return -1;
@@ -147,9 +149,7 @@ int cpu_ctx_make(cpu_ctx *ctx, void *stack, size_t bytes, void (*entry)(void))
     uint64_t *f = (uint64_t *)(top - 176);
     memset(f, 0, 176);
     f[11] = (uint64_t)(uintptr_t)entry; /* x30 at offset 88 */
-    uint64_t fpcr;
-    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
-    f[20] = fpcr;                        /* offset 160 */
+    f[20] = fp->fpcr;                    /* offset 160; not the caller's */
     ctx->sp = f;
     return 0;
 }
@@ -162,8 +162,10 @@ int cpu_ctx_make(cpu_ctx *ctx, void *stack, size_t bytes, void (*entry)(void))
 
 const char *cpu_ctx_kind(void) { return "ucontext"; }
 
-int cpu_ctx_make(cpu_ctx *ctx, void *stack, size_t bytes, void (*entry)(void))
+int cpu_ctx_make(cpu_ctx *ctx, void *stack, size_t bytes, void (*entry)(void),
+                 const cpu_fpctl *fp)
 {
+    (void)fp; /* the entry resets the control state (cpu_fiber.h) */
     if (getcontext(&ctx->uc) != 0) {
         return -1;
     }

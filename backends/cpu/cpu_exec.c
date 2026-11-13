@@ -215,7 +215,8 @@ typedef struct warp_rec {
     uint64_t tag;
     uint64_t seq;    /* the lane's warp operations so far in this block */
     uint64_t named;  /* lanes it waits for (warp-relative) */
-    bool     masked; /* an explicit mask (not the whole-warp form) */
+    bool     masked; /* a *_masked call (mask 0 included), not the unmasked
+                        forms, which wait for the lanes still running */
 } warp_rec;
 
 /* Per warp: which lanes are parked (waiting at a warp operation or
@@ -270,6 +271,9 @@ typedef struct block_exec {
     size_t            stack_region_bytes;
     size_t            stack_bytes;   /* usable bytes per fiber */
     uint64_t          rng;
+    /* Floating-point control state each GPU thread starts with: the OS
+       thread's when the block starts (cpu_fiber.h). */
+    cpu_fpctl         fp0;
     /* counters for OCU_CPU_STATS (cheap enough to keep always) */
     uint64_t          st_visits;     /* scheduler -> fiber switches */
     uint64_t          st_barriers;   /* block barrier waits */
@@ -408,7 +412,8 @@ static ocu_status start_fiber(block_exec *ex, uint32_t i)
     }
     f->slot = slot;
     f->stack = slot_stack(ex, slot);
-    if (cpu_ctx_make(&f->ctx, f->stack, slot_bytes(ex, slot), fiber_entry) != 0) {
+    if (cpu_ctx_make(&f->ctx, f->stack, slot_bytes(ex, slot), fiber_entry,
+                     &ex->fp0) != 0) {
         ex->free_slots[ex->nfree++] = slot;
         return OCU_ERR_LAUNCH_FAILED;
     }
@@ -506,7 +511,10 @@ static void yield_to_scheduler(block_exec *ex, bool exiting)
  * the lanes it names at the same call, the same occurrence of it and with
  * the same mask (a lane that skipped an iteration has a different sequence
  * number). A named lane that returned before reaching the operation is
- * tolerated, or an error under OCU_CPU_STRICT=1 when the mask was explicit.
+ * tolerated, or an error under OCU_CPU_STRICT=1 when the lanes were named by
+ * a *_masked call: mask 0 there names the whole warp as 0xffffffff does.
+ * The unmasked forms (ocu_cpu_warp_sync, ocu_cpu_warp_gather[_tagged]) mean
+ * the lanes still running and tolerate returned lanes in every mode.
  */
 static void check_release(block_exec *ex, uint32_t w, uint64_t go, bool full)
 {
@@ -602,6 +610,13 @@ static void fiber_entry(void)
 #ifdef OCU_ASAN
     __sanitizer_finish_switch_fiber(NULL, &ex->sched_bottom, &ex->sched_size);
 #endif
+    /* Each GPU thread starts with the block's initial floating-point control
+       state (cpu_fiber.h). A context of the fast switch starts with it
+       already (cpu_ctx_make); one from the system starts with the state of
+       whoever made or last ran it. */
+#if !defined(OCU_CPU_FAST_SWITCH)
+    cpu_fpctl_reset(&ex->fp0);
+#endif
     for (;;) {
         ex->fn(ex->args);
         uint32_t me = ex->current;
@@ -623,6 +638,9 @@ static void fiber_entry(void)
             ex->current = next;
             ex->st_visits++;
             ocu_cpu_tls_thread_idx = n->tid;
+            /* The thread that ended here may have changed the control
+               state; the next one must not see it. */
+            cpu_fpctl_reset(&ex->fp0);
             continue;
         }
 #endif
@@ -795,6 +813,7 @@ static ocu_status run_block(block_exec *ex, uint64_t linear_block)
 {
     const cpu_config *cfg = cpu_get_config();
     ex->rng = (cfg->seed ^ (linear_block * 0x9E3779B97F4A7C15ULL)) | 1u;
+    cpu_fpctl_get(&ex->fp0);
     if (ex->dyn_shared != NULL) {
         /* Shared memory starts with garbage on a GPU; make it visible. */
         memset(ex->dyn_shared, 0xA5, ex->dyn_shared_bytes);
@@ -1461,7 +1480,10 @@ void *ocu_cpu_dynamic_shared(void)
 
 uint32_t ocu_cpu_lane_id(void)
 {
-    return tl_exec->current & (tl_exec->warp_size - 1);
+    /* Outside a kernel: lane 0, as for thread 0 (warp_size gives the
+       setting there). */
+    const block_exec *ex = tl_exec;
+    return ex != NULL ? ex->current & (ex->warp_size - 1) : 0;
 }
 
 /*
@@ -1473,7 +1495,7 @@ uint32_t ocu_cpu_lane_id(void)
 #define OCU_SYNC_TAG 0x53594e43ULL
 
 static const uint64_t *warp_meet(block_exec *ex, uint64_t tag, uint32_t mask,
-                                 uint64_t value, uint32_t *count_out)
+                                 bool masked, uint64_t value, uint32_t *count_out)
 {
     uint32_t me = ex->current;
     uint32_t w = ex->warp_size;
@@ -1501,7 +1523,7 @@ static const uint64_t *warp_meet(block_exec *ex, uint64_t tag, uint32_t mask,
     mine->tag = tag;
     mine->seq = seq;
     mine->named = named;
-    mine->masked = mask != 0;
+    mine->masked = masked;
 
     /* Arrive; wait unless this arrival releases us. */
     f->state = FIBER_WAITING_WARP;
@@ -1521,10 +1543,11 @@ static const uint64_t *warp_meet(block_exec *ex, uint64_t tag, uint32_t mask,
     return &vals[base]; /* stable until this lane's next warp operation */
 }
 
-static uint32_t warp_gather(uint64_t tag, uint32_t mask, uint64_t value, uint64_t *all)
+static uint32_t warp_gather(uint64_t tag, uint32_t mask, bool masked, uint64_t value,
+                            uint64_t *all)
 {
     uint32_t count;
-    const uint64_t *vals = warp_meet(tl_exec, tag, mask, value, &count);
+    const uint64_t *vals = warp_meet(tl_exec, tag, mask, masked, value, &count);
     if (all != NULL) {
         memcpy(all, vals, count * sizeof(*all));
     }
@@ -1533,28 +1556,28 @@ static uint32_t warp_gather(uint64_t tag, uint32_t mask, uint64_t value, uint64_
 
 void ocu_cpu_warp_sync(void)
 {
-    (void)warp_gather(OCU_SYNC_TAG, 0, 0, NULL);
+    (void)warp_gather(OCU_SYNC_TAG, 0, false, 0, NULL);
 }
 
 void ocu_cpu_warp_sync_masked(uint32_t mask)
 {
-    (void)warp_gather(OCU_SYNC_TAG ^ mask, mask, 0, NULL);
+    (void)warp_gather(OCU_SYNC_TAG ^ mask, mask, true, 0, NULL);
 }
 
 uint32_t ocu_cpu_warp_gather(uint64_t value, uint64_t *all)
 {
-    return warp_gather(0, 0, value, all);
+    return warp_gather(0, 0, false, value, all);
 }
 
 uint32_t ocu_cpu_warp_gather_tagged(uint64_t value, uint64_t tag, uint64_t *all)
 {
-    return warp_gather(tag, 0, value, all);
+    return warp_gather(tag, 0, false, value, all);
 }
 
 uint32_t ocu_cpu_warp_gather_masked(uint64_t value, uint64_t tag, uint32_t mask,
                                     uint64_t *all)
 {
-    return warp_gather(tag, mask, value, all);
+    return warp_gather(tag, mask, true, value, all);
 }
 
 uint64_t ocu_cpu_warp_shuffle_masked(uint64_t value, uint64_t tag, uint32_t mask,
@@ -1562,7 +1585,7 @@ uint64_t ocu_cpu_warp_shuffle_masked(uint64_t value, uint64_t tag, uint32_t mask
 {
     block_exec *ex = tl_exec;
     uint32_t count;
-    const uint64_t *vals = warp_meet(ex, tag, mask, value, &count);
+    const uint64_t *vals = warp_meet(ex, tag, mask, true, value, &count);
     if (src >= count) {
         src = ex->current & (ex->warp_size - 1); /* our own value */
     }
@@ -1572,7 +1595,7 @@ uint64_t ocu_cpu_warp_shuffle_masked(uint64_t value, uint64_t tag, uint32_t mask
 uint64_t ocu_cpu_warp_vote_masked(int pred, uint64_t tag, uint32_t mask)
 {
     uint32_t count;
-    const uint64_t *vals = warp_meet(tl_exec, tag, mask, pred != 0, &count);
+    const uint64_t *vals = warp_meet(tl_exec, tag, mask, true, pred != 0, &count);
     uint64_t bits = 0;
     for (uint32_t i = 0; i < count; ++i) {
         bits |= (uint64_t)(vals[i] != 0) << i;

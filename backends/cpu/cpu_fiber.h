@@ -18,6 +18,91 @@
 #include <ucontext.h>
 #endif
 
+#include <stdint.h>
+
+/*
+ * Floating-point control state: rounding mode, flush-to-zero and
+ * denormals-are-zero, x87 precision (x86-64: MXCSR control bits and the x87
+ * control word; AArch64: FPCR; elsewhere the C11 <fenv.h> rounding mode).
+ * Status flags are not part of it. Every GPU thread starts with the state of
+ * the OS thread that runs its block (captured when the block starts): the
+ * entry resets it before each thread, including a thread started on a used
+ * stack (chaining in cpu_exec.c). A change a thread makes stays with that
+ * thread where the switch saves and restores the state per context (the
+ * fast switch, ucontext); Windows fibers are made without
+ * FIBER_FLAG_FLOAT_SWITCH, so there it is seen by fibers resumed after it.
+ */
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__)
+#define CPU_FPCTL_X86 1
+#elif (defined(__GNUC__) || defined(__clang__)) && defined(__aarch64__)
+#define CPU_FPCTL_ARM64 1
+#else
+#include <fenv.h>
+#endif
+
+typedef struct cpu_fpctl {
+#if defined(CPU_FPCTL_X86)
+    uint32_t mxcsr;
+    uint16_t x87cw;
+#elif defined(CPU_FPCTL_ARM64)
+    uint64_t fpcr;
+#else
+    int round;
+#endif
+} cpu_fpctl;
+
+#if defined(CPU_FPCTL_X86)
+/* MXCSR bits 0-5 are sticky exception flags; 6-15 control (DAZ, masks,
+   rounding, FTZ). */
+#define CPU_MXCSR_CONTROL 0xffc0u
+#endif
+
+static inline void cpu_fpctl_get(cpu_fpctl *s)
+{
+#if defined(CPU_FPCTL_X86)
+    __asm__ volatile("stmxcsr %0" : "=m"(s->mxcsr));
+    __asm__ volatile("fnstcw %0" : "=m"(s->x87cw));
+#elif defined(CPU_FPCTL_ARM64)
+    uint64_t v;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(v));
+    s->fpcr = v;
+#else
+    s->round = fegetround();
+#endif
+}
+
+/*
+ * Make `s` the current control state. Reads first and writes only what
+ * differs: the writes serialise the pipeline (ldmxcsr, fldcw, msr fpcr), and
+ * the state almost never differs.
+ */
+static inline void cpu_fpctl_reset(const cpu_fpctl *s)
+{
+#if defined(CPU_FPCTL_X86)
+    uint32_t csr;
+    uint16_t cw;
+    __asm__ volatile("stmxcsr %0" : "=m"(csr));
+    __asm__ volatile("fnstcw %0" : "=m"(cw));
+    if ((csr ^ s->mxcsr) & CPU_MXCSR_CONTROL) {
+        __asm__ volatile("ldmxcsr %0" : : "m"(s->mxcsr));
+    }
+    if (cw != s->x87cw) {
+        __asm__ volatile("fldcw %0" : : "m"(s->x87cw));
+    }
+#elif defined(CPU_FPCTL_ARM64)
+    uint64_t v;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(v));
+    if (v != s->fpcr) {
+        __asm__ volatile("msr fpcr, %0" : : "r"(s->fpcr));
+    }
+#else
+    if (fegetround() != s->round) {
+        fesetround(s->round);
+    }
+#endif
+}
+
+
 typedef struct cpu_ctx {
 #if defined(_WIN32)
     void *fiber;          /* system fiber; created once, reused while possible */
@@ -32,10 +117,14 @@ typedef struct cpu_ctx {
 
 /*
  * Prepare `ctx` so that switching to it runs `entry` on the stack
- * [stack, stack + bytes). `entry` must never return.
+ * [stack, stack + bytes). `entry` must never return. With the fast switch
+ * the context starts with the floating-point control state `fp`, whoever
+ * calls this (a running fiber may prepare the next one); elsewhere it starts
+ * with the caller's, and `entry` resets it (cpu_fpctl_reset).
  * Returns 0 on success.
  */
-int cpu_ctx_make(cpu_ctx *ctx, void *stack, size_t bytes, void (*entry)(void));
+int cpu_ctx_make(cpu_ctx *ctx, void *stack, size_t bytes, void (*entry)(void),
+                 const cpu_fpctl *fp);
 
 /* Save the running context into `from` and resume `to`. */
 void cpu_ctx_switch(cpu_ctx *from, cpu_ctx *to);
