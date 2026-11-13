@@ -31,7 +31,7 @@ static ocu_status launch(ocu_queue *q, ocu_cpu_kernel_fn fn, uint32_t gx,
                          uint32_t gy, uint32_t bx, uint32_t by, size_t shared,
                          void *argstruct, size_t argsize)
 {
-    struct ocu_kernel k = {NULL, fn}; /* fn is copied by the launch */
+    struct ocu_kernel k = {NULL, fn, NULL}; /* fn is copied by the launch */
     void *args[1] = {argstruct};
     size_t sizes[1] = {argsize};
     ocu_launch_params p;

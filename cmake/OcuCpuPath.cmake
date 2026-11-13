@@ -16,6 +16,12 @@
 # target) and, optionally, OCU_CC_DEPENDS (files whose change rebuilds .cu
 # objects).
 #
+# OCU_CPU_LOOPS_ENV (set in this source tree by compiler/cpu_loops) is
+# passed to ocu_cc: OCU_CPU_LOOPS=<plugin> or OCU_CPU_LOOPS=off. Installed
+# packages leave it unset, and ocu_cc uses the installed plugin if there is
+# one. The plugin gives kernels without synchronisation points a loop entry
+# (docs/cpu-region-loops.md).
+#
 # LIBRARIES are linked, and their INTERFACE_INCLUDE_DIRECTORIES are passed
 # to ocu_cc for the .cu sources (custom commands do not see target include
 # directories otherwise). Use a library built for the same target: a
@@ -34,6 +40,10 @@ endif()
 # sources left for the normal compiler.
 function(_ocu_cu_objects objs_var others_var target kind incflags defflags)
   get_filename_component(_cc_dir ${OCU_CC_SCRIPT} DIRECTORY)
+  set(loops_dep)
+  if(kind STREQUAL "cpu" AND OCU_CPU_LOOPS_PLUGIN AND TARGET ocu_cpu_loops)
+    set(loops_dep ocu_cpu_loops)
+  endif()
   set(objs)
   set(others)
   foreach(src IN LISTS ARGN)
@@ -54,10 +64,11 @@ function(_ocu_cu_objects objs_var others_var target kind incflags defflags)
       OUTPUT ${obj}
       COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/${target}.dir
       COMMAND ${CMAKE_COMMAND} -E env CXX=${CMAKE_CXX_COMPILER} CC=${CMAKE_C_COMPILER}
+              ${OCU_CPU_LOOPS_ENV}
               ${Python3_EXECUTABLE} ${OCU_CC_SCRIPT}
               --target ${kind} -O2 ${incflags} ${defflags} -c ${abs} -o ${obj}
       DEPENDS ${abs} ${OCU_CC_SCRIPT} ${_cc_dir}/cpu_rewrite.py ${_cc_dir}/ptx_shift.py
-              ${OCU_CC_DEPENDS}
+              ${OCU_CC_DEPENDS} ${loops_dep}
       IMPLICIT_DEPENDS CXX ${abs}
       COMMAND_EXPAND_LISTS
       COMMENT "ocu_cc --target ${kind} ${src}")

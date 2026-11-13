@@ -129,6 +129,11 @@ static ocu_status tracked_alloc(alloc_table *t, size_t bytes, void **ptr)
     if ((mem = cpu_os_aligned_alloc(CPU_ALLOC_ALIGN, rounded)) == NULL) {
         return OCU_ERR_OUT_OF_MEMORY;
     }
+    if (cpu_get_config()->trace != NULL) {
+        /* OCU_CPU_TRACE compares runs: new memory holds the same bytes in
+           every run, not whatever the heap held before. */
+        memset(mem, 0xA5, rounded);
+    }
     pthread_mutex_lock(&g_mem_lock);
     ocu_status st = table_insert(t, (uintptr_t)mem, bytes);
     pthread_mutex_unlock(&g_mem_lock);
@@ -232,4 +237,40 @@ ocu_status cpu_check_device_range(const void *ptr, size_t bytes)
     }
     pthread_mutex_unlock(&g_mem_lock);
     return st;
+}
+
+/* Hash of one allocation's bytes and size. */
+static uint64_t digest_bytes(const unsigned char *p, size_t n)
+{
+    uint64_t h = 0x6f63752d64696765ULL ^ (uint64_t)n;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, p + i, 8);
+        h = (h ^ w) * 0x9E3779B97F4A7C15ULL;
+        h ^= h >> 29;
+    }
+    for (; i < n; ++i) {
+        h = (h ^ p[i]) * 0x100000001B3ULL;
+    }
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    return h;
+}
+
+uint64_t cpu_mem_digest(void)
+{
+    /* A sum: independent of where the allocations happen to lie. */
+    uint64_t sum = 0;
+    pthread_mutex_lock(&g_mem_lock);
+    const alloc_table *tables[2] = {&g_device, &g_pinned};
+    for (int t = 0; t < 2; ++t) {
+        for (size_t i = 0; i < tables[t]->count; ++i) {
+            const alloc_rec *r = &tables[t]->recs[i];
+            sum += digest_bytes((const unsigned char *)r->base, r->bytes);
+        }
+    }
+    pthread_mutex_unlock(&g_mem_lock);
+    return sum;
 }

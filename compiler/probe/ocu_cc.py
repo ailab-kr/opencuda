@@ -22,7 +22,9 @@ What it guarantees on every path:
 cpu:    .cu: preprocess as C++17 with our cuda_runtime.h force-included
         (as nvcc does) and __CUDACC__ defined, rewrite the whole translation
         unit (cpu_rewrite.py: launches in included files and macros too),
-        compile the result. .c/.cpp: compile with our headers on the
+        compile the result. With the whole-block pass (compiler/cpu_loops,
+        see cpu_loops() below) both steps use the pass's Clang and load it:
+        kernels without synchronisation points also get a loop entry. .c/.cpp: compile with our headers on the
         include path, as nvcc hands them to the host compiler. Link with
         ocu_cudart (see cmake/OcuCpuPath.cmake).
 nvidia: device code only, as PTX (-S).
@@ -257,6 +259,34 @@ def ptx_shift_step(args, src: Path, work: Path, common: list[str], std: str, sid
     return [step], dest / src.name, extra
 
 
+LOOPS_PLUGIN = "libocu_cpu_loops.so"
+
+
+def cpu_loops(args=None):
+    """(plugin, clang++) of the whole-block pass (compiler/cpu_loops), or
+    None. Where the plugin comes from, first found: args.cpu_loops (set by
+    the compiler driver from its toolkit folder), $OCU_CPU_LOOPS, the
+    installed copy next to this script. "0", "off" or "no" in either of the
+    first two turns the pass off. The plugin only loads into the Clang it
+    was built for, named in the file next to it (<plugin stem>.clang)."""
+    given = getattr(args, "cpu_loops", None)
+    if given is None:
+        given = os.environ.get("OCU_CPU_LOOPS")
+    if given is not None and given.strip().lower() in ("0", "off", "no"):
+        return None
+    plugin = Path(given) if given else HERE / LOOPS_PLUGIN
+    clang_file = plugin.with_suffix(".clang")
+    if not plugin.is_file() or not clang_file.is_file():
+        if given:
+            print(f"ocu_cc: OCU_CPU_LOOPS: no plugin with its .clang file at {plugin}; "
+                  "kernels run on fibers", file=sys.stderr)
+        return None
+    clang = clang_file.read_text().strip()
+    if not Path(clang).is_file():
+        return None
+    return str(plugin), clang
+
+
 def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
     """The commands that compile one source. `args` has target, arch, I, D,
     O, g and cache (the ocu_cc.py command line); the compiler driver
@@ -309,6 +339,13 @@ def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
         pre_out = work / (src.stem + ".ii")
         rewritten = work / (src.stem + ".ocu.ii")
         shift, src, extra = ptx_shift_step(args, src, work, common, std, "--cuda-host-only")
+        # Whole-block entries for kernels without synchronisation points
+        # (docs/cpu-region-loops.md): the plugin's Clang preprocesses and
+        # compiles, so both steps read the same headers.
+        loops = cpu_loops(args)
+        if loops is not None:
+            cxx = loops[1]
+            codegen = [*codegen, f"-fpass-plugin={loops[0]}"]
         return [*shift,
                 [cxx, f"-std={std}", "-x", "c++", "-E", "-DOCU_CPU_PATH",
                  "-DOCU_CPU_PREPROCESS", "-D__CUDACC__", *cpu_arch_macros(args, pre), *ours,

@@ -19,6 +19,13 @@
  *
  * Address and thread sanitizers are told about every fiber switch, so both
  * can be used on code that runs here.
+ *
+ * Whole-block entries (image version 2, ocu_cpu_kernel.h): for kernels the
+ * compiler found free of synchronisation points, one call runs every thread
+ * of the block as a loop. It runs on one fiber of the block (so the stack
+ * size, the canary check and the sanitizer hooks are those of a fiber), in
+ * the order the fibers would run: fixed, or the same shuffle of the block's
+ * seed. OCU_CPU_FORM=fiber turns it off.
  */
 #define _DEFAULT_SOURCE
 #if defined(__APPLE__)
@@ -125,6 +132,16 @@ static void load_config(void)
 
     const char *stats = getenv("OCU_CPU_STATS");
     g_config.stats = stats != NULL && strcmp(stats, "1") == 0;
+
+    /* fiber: every kernel on fibers. loop (default): whole-block entries
+       where the compiler made them. dispatch: the same as loop for now (a
+       kernel without synchronisation points has one region, and the region
+       dispatcher of docs/cpu-region-loops.md runs it the same way). */
+    const char *trace = getenv("OCU_CPU_TRACE");
+    g_config.trace = trace != NULL && *trace != '\0' ? trace : NULL;
+
+    const char *form = getenv("OCU_CPU_FORM");
+    g_config.loops = !(form != NULL && strcmp(form, "fiber") == 0);
 }
 
 const cpu_config *cpu_get_config(void)
@@ -240,6 +257,11 @@ typedef struct block_exec {
     ocu_cpu_dim3      tid_dim;       /* block_dim the fibers' tid were made for */
     ocu_cpu_dim3      grid_dim;
     ocu_cpu_kernel_fn fn;
+    ocu_cpu_block_fn  block_fn;      /* whole-block entry for this launch, or NULL */
+    bool              loop_run;      /* fiber 0 runs block_fn for the block */
+    bool              loop_declined; /* block_fn declined (ran no thread) */
+    ocu_cpu_block_info info;         /* what block_fn is told */
+    ocu_cpu_dim3     *tids;          /* threadIdx by linear index */
     void            **args;
     void             *dyn_shared;
     size_t            dyn_shared_bytes;
@@ -617,6 +639,20 @@ static void fiber_entry(void)
 #if !defined(OCU_CPU_FAST_SWITCH)
     cpu_fpctl_reset(&ex->fp0);
 #endif
+    if (ex->loop_run) {
+        /* The whole block as one loop. The kernel has no synchronisation
+           point and does not change the control state (checked when it was
+           compiled), so every thread starts with fp0 as on its own fiber. */
+        ex->loop_declined = ex->block_fn(ex->args, &ex->info) != 0;
+        ex->current = 0;
+        ex->fibers[0].state = FIBER_DONE;
+        ex->n_done = ex->nthreads;
+        yield_to_scheduler(ex, true); /* nothing is ready: to the scheduler */
+#if !CPU_CTX_REUSED
+        abort();
+#endif
+        return;
+    }
     for (;;) {
         ex->fn(ex->args);
         uint32_t me = ex->current;
@@ -658,6 +694,7 @@ static void set_thread_indices(block_exec *ex, ocu_cpu_dim3 dim)
 {
     for (uint32_t i = 0; i < ex->nthreads; ++i) {
         ex->fibers[i].tid = linear_to_dim3(i, dim);
+        ex->tids[i] = ex->fibers[i].tid;
     }
     ex->tid_dim = dim;
 }
@@ -711,6 +748,7 @@ static ocu_status block_exec_init(block_exec *ex, uint32_t nthreads,
     ex->nwarps = (nthreads + ex->warp_size - 1) / ex->warp_size;
     ex->fibers = calloc(nthreads, sizeof(*ex->fibers));
     ex->order = calloc(nthreads, sizeof(*ex->order));
+    ex->tids = calloc(nthreads, sizeof(*ex->tids));
     ex->warp_recs = calloc(nthreads, sizeof(*ex->warp_recs));
     ex->warp_vals = calloc(2 * (size_t)nthreads, sizeof(*ex->warp_vals));
     ex->warps = calloc(ex->nwarps, sizeof(*ex->warps));
@@ -720,7 +758,8 @@ static ocu_status block_exec_init(block_exec *ex, uint32_t nthreads,
     ex->barrier_bits = calloc(ex->nwords, sizeof(*ex->barrier_bits));
     ex->chain = CPU_CHAIN && cfg->order == CPU_ORDER_FIXED;
     if (ex->ready_bits == NULL || ex->barrier_bits == NULL ||
-        ex->fibers == NULL || ex->order == NULL || ex->warp_recs == NULL ||
+        ex->fibers == NULL || ex->order == NULL || ex->tids == NULL ||
+        ex->warp_recs == NULL ||
         ex->warp_vals == NULL ||
         ex->warps == NULL || ex->free_slots == NULL) {
         return OCU_ERR_OUT_OF_MEMORY;
@@ -759,6 +798,7 @@ static void block_exec_release(block_exec *ex)
     }
     free(ex->fibers);
     free(ex->order);
+    free(ex->tids);
     free(ex->warp_recs);
     free(ex->warp_vals);
     free(ex->warps);
@@ -789,6 +829,15 @@ static void report_warp_mismatch(void)
     }
 }
 
+static void report_loop_wait(void)
+{
+    static atomic_flag said = ATOMIC_FLAG_INIT;
+    if (!atomic_flag_test_and_set(&said)) {
+        fprintf(stderr, "ocu cpu backend: a whole-block kernel entry reached a "
+                        "synchronisation point; the launch fails\n");
+    }
+}
+
 static void report_stack_overflow(void)
 {
     static atomic_flag said = ATOMIC_FLAG_INIT;
@@ -797,6 +846,47 @@ static void report_stack_overflow(void)
                         "(raise OCU_CPU_STACK_KB, now %zu)\n",
                 cpu_get_config()->stack_bytes / 1024u);
     }
+}
+
+/*
+ * The block through its whole-block entry, on fiber 0's context (so on the
+ * stack the fibers would use first). Random order: the same shuffle as the
+ * fibers' first round, which is the only round of a kernel that never waits.
+ */
+static ocu_status run_block_loop(block_exec *ex, const cpu_config *cfg)
+{
+    ex->info.order = NULL;
+    if (cfg->order == CPU_ORDER_RANDOM) {
+        for (uint32_t i = 0; i < ex->nthreads; ++i) {
+            ex->order[i] = i;
+        }
+        for (uint32_t i = ex->nthreads; i > 1; --i) {
+            uint32_t j = (uint32_t)(rng_next(&ex->rng) % i);
+            uint32_t t = ex->order[i - 1];
+            ex->order[i - 1] = ex->order[j];
+            ex->order[j] = t;
+        }
+        ex->info.order = ex->order;
+    }
+    ex->info.tids = ex->tids;
+    ex->info.current = &ex->current;
+    ex->info.dim = ex->block_dim;
+    ex->info.nthreads = ex->nthreads;
+    for (uint32_t wd = 0; wd < ex->nwords; ++wd) {
+        ex->ready_bits[wd] = 0; /* no fiber to chain to */
+    }
+    ex->loop_run = true;
+    ex->loop_declined = false;
+    ocu_status st = switch_to_fiber(ex, 0);
+    ex->loop_run = false;
+    ex->st_rounds++;
+    if (st == OCU_OK && ex->fibers[0].state != FIBER_DONE) {
+        /* The entry waited (a barrier or warp operation the compiler should
+           have refused): the block did not finish. Never resumed. */
+        report_loop_wait();
+        st = OCU_ERR_LAUNCH_FAILED;
+    }
+    return st;
 }
 
 /*
@@ -809,7 +899,13 @@ static void report_stack_overflow(void)
  * round, in random order it runs the ready ones in a fresh shuffle. When no
  * fiber is ready, the block barrier's waiters are released together.
  */
-static ocu_status run_block(block_exec *ex, uint64_t linear_block)
+/*
+ * Per-block start. `fibers`: the fiber state of every thread; without it,
+ * only what the whole-block entry's single fiber (fiber 0, on the slot the
+ * fibers would take first) needs: the per-thread work here would cost
+ * about 1 ns per GPU thread, as much as a small kernel body.
+ */
+static void block_prologue(block_exec *ex, uint64_t linear_block, bool fibers)
 {
     const cpu_config *cfg = cpu_get_config();
     ex->rng = (cfg->seed ^ (linear_block * 0x9E3779B97F4A7C15ULL)) | 1u;
@@ -820,6 +916,17 @@ static ocu_status run_block(block_exec *ex, uint64_t linear_block)
     }
     ex->warp_mismatch = false;
     ex->n_barrier = ex->n_warp = ex->n_done = 0;
+    ex->lowest_slot = ex->nthreads;
+    if (!fibers) {
+        fiber *f = &ex->fibers[0];
+        f->state = FIBER_READY;
+        f->started = false;
+        f->nonfull = false;
+        f->warp_seq = 0;
+        ex->free_slots[0] = ex->nthreads - 1;
+        ex->nfree = 1;
+        return;
+    }
     for (uint32_t w = 0; w < ex->nwarps; ++w) {
         ex->warps[w].parked = ex->warps[w].waiting = 0;
         ex->warps[w].nonfull = 0;
@@ -831,7 +938,6 @@ static ocu_status run_block(block_exec *ex, uint64_t linear_block)
     for (uint32_t i = 0; i < ex->nthreads; ++i) {
         ex->free_slots[ex->nfree++] = i;
     }
-    ex->lowest_slot = ex->nthreads;
     for (uint32_t i = 0; i < ex->nthreads; ++i) {
         fiber *f = &ex->fibers[i];
         f->state = FIBER_READY;
@@ -844,9 +950,43 @@ static ocu_status run_block(block_exec *ex, uint64_t linear_block)
         ex->ready_bits[wd] = left >= 64 ? ~0ULL : ((1ULL << left) - 1u);
         ex->barrier_bits[wd] = 0;
     }
+}
 
+/* Fibers that ran in this block are forgotten (their stacks are free):
+   the first `n` (only fiber 0 ran a whole-block entry). */
+static void forget_fibers(block_exec *ex, uint32_t n)
+{
+    for (uint32_t i = 0; i < n; ++i) {
+        fiber *f = &ex->fibers[i];
+        if (!f->started) {
+            continue;
+        }
+        f->started = false;
+#ifdef OCU_TSAN
+        __tsan_destroy_fiber(f->tsan_fiber);
+#endif
+    }
+}
+
+static ocu_status run_block(block_exec *ex, uint64_t linear_block)
+{
+    const cpu_config *cfg = cpu_get_config();
+    bool fibers = ex->block_fn == NULL;
+    block_prologue(ex, linear_block, fibers);
     ocu_status st = OCU_OK;
-    for (;;) {
+    if (!fibers) {
+        st = run_block_loop(ex, cfg);
+        if (st == OCU_OK && ex->loop_declined) {
+            /* The entry ran no thread (its kernel pointer is not one it
+               knows): this block and the rest of the launch on this thread
+               run on fibers, from the same start. */
+            ex->block_fn = NULL;
+            forget_fibers(ex, 1);
+            block_prologue(ex, linear_block, true);
+            fibers = true;
+        }
+    }
+    while (fibers) {
         bool ran = false;
         if (cfg->order == CPU_ORDER_RANDOM) {
             uint32_t ready = 0;
@@ -907,16 +1047,7 @@ static ocu_status run_block(block_exec *ex, uint64_t linear_block)
         ex->n_barrier = 0;
     }
     bool overflow = false;
-    for (uint32_t i = 0; i < ex->nthreads; ++i) {
-        fiber *f = &ex->fibers[i];
-        if (!f->started) {
-            continue;
-        }
-        f->started = false;
-#ifdef OCU_TSAN
-        __tsan_destroy_fiber(f->tsan_fiber);
-#endif
-    }
+    forget_fibers(ex, fibers ? ex->nthreads : 1);
     for (uint32_t s = ex->lowest_slot; s < ex->nthreads; ++s) {
         char *stack = slot_stack(ex, s);
         if (!canary_ok(stack)) {
@@ -946,6 +1077,8 @@ static ocu_status run_block(block_exec *ex, uint64_t linear_block)
  */
 typedef struct grid_job {
     ocu_cpu_kernel_fn fn;
+    ocu_cpu_block_fn  block_fn;   /* NULL: fibers */
+    _Atomic bool      declined;   /* block_fn declined: fibers after all */
     void            **args;
     uint32_t          grid[3];
     uint32_t          block[3];
@@ -1109,6 +1242,7 @@ static bool work_on(grid_job *job, bool primary)
         return false;
     }
     ex->fn = job->fn;
+    ex->block_fn = job->block_fn;
     ex->args = job->args;
     ex->dyn_shared_bytes = job->shared_bytes;
     ex->block_dim = (ocu_cpu_dim3){job->block[0], job->block[1], job->block[2]};
@@ -1144,6 +1278,9 @@ static bool work_on(grid_job *job, bool primary)
             record_error(job, st);
             break;
         }
+    }
+    if (job->block_fn != NULL && ex->block_fn == NULL) {
+        atomic_store(&job->declined, true);
     }
     if (stats && ran > 0) {
         atomic_fetch_add(&job->st_visits, ex->st_visits);
@@ -1266,6 +1403,7 @@ typedef struct kstat {
     ocu_cpu_kernel_fn fn;
     uint32_t threads_per_block;
     uint64_t launches, blocks, visits, barriers, warp_waits, rounds, threads;
+    uint64_t loop_launches; /* launches run through the whole-block entry */
     double   wall_ms, busy_ms;
 } kstat;
 
@@ -1291,6 +1429,7 @@ static void stats_print(void)
     memset(&t, 0, sizeof(t));
     for (uint32_t i = 0; i < g_nkstats; ++i) {
         t.launches += g_kstats[i].launches;
+        t.loop_launches += g_kstats[i].loop_launches;
         t.blocks += g_kstats[i].blocks;
         t.visits += g_kstats[i].visits;
         t.barriers += g_kstats[i].barriers;
@@ -1299,25 +1438,28 @@ static void stats_print(void)
         t.wall_ms += g_kstats[i].wall_ms;
         t.busy_ms += g_kstats[i].busy_ms;
     }
-    fprintf(stderr, "ocu cpu stats: %llu launches, %.1f ms in kernels (busy %.1f ms "
+    fprintf(stderr, "ocu cpu stats: %llu launches (%llu as loops), %.1f ms in kernels (busy %.1f ms "
                     "over threads), %llu blocks, %llu fiber switches, %llu barrier "
                     "waits, %llu warp waits, %llu rounds; %llu copies %.1f MB %.1f ms\n",
-            (unsigned long long)t.launches, t.wall_ms, t.busy_ms,
+            (unsigned long long)t.launches, (unsigned long long)t.loop_launches, t.wall_ms, t.busy_ms,
             (unsigned long long)t.blocks, (unsigned long long)t.visits,
             (unsigned long long)t.barriers, (unsigned long long)t.warp_waits,
             (unsigned long long)t.rounds, (unsigned long long)g_copies,
             (double)g_copy_bytes / 1e6, g_copy_ms);
     fprintf(stderr, "ocu cpu stats: kernel(+off) tpb launches blocks wall_ms busy_ms "
-                    "thr/launch switches barriers warp_waits rounds\n");
+                    "thr/launch switches barriers warp_waits rounds form\n");
     for (uint32_t i = 0; i < g_nkstats && i < 40; ++i) {
         const kstat *k = &g_kstats[i];
-        fprintf(stderr, "ocu cpu stats: %+lld %u %llu %llu %.1f %.1f %.1f %llu %llu %llu %llu\n",
+        const char *form = k->loop_launches == 0              ? "fiber"
+                           : k->loop_launches == k->launches ? "loop"
+                                                             : "mixed";
+        fprintf(stderr, "ocu cpu stats: %+lld %u %llu %llu %.1f %.1f %.1f %llu %llu %llu %llu %s\n",
                 (long long)((intptr_t)k->fn - (intptr_t)cpu_run_grid),
                 k->threads_per_block, (unsigned long long)k->launches,
                 (unsigned long long)k->blocks, k->wall_ms, k->busy_ms,
                 (double)k->threads / (double)k->launches,
                 (unsigned long long)k->visits, (unsigned long long)k->barriers,
-                (unsigned long long)k->warp_waits, (unsigned long long)k->rounds);
+                (unsigned long long)k->warp_waits, (unsigned long long)k->rounds, form);
     }
     pthread_mutex_unlock(&g_stats_lock);
 }
@@ -1341,6 +1483,7 @@ static void stats_record(grid_job *job, double wall_ms)
     kstat *k = stats_slot(job->fn);
     k->threads_per_block = job->block[0] * job->block[1] * job->block[2];
     k->launches++;
+    k->loop_launches += job->block_fn != NULL && !atomic_load(&job->declined);
     k->blocks += job->nblocks;
     k->visits += atomic_load(&job->st_visits);
     k->barriers += atomic_load(&job->st_barriers);
@@ -1362,9 +1505,35 @@ void cpu_stats_copy(double ms, size_t bytes)
     pthread_mutex_unlock(&g_stats_lock);
 }
 
-ocu_status cpu_run_grid(ocu_cpu_kernel_fn fn, const uint32_t grid[3],
-                        const uint32_t block[3], size_t shared_bytes,
-                        void **args)
+/*
+ * OCU_CPU_TRACE=<file>: one line per launch, appended when it ends:
+ * sequence number, grid, block, status and a hash of all device and pinned
+ * memory. Two runs of a program whose launches happen in the same order
+ * (one OS thread, one stream) can be compared line by line, for example
+ * OCU_CPU_FORM=fiber against =loop (tests/cpu_forms). Slow: it reads all
+ * device memory after every launch.
+ */
+static void trace_launch(grid_job *job)
+{
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t seq;
+    uint64_t h = cpu_mem_digest();
+    pthread_mutex_lock(&lock);
+    FILE *f = fopen(cpu_get_config()->trace, "a");
+    if (f != NULL) {
+        fprintf(f, "%llu grid %u,%u,%u block %u,%u,%u status %d form %s memory %016llx\n",
+                (unsigned long long)++seq, job->grid[0], job->grid[1], job->grid[2],
+                job->block[0], job->block[1], job->block[2], atomic_load(&job->status),
+                job->block_fn != NULL && !atomic_load(&job->declined) ? "loop" : "fiber",
+                (unsigned long long)h);
+        fclose(f);
+    }
+    pthread_mutex_unlock(&lock);
+}
+
+ocu_status cpu_run_grid(ocu_cpu_kernel_fn fn, ocu_cpu_block_fn block_fn,
+                        const uint32_t grid[3], const uint32_t block[3],
+                        size_t shared_bytes, void **args)
 {
     if (tl_exec != NULL) {
         return OCU_ERR_NOT_SUPPORTED; /* launch from inside a kernel */
@@ -1372,6 +1541,7 @@ ocu_status cpu_run_grid(ocu_cpu_kernel_fn fn, const uint32_t grid[3],
     grid_job job;
     memset(&job, 0, sizeof(job));
     job.fn = fn;
+    job.block_fn = cpu_get_config()->loops ? block_fn : NULL;
     job.args = args;
     memcpy(job.grid, grid, sizeof(job.grid));
     memcpy(job.block, block, sizeof(job.block));
@@ -1379,6 +1549,7 @@ ocu_status cpu_run_grid(ocu_cpu_kernel_fn fn, const uint32_t grid[3],
     job.nblocks = (uint64_t)grid[0] * grid[1] * grid[2];
     atomic_init(&job.next, 0);
     atomic_init(&job.status, OCU_OK);
+    atomic_init(&job.declined, false);
 
     bool stats = cpu_get_config()->stats;
     double t_start = stats ? cpu_now_ms() : 0.0;
@@ -1428,6 +1599,9 @@ ocu_status cpu_run_grid(ocu_cpu_kernel_fn fn, const uint32_t grid[3],
     }
     if (stats) {
         stats_record(&job, cpu_now_ms() - t_start);
+    }
+    if (cpu_get_config()->trace != NULL) {
+        trace_launch(&job);
     }
     return (ocu_status)atomic_load(&job.status);
 }

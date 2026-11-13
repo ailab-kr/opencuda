@@ -260,7 +260,7 @@ ocu_status cpu_gemm_launch(ocu_queue *queue, const ocu_op_desc *d, void *const *
     const int64_t blocks = j.batch * j.tiles_m * j.tiles_n;
     if (blocks > 0x7fffffffLL) return OCU_ERR_NOT_SUPPORTED;
 
-    struct ocu_kernel k = {NULL, k_gemm_tile};
+    struct ocu_kernel k = {NULL, k_gemm_tile, NULL};
     void *args[1] = {&j};
     size_t sizes[1] = {sizeof(j)};
     ocu_launch_params p;

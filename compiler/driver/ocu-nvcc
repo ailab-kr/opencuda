@@ -32,6 +32,12 @@ the cpu target needs none. Options for NVIDIA's own back-end tools
 
 No vendor SDK file is ever read: include and library paths inside a vendor
 SDK are refused, as in ocu_cc.py.
+
+cpu target: when the toolkit's lib folder has the whole-block pass
+(libocu_cpu_loops.so, compiler/cpu_loops), kernels without synchronisation
+points also get a loop entry (docs/cpu-region-loops.md); .cu files are then
+compiled by the Clang the pass was built for. OCU_CPU_LOOPS=off turns it off,
+OCU_CPU_LOOPS=<plugin> picks another.
 """
 
 from __future__ import annotations
@@ -506,6 +512,16 @@ def toolkit_libdir() -> Path | None:
     return None
 
 
+def toolkit_cpu_loops() -> str | None:
+    """The whole-block pass in the toolkit's lib folder, unless
+    OCU_CPU_LOOPS chooses (then ocu_cc reads it itself)."""
+    if os.environ.get("OCU_CPU_LOOPS") is not None:
+        return None
+    lib = toolkit_libdir()
+    plugin = lib / ocu_cc.LOOPS_PLUGIN if lib is not None else None
+    return str(plugin) if plugin is not None and plugin.is_file() else None
+
+
 def runtime_link(libdir: Path, blas: bool, target: str = "cpu") -> list[str]:
     # -lcublas: the cublas_v2.h library built for the same target as the
     # CUDA code (libs/cublas), then the internal BLAS layer.
@@ -624,7 +640,8 @@ class Driver:
             target=o.target, arch=self.ptx_arch() if o.target == "nvidia" else None,
             I=[], D=[], O=level, g=o.g or o.G, cache=None, lang=lang, std=o.std,
             pre=list(o.pre), host=host, device=device, deps=deps,
-            cxx=self.cxx, cc=self.cc)
+            cxx=self.cxx, cc=self.cc,
+            cpu_loops=toolkit_cpu_loops() if o.target == "cpu" else None)
 
     def dep_flags(self, obj: str) -> list[str]:
         o = self.o
