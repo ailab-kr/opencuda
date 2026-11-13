@@ -465,4 +465,13 @@ static inline cudaError_t cudaLaunchKernel(void (*func)(P...), dim3 grid, dim3 b
 
 #include "ocu_cuda_lang_scoped.h"
 
+/* Texture objects, sampled in software from the descriptor in device
+   memory (the driver's texture units are not used). Texture references
+   stop the build (ocu_texture_fetch.h). */
+#if !defined(OCU_NO_TEXTURE_DECLS) /* the source translators: see cuda_runtime_api.h */
+#define OCU_TEX_FN static __device__ inline
+#define OCU_TEX_MFN __device__ inline
+#include "ocu_texture_fetch.h"
+#endif
+
 #endif /* OCU_CUDA_LANG_NVPTX_H */

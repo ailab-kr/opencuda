@@ -20,6 +20,7 @@
 
 #include "ocu_rt.h"
 #include "ocu_core.h"
+#include "cudart_internal.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -121,6 +122,8 @@ static cudaError_t set_error(cudaError_t e)
 }
 
 static cudaError_t from(ocu_status st) { return set_error(ocu_rt_error(st)); }
+
+cudaError_t ocu_rt_set_error(cudaError_t e) { return set_error(e); }
 
 /* A backend result from synchronising work on device d: a kernel failure
    becomes the device's sticky error; an earlier sticky error wins. */
@@ -981,6 +984,18 @@ static bool range_overlaps(rt_device *d, const void *p, size_t n)
     return hit;
 }
 
+bool ocu_rt_alloc_avail(const void *p, size_t *avail)
+{
+    rt_device *d;
+    mem_range r;
+    if (p == NULL || current(&d) != cudaSuccess || !range_find(d, p, 1, &r) ||
+        r.type == cudaMemoryTypeHost) {
+        return false;
+    }
+    *avail = r.size - (size_t)((const char *)p - r.base);
+    return true;
+}
+
 static bool pinned_contains(rt_device *d, const void *p, size_t n)
 {
     mem_range r;
@@ -1268,10 +1283,44 @@ cudaError_t cudaMemset3DAsync(struct cudaPitchedPtr pitched, int value, struct c
     return memset3d(pitched, value, extent, stream);
 }
 
+/* An array side of cudaMemcpy3D as pitched memory: position x and the
+   extent's width are in elements of the array, so they become bytes here.
+   False (invalid value) for an unknown array or a region outside it. */
+static bool array_side(cudaArray_t a, struct cudaPos *pos, struct cudaPitchedPtr *pp,
+                       size_t *elem, const struct cudaExtent *ext)
+{
+    ocu_rt_array_view v;
+    if (!ocu_rt_array_view_of(a, &v)) return false;
+    if (*elem != 0 && *elem != v.elem_bytes) return false; /* two arrays of different elements */
+    *elem = v.elem_bytes;
+    if (pos->x > v.width || ext->width > v.width - pos->x || pos->y > v.rows ||
+        ext->height > v.rows - pos->y || pos->z > v.slices || ext->depth > v.slices - pos->z) {
+        return false;
+    }
+    pos->x *= v.elem_bytes;
+    *pp = make_cudaPitchedPtr(v.ptr, v.pitch, v.width * v.elem_bytes, v.rows);
+    return true;
+}
+
 static cudaError_t copy3d(const struct cudaMemcpy3DParms *p, cudaStream_t stream, bool wait)
 {
     if (p == NULL) return set_error(cudaErrorInvalidValue);
-    if (p->srcArray != NULL || p->dstArray != NULL) return set_error(cudaErrorNotSupported);
+    if (p->srcArray != NULL || p->dstArray != NULL) {
+        /* CUDA arrays: the same copy on the array's pitched memory. */
+        struct cudaMemcpy3DParms q = *p;
+        size_t elem = 0;
+        q.srcArray = NULL;
+        q.dstArray = NULL;
+        if (p->extent.width == 0 || p->extent.height == 0 || p->extent.depth == 0) {
+            return cudaSuccess;
+        }
+        if ((p->srcArray != NULL && !array_side(p->srcArray, &q.srcPos, &q.srcPtr, &elem, &p->extent)) ||
+            (p->dstArray != NULL && !array_side(p->dstArray, &q.dstPos, &q.dstPtr, &elem, &p->extent))) {
+            return set_error(cudaErrorInvalidValue);
+        }
+        q.extent.width = p->extent.width * elem;
+        return copy3d(&q, stream, wait);
+    }
     const struct cudaExtent ext = p->extent;
     if (ext.width == 0 || ext.height == 0 || ext.depth == 0) return cudaSuccess;
     if (p->srcPtr.ptr == NULL || p->dstPtr.ptr == NULL) return set_error(cudaErrorInvalidValue);

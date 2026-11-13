@@ -478,20 +478,20 @@ static void test_memcpy3d()
         nul.srcPtr = make_cudaPitchedPtr(nullptr, s.pitch, 30, 4);
         nul.dstPtr = make_cudaPitchedPtr(d.p, d.pitch, 30, 4);
         EXPECT(cudaMemcpy3D(&nul), cudaErrorInvalidValue);   // source missing
-        // arrays are not supported (documented in the project card): explicit "not supported"
+        // CUDA arrays are supported now; a bogus array handle must fail and leave memory unchanged
         cudaMemcpy3DParms arr;
         std::memset(&arr, 0, sizeof arr);
         arr.srcPtr = make_cudaPitchedPtr(s.p, s.pitch, 30, 4);
         arr.dstArray = reinterpret_cast<cudaArray_t>(0x10);
         arr.extent = make_cudaExtent(8, 2, 1);
         arr.kind = cudaMemcpyDeviceToDevice;
-        EXPECT(cudaMemcpy3D(&arr), cudaErrorNotSupported);
-        EXPECT(cudaMemcpy3DAsync(&arr, st), cudaErrorNotSupported);
+        FAILS(cudaMemcpy3D(&arr));
+        FAILS(cudaMemcpy3DAsync(&arr, st));
         arr.dstArray = nullptr;
         arr.dstPtr = make_cudaPitchedPtr(d.p, d.pitch, 30, 4);
         arr.srcPtr = make_cudaPitchedPtr(nullptr, 0, 0, 0);
         arr.srcArray = reinterpret_cast<cudaArray_t>(0x10);
-        EXPECT(cudaMemcpy3D(&arr), cudaErrorNotSupported);
+        FAILS(cudaMemcpy3D(&arr));
         CHECK_KEEP(d, db, "memcpy3D with array argument");
         (void)cudaGetLastError();
         free_buf(s); free_buf(d);

@@ -28,7 +28,7 @@ if(OCU_BACKEND_OPENCL)
 endif()
 
 # ocu_cudart: the runtime API (cuda_runtime_api.h) on the backend interface.
-add_library(ocu_cudart STATIC cudart/cudart.c cudart/fatbin.c)
+add_library(ocu_cudart STATIC cudart/cudart.c cudart/fatbin.c cudart/texture.c)
 target_include_directories(ocu_cudart PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${OCU_INSTALL_INCLUDEDIR}>)
