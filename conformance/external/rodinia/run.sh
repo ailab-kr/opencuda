@@ -36,14 +36,16 @@ TARGET=${OCU_TARGET:-cpu}
 SHIFT=
 MODE=standard
 if [ "${OCU_PTX_SHIFT:-0}" = 1 ]; then SHIFT=--ptx-shift; MODE=ptx-shift; fi
-LIBS="$BUILD/runtime/libocu_cudart.a $BUILD/runtime/libocu_core.a $BUILD/backends/cpu/libocu_backend_cpu.a"
-[ -f "$BUILD/backends/nvidia/libocu_backend_nvidia.a" ] && LIBS="$LIBS $BUILD/backends/nvidia/libocu_backend_nvidia.a -ldl"
-[ -f "$BUILD/backends/opencl/libocu_backend_opencl.a" ] && LIBS="$LIBS $BUILD/backends/opencl/libocu_backend_opencl.a -ldl"
+# Every library of the build in one group (the CPU backend needs ops_ref, the
+# registry every backend that was built).
+LIBS="-Wl,--start-group $BUILD/runtime/libocu_cudart.a $BUILD/runtime/libocu_core.a $(echo $BUILD/backends/*/libocu_*.a) -Wl,--end-group -ldl"
 # OCU_TARGET=opencl: device code through cu2ocl.py, run on the OpenCL backend
 # (OCU_OPENCL_LIBRARY / OCU_LLVM_SPIRV choose the library and translator).
 [ "$TARGET" = opencl ] && export OCU_BACKEND=opencl
 # build <exe> <sources...> [-- flags]: every source through ocu_cc, as nvcc
-# would take it.
+# would take it. With $HOSTCXX set, .cpp files go to that host compiler
+# instead (programs whose Makefile builds them without nvcc). $EXTRA_LIBS and
+# $LINK_FLAGS are added to the link.
 build() {
     local out=$1; shift
     local srcs=() flags=()
@@ -55,11 +57,15 @@ build() {
     local objs=() s o
     for s in "${srcs[@]}"; do
         o=.ocu/$(echo "$s" | tr / _).o
+        if [ -n "${HOSTCXX:-}" ] && [[ "$s" == *.cpp ]]; then
+            $HOSTCXX -I"$REPO/runtime/include" "${flags[@]}" -c "$s" -o "$o" 2>> .ocu/build.log || return 1
+            objs+=("$o"); continue
+        fi
         python3 "$REPO/compiler/probe/ocu_cc.py" --target "$TARGET" -O2 $SHIFT "${flags[@]}" -c "$s" -o "$o" \
             2> .ocu/build.log || return 1
         objs+=("$o")
     done
-    g++ -o "$out" "${objs[@]}" $LIBS -lpthread -lm 2>> .ocu/build.log
+    g++ -o "$out" "${objs[@]}" ${EXTRA_LIBS:-} $LIBS -lpthread -lm ${LINK_FLAGS:-} 2>> .ocu/build.log
 }
 cmp_num() { python3 "$HERE/numcmp.py" "$@"; }
 
@@ -138,9 +144,12 @@ open('$C/hotspot3D/t','w').write(''.join('%f\n'%(320+random.random()*20) for _ i
 else report hotspot3D BUILD-FAIL "$(head -c 200 $C/hotspot3D/.ocu/build.log)"; fi
 
 # nn: nearest records against an independent computation (nn_check.py
-# reproduces the program's own selection, including its record swap)
+# reproduces the program's own selection, including its record swap). The
+# input generator seeds every file with time(NULL); fixtime.so fixes it, so
+# the input is the same on every run (unfixed, runs differed from run to run
+# and about one in five had ties the check orders differently).
 if (cd $C/nn && build nn nn_cuda.cu); then
-    (cd $C/nn && mkdir -p data && gcc -O2 hurricane_gen.c -o hgen -lm 2>/dev/null && ./hgen 20000 4 > /dev/null 2>&1 \
+    (cd $C/nn && mkdir -p data && gcc -O2 hurricane_gen.c -o hgen -lm 2>/dev/null && LD_PRELOAD=$TOOLS/fixtime.so ./hgen 20000 4 > /dev/null 2>&1 \
         && printf 'data/cane4_%s.db\n' 0 1 2 3 > flist && ./nn flist -r 10 -lat 30 -lng 90 | grep -- '-->' > ocu.txt)
     r=$(cd $C/nn && python3 "$HERE/nn_check.py" flist 10 30 90 ocu.txt); report nn "$(verdict "$r")" "$r"
 else report nn BUILD-FAIL "$(head -c 200 $C/nn/.ocu/build.log)"; fi
@@ -228,6 +237,89 @@ if (cd $C/huffman && build huff main_test_cu.cu vlc_kernel_sm64huff.cu scan.cu p
     else report huffman FAIL "own check: $(grep -c '^Diff' $C/huffman/ocu.txt) differing elements vs CPU encoder"; fi
 else report huffman BUILD-FAIL "$(head -c 200 $C/huffman/.ocu/build.log)"; fi
 
+# ---- programs that use texture references (README.md, "textures") ----
+
+# hybridsort: the program's own check (-DVERIFY: its result against qsort on
+# the same 4M random floats). It includes GL/glew.h, GL/glut.h and
+# cuda_gl_interop.h without using them; empty ones are supplied when the
+# system has none. checkCudaErrors comes from the program's bundled helper
+# header only under a condition our headers do not meet, so it is given on the
+# command line as the call itself (result not checked, as in a release build).
+STUB=$TOOLS/stub; mkdir -p $STUB/GL
+[ -f /usr/include/GL/glew.h ] || : > $STUB/GL/glew.h
+[ -f /usr/include/GL/glut.h ] || : > $STUB/GL/glut.h
+: > $STUB/cuda_gl_interop.h
+if (cd $C/hybridsort && build hs bucketsort.cu mergesort.cu main.cu -- -I$STUB -DVERIFY "-DcheckCudaErrors(x)=(x)"); then
+    (cd $C/hybridsort && ./hs r > ocu.txt 2>&1)
+    if grep -q '^Checking result\.\.\.PASSED' $C/hybridsort/ocu.txt; then report hybridsort ok "PASSED (own check: 4,194,304 floats against qsort)"
+    else report hybridsort FAIL "own check: $(grep -m1 -i 'missmatch\|FAILED' $C/hybridsort/ocu.txt | head -c 100)"; fi
+else report hybridsort BUILD-FAIL "$(grep -m1 error $C/hybridsort/.ocu/build.log | head -c 200)"; fi
+
+# kmeans: cluster centres against the serial version of the suite (openmp/
+# kmeans/kmeans_serial: same first-k initial centres, same stopping rule) on
+# 20,000 generated points with 16 features around 5 centres. The CUDA version
+# passes the name of its __constant__ array as a string to
+# cudaMemcpyToSymbol("c_clusters", ...), a form removed in CUDA 5.0; it is
+# reported as it runs.
+if (cd $C/kmeans && build km kmeans_cuda.cu cluster.c getopt.c kmeans.c kmeans_clustering.c rmse.c); then
+    python3 -c "
+import random
+r = random.Random(5)
+cs = [[r.uniform(0, 100) for _ in range(16)] for _ in range(5)]
+with open('$C/kmeans/in.txt', 'w') as f:
+    for i in range(20000):
+        c = cs[r.randrange(5)]
+        f.write(str(i + 1) + ' ' + ' '.join('%.4f' % (v + r.gauss(0, 4)) for v in c) + '\n')"
+    (cd $C/kmeans && ./km -o -i in.txt > run.log 2>&1; grep -E '^[0-9]+:' run.log > ocu.txt)
+    (cd $O/kmeans/kmeans_serial && gcc -O2 -w -fopenmp *.c -o km_ser -lm 2>/dev/null && ./km_ser -i $C/kmeans/in.txt | grep -E '^[0-9]+:' > ref.txt)
+    if [ -s $C/kmeans/ocu.txt ]; then
+        r=$(cmp_num $C/kmeans/ocu.txt $O/kmeans/kmeans_serial/ref.txt 1e-4); report kmeans "$(verdict "$r")" "$r vs serial version"
+    else report kmeans FAIL "no centres printed: $(tail -c 120 $C/kmeans/run.log | tr '\n' ' ')"; fi
+else report kmeans BUILD-FAIL "$(grep -m1 error $C/kmeans/.ocu/build.log | head -c 200)"; fi
+
+# leukocyte: cells found in a generated video (leukocyte_avi.c, written with
+# the program's own avilib.c; the suite's sample video is not in its source
+# tree), tracked over 3 frames, against the OpenMP version. Both built with
+# -DOUTPUT (result.txt: the cell positions after the last frame).
+make -s -C $C/leukocyte/meschach_lib > /dev/null 2>&1
+if (cd $C/leukocyte/CUDA && EXTRA_LIBS=../meschach_lib/meschach.a build lk detect_main.c avilib.c find_ellipse.c find_ellipse_kernel.cu track_ellipse.c track_ellipse_kernel.cu misc_math.c -- -I../meschach_lib -DOUTPUT); then
+    gcc -O2 -w -I$C/leukocyte/CUDA "$HERE/leukocyte_avi.c" $C/leukocyte/CUDA/avilib.c -o $TOOLS/leukocyte_avi -lm \
+        && $TOOLS/leukocyte_avi $TOOLS/cells.avi 8
+    (cd $C/leukocyte/CUDA && rm -f result.txt && ./lk $TOOLS/cells.avi 3 > run.log 2>&1; cp result.txt ocu.txt 2>/dev/null)
+    make -s -C $O/leukocyte/meschach_lib > /dev/null 2>&1
+    (cd $O/leukocyte/OpenMP && gcc -O2 -w -fopenmp -DOUTPUT -I../meschach_lib *.c ../meschach_lib/meschach.a -o lk_omp -lm \
+        && rm -f result.txt && ./lk_omp 3 4 $TOOLS/cells.avi > run.log 2>&1 && cp result.txt ref.txt)
+    n1=$(grep -o 'Cells detected: [0-9]*' $C/leukocyte/CUDA/run.log); n2=$(grep -o 'Cells detected: [0-9]*' $O/leukocyte/OpenMP/run.log)
+    r=$(cmp_num $C/leukocyte/CUDA/ocu.txt $O/leukocyte/OpenMP/ref.txt 1e-5); report leukocyte "$(verdict "$r")" "$n1 / OpenMP $n2; positions $r"
+else report leukocyte BUILD-FAIL "$(grep -m1 error $C/leukocyte/CUDA/.ocu/build.log | head -c 200)"; fi
+
+# mummergpu: the matches of the GPU kernels against the program's own CPU
+# version (-C, mummergpu_gold.cpp), same binary, same generated reference
+# (200,000 bases) and 2,000 reads of 100 bases with up to 3 changes; minimum
+# match length 20. The program's host-only C++ files are built with the host
+# compiler as its Makefile does, at -O0: with g++ -O2 they crash while
+# flattening the suffix tree (in the -C CPU version too); they also need
+# <unistd.h>, which they do not include.
+if (cd $C/mummergpu/src && HOSTCXX="g++ -O0 -w -fopenmp -include unistd.h" LINK_FLAGS=-fopenmp build mg mummergpu.cu mummergpu_gold.cpp mummergpu_main.cpp suffix-tree.cpp PoolMalloc.cpp -- -I.); then
+    python3 -c "
+import random
+r = random.Random(9)
+ref = ''.join(r.choice('ACGT') for _ in range(200000))
+with open('$C/mummergpu/src/ref.fna', 'w') as f:
+    f.write('>ref synthetic\n')
+    for i in range(0, len(ref), 70): f.write(ref[i:i + 70] + '\n')
+with open('$C/mummergpu/src/q.fna', 'w') as f:
+    for q in range(2000):
+        p = r.randrange(len(ref) - 100)
+        s = list(ref[p:p + 100])
+        for _ in range(r.randrange(4)): s[r.randrange(100)] = r.choice('ACGT')
+        f.write('>q%d\n%s\n' % (q, ''.join(s)))"
+    (cd $C/mummergpu/src && ./mg -l 20 ref.fna q.fna > ocu.txt 2> run.log; ./mg -C -l 20 ref.fna q.fna > ref.txt 2> ref.log)
+    if [ -s $C/mummergpu/src/ref.txt ] && cmp -s $C/mummergpu/src/ocu.txt $C/mummergpu/src/ref.txt; then
+        report mummergpu ok "identical to its CPU version ($(grep -c '^>' $C/mummergpu/src/ocu.txt) reads, $(grep -vc '^>' $C/mummergpu/src/ocu.txt) matches)"
+    else report mummergpu FAIL "differs from its CPU version: $(diff $C/mummergpu/src/ocu.txt $C/mummergpu/src/ref.txt | grep -c '^[<>]') lines"; fi
+else report mummergpu BUILD-FAIL "$(grep -m1 error $C/mummergpu/src/.ocu/build.log | head -c 200)"; fi
+
 # Built only (they need input files this script does not generate, or the
 # program keeps its results inside the solver, see README.md).
 build_only() { # build_only <name> <dir> -- <build args>
@@ -237,6 +329,5 @@ build_only() { # build_only <name> <dir> -- <build args>
 }
 build_only srad_v1 $C/srad/srad_v1 -- main.cu
 build_only myocyte $C/myocyte -- main.cu
-build_only kmeans $C/kmeans -- kmeans_cuda.cu cluster.c getopt.c kmeans.c kmeans_clustering.c rmse.c
 
 echo "summary: $total programs, $built built, $pass checked equal, $fail failed or not built ($TARGET, $MODE shifts)"

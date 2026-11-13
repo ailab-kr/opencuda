@@ -4,9 +4,30 @@
 #   SKIP  why the program is not run (empty when it is)
 # $OUT is the work directory; $OUT/in holds gen.py's inputs.
 I=$OUT/in
-case_bfs()   { SKIP="texture references are not supported"; RUN=; REF=; }
-case_sad()   { SKIP="texture references are not supported"; RUN=; REF=; }
-case_spmv()  { SKIP="texture references are not supported"; RUN=; REF=; }
+case_bfs() {
+    SKIP=
+    RUN="$OUT/bfs.cuda -i $I/bfs_graph.txt -o $OUT/bfs.out.cuda"
+    build_ref bfs base || { SKIP="reference did not build"; return; }
+    REF="$OUT/bfs.ref -i $I/bfs_graph.txt -o $OUT/bfs.out.ref"
+}
+case_sad() {
+    SKIP=
+    RUN="$OUT/sad.cuda -i $I/sad_ref.bin,$I/sad_cur.bin -o $OUT/sad.out.cuda"
+    build_ref sad cpu || { SKIP="reference did not build"; return; }
+    REF="$OUT/sad.ref -i $I/sad_ref.bin,$I/sad_cur.bin -o $OUT/sad.out.ref"
+}
+# spmv: the suite's own fidapm05.mtx (42 rows, 520 entries, in its source tree)
+# and a generated vector. The pattern matrices next to it (jgl009, bcsstk32)
+# crash the suite's shared converter in both versions ("free(): invalid
+# pointer" from convert_dataset.c, also when built with the host compiler only).
+case_spmv() {
+    SKIP=
+    local cv=$B/spmv/common_src/convert-dataset
+    RUN="$OUT/spmv.cuda -i $cv/fidapm05.mtx,$I/spmv_vec.bin -o $OUT/spmv.out.cuda"
+    REF_SRCS="$cv/convert_dataset.c $cv/mmio.c" build_ref spmv cpu -I"$cv" \
+        || { SKIP="reference did not build"; return; }
+    REF="$OUT/spmv.ref -i $cv/fidapm05.mtx,$I/spmv_vec.bin -o $OUT/spmv.out.ref"
+}
 case_cutcp() { SKIP=; REF=; RUN="$OUT/cutcp.cuda -i $I/cutcp.pqr -o $OUT/cutcp.out.cuda"; }
 case_mri-gridding() { RUN=; REF=; SKIP="input is a trajectory file the suite does not ship with its source"; }
 case_tpacf() { RUN=; REF=; SKIP="inputs are catalogue files the suite does not ship with its source"; }

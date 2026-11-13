@@ -55,7 +55,8 @@ build_cuda() {
     "$NVCC" $FLAGS "$@" $srcs "$COM/src/parboil_cuda.c" \
         -o "$OUT/$n.cuda" > "$OUT/$n.cuda.build.log" 2>&1
 }
-# build_ref <name> <dir>: the suite's CPU version, host compiler only.
+# build_ref <name> <dir> [flags]: the suite's CPU version, host compiler only
+# ($REF_SRCS: more sources, such as the suite's shared dataset converter).
 build_ref() {
     local n=$1 d=$2; shift 2
     local s=$B/$n/src/$d
@@ -69,7 +70,7 @@ build_ref() {
     local cxx=${REFCXX:-$(command -v clang++ || echo /usr/lib/llvm-18/bin/clang++)}
     local objs="" f o
     : > "$OUT/$n.ref.build.log"
-    for f in $srcs "$COM/src/parboil.c"; do
+    for f in $srcs ${REF_SRCS:-} "$COM/src/parboil.c"; do
         o=$OUT/$n.ref.$(basename "$f").o
         case $f in
             *.c) "$cxx" -x c -O2 -w -I"$COM/include" "$@" -c "$f" -o "$o" ;;

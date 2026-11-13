@@ -10,8 +10,10 @@ against something that does not depend on this project:
 | the OpenMP version of the same program, same inputs | pathfinder, nw, bfs, lavaMD, streamcluster, backprop, srad_v2, particlefilter, b+tree |
 | a serial reference written from the kernel's formula (`hotspot_ref.c`) | hotspot |
 | a double-precision solver from the input formula (`gaussian_ref.py`) | gaussian |
-| the program's own check | lud, hotspot3D, huffman |
+| the program's own check | lud, hotspot3D, huffman, hybridsort, mummergpu (its `-C` CPU version) |
 | an independent computation (`nn_check.py`) | nn |
+| the serial version of the suite (`openmp/kmeans/kmeans_serial`) | kmeans |
+| the OpenMP version, on a generated video (`leukocyte_avi.c`) | leukocyte |
 
 Programs that print nothing about their results get a small driver
 (`gaussian_dump.cpp`, `backprop_dump.cpp`). It is built with
@@ -48,7 +50,7 @@ NVIDIA path on an RTX 5070 Ti):
 | huffman 256 KiB | 1,360 differing | PASS | PASS | PASS |
 | huffman 512 KiB | 3,836 differing | PASS | PASS | PASS |
 | huffman 1 MiB (5 runs) | 5,627-5,628 differing | PASS (5/5) | PASS (5/5) | PASS (5/5) |
-| the other 17 | 14 equal, 2 built only, kmeans does not build | same | same | same |
+| the other 17 (before textures, below) | 14 equal, 2 built only, kmeans does not build | same | same | same |
 
 The NVIDIA standard column passes by luck, not by rule: Clang turns a C++
 shift into an LLVM shift, whose result is poison at or above the width, and
@@ -120,11 +122,57 @@ Not checked:
 - myocyte: the program prints only timings and keeps the solver's results in
   arrays that `work()` frees before it returns. Checking it needs a copy of
   `work()`, so it is built only.
-- srad_v1: see above. kmeans: `texture` references; it does not build.
+- srad_v1: see above.
 
 Other programs are built only when they need input files the script does
-not generate. Programs that use texture references (removed from the CUDA
-runtime in 12.0) are expected not to build.
+not generate.
+
+textures (card `cards/runtime/texture.md`): hybridsort, kmeans, leukocyte
+and mummergpu use texture references (removed from the CUDA runtime in
+12.0); on the CPU path they are provided and sampled in software. Results on
+2026-11-13 (CPU path):
+
+| program | before | now |
+|---|---|---|
+| hybridsort | not in the script (did not build) | PASSED, own check (4,194,304 floats against qsort) |
+| kmeans | did not build | builds; crashes at run time (below) |
+| leukocyte | not in the script | 4 cells as the OpenMP version; 118 candidate positions identical; after 3 frames 3 of 4 cell positions within 3e-5, one 0.09 px apart (below): reported FAIL at tolerance 1e-5 |
+| mummergpu | not in the script | output identical to its own CPU version (2,000 reads, 3,048 matches) |
+
+Whole script: 21 programs, 21 built, 16 checked equal (the failures:
+huffman with standard shifts, kmeans, leukocyte). With `OCU_PTX_SHIFT=1`:
+19 built, 16 equal (huffman passes; kmeans and mummergpu stop in the Clang
+syntax pass of `--ptx-shift`: GCC's `omp.h` uses an attribute form Clang
+rejects, and mummergpu's kernel file writes `"..."NAME` without a space,
+which C++11 reads as a literal suffix).
+
+What the script does for them, without changing their sources:
+
+- hybridsort includes `GL/glew.h`, `GL/glut.h` and `cuda_gl_interop.h` and
+  uses none of them: empty files are supplied where the system has none.
+  `checkCudaErrors` comes from the program's bundled helper header only under
+  a condition our headers do not meet; it is defined on the command line as
+  the call itself.
+- leukocyte: the suite's sample video is not in its source tree.
+  `leukocyte_avi.c` writes a 640x480 grey video (dark rings on a textured
+  background) with the program's own `avilib.c`.
+- mummergpu: its host-only C++ files are built with the host compiler, as its
+  Makefile does, at -O0 and with `-include unistd.h` (they call `read` and
+  `lseek` without including it). With `g++ -O2` they crash while flattening
+  the suffix tree, in the program's `-C` CPU version too.
+
+Differences that come from the programs:
+
+- kmeans passes the name of its `__constant__` array as a string,
+  `cudaMemcpyToSymbol("c_clusters", ...)`, a form the runtime API removed in
+  CUDA 5.0. On the CPU path the string's address is taken for the symbol and
+  the copy writes into the string literal, which crashes.
+- leukocyte: the texture kernels (GICOV, dilation) give the same candidate
+  cells as the OpenMP version (checked with a debug copy that prints them).
+  The difference starts after them: one cell's detected centre is 0.25 px
+  apart, and 0.09 px after tracking. The CUDA version computes GICOV in
+  float with float sine and cosine tables, the OpenMP version in double;
+  that this is the cause is likely but not shown.
 
     conformance/external/rodinia/run.sh <cmake build dir> [work dir]
 
