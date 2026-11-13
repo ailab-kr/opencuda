@@ -259,12 +259,6 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
               "-DMATCH=${cm}"
               -P ${CMAKE_CURRENT_SOURCE_DIR}/runtime/compile_case.cmake)
   endforeach()
-  # Known defect (expected failure; remove this line when fixed): on the CPU
-  # path the translator drops the alignment in
-  #   case 32:  typedef struct { float x, y; } __align__(8) S;     (alignof(S) is 4, want 8)
-  #   case 34:  struct S { int a; int b; } __align__(8) g_s;       (alignof(S) is 4, want 8)
-  # The NVIDIA path compiles both with the right alignment.
-  set_tests_properties(runtime_apps_compile_case32_cpu runtime_apps_compile_case34_cpu PROPERTIES WILL_FAIL TRUE)
   ocu_add_cpu_cu_executable(rt_fp16 runtime/rt_fp16.cu)
   add_test(NAME runtime_fp16 COMMAND rt_fp16)
   ocu_add_cpu_cu_executable(rt_bf16 runtime/rt_bf16.cu)
