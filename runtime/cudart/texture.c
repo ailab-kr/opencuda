@@ -516,6 +516,13 @@ static bool view_ok(const struct cudaResourceViewDesc *v, const struct cudaArray
         {16, 1, cudaChannelFormatKindFloat}, {16, 2, cudaChannelFormatKindFloat}, {16, 4, cudaChannelFormatKindFloat},
         {32, 1, cudaChannelFormatKindFloat}, {32, 2, cudaChannelFormatKindFloat}, {32, 4, cudaChannelFormatKindFloat},
     };
+    /* An all-zero descriptor (format None, no extent, no levels or layers)
+       asks for nothing beyond the underlying resource: accepted as no view. */
+    if (v->format == cudaResViewFormatNone && v->width == 0 && v->height == 0 && v->depth == 0 &&
+        v->firstMipmapLevel == 0 && v->lastMipmapLevel == 0 && v->firstLayer == 0 &&
+        v->lastLayer == 0) {
+        return true;
+    }
     unsigned vf = (unsigned)v->format;
     if (vf >= sizeof fmt / sizeof fmt[0]) return false;
     if (vf != 0) {

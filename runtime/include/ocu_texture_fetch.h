@@ -21,10 +21,11 @@
  *           mirror step; wrap and mirror without normalized coordinates act
  *           as clamp (API reference, cudaTextureDesc::addressMode).
  *   clamp:  indices clamped to [0, N-1] (coordinates to [0, N)).
- *   border: a coordinate outside [0, N) gives the border value (zero for
- *           texture references, cudaTextureDesc::borderColor for objects);
- *           a linear-filter neighbour outside the texture contributes the
- *           border value.
+ *   border: point sampling at a coordinate outside [0, N) gives the border
+ *           value (zero for texture references, cudaTextureDesc::borderColor
+ *           for objects); linear filtering blends the neighbours T[i], T[i+1]
+ *           and each one outside the texture reads as the border value, so
+ *           x = 4.25 on [10,20,30,40] with border -7 gives 0.25*40 + 0.75*(-7).
  *   wrap:   x -> frac(x); neighbours wrap around.
  *   mirror: x -> frac(x) when floor(x) is even, 1 - frac(x) when odd;
  *           neighbours outside reflect back (-1 -> 0, N -> N-1).
@@ -316,7 +317,9 @@ OCU_TEX_FN bool setup_axis(axis *ax, float c, unsigned int n, int mode, int norm
     ax->mode = mode;
     ax->n = n;
     float x = to_texels(c, n, norm, &ax->mode);
-    if (ax->mode == cudaAddressModeBorder && !(x >= 0.0f && x < (float)n)) return false;
+    /* Point sampling outside the texture is the border value at once; linear
+       filtering still blends the neighbours, those outside reading as border. */
+    if (!linear && ax->mode == cudaAddressModeBorder && !(x >= 0.0f && x < (float)n)) return false;
     if (!linear) {
         ax->i = floor_index(x);
         ax->a = 0.0f;
