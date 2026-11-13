@@ -15,7 +15,17 @@ set(_ocu_cpu_sources
   cpu_exec.c
   cpu_fiber.c
   cpu_blas.c
-  cpu_ops.c)
+  cpu_ops.c
+  cpu_gemm.c
+  cpu_gemm_generic.c
+  cpu_gemm_avx2.c)
+# The op table's GEMM has a variant for x86-64 with AVX2, FMA and F16C,
+# chosen at run time when the processor has them (cpu_gemm.c).
+set(_ocu_gemm_avx2 OFF)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  set(_ocu_gemm_avx2 ON)
+  set_source_files_properties(cpu_gemm_avx2.c PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+endif()
 if(_ocu_fast_switch)
   enable_language(ASM)
   list(APPEND _ocu_cpu_sources cpu_fiber_switch.S)
@@ -33,6 +43,9 @@ target_link_libraries(ocu_backend_cpu PUBLIC ocu_backend_interface Threads::Thre
 target_link_libraries(ocu_backend_cpu PRIVATE ocu_ops_ref)
 if(NOT APPLE)
   target_link_libraries(ocu_backend_cpu PUBLIC m)
+endif()
+if(_ocu_gemm_avx2)
+  target_compile_definitions(ocu_backend_cpu PRIVATE OCU_CPU_GEMM_AVX2)
 endif()
 if(_ocu_fast_switch)
   target_compile_definitions(ocu_backend_cpu PRIVATE OCU_CPU_FAST_SWITCH)

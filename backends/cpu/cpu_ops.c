@@ -3,11 +3,13 @@
  * docs/spec/op-table.md).
  *
  * Every execute is a kernel run through cpu_kernel_launch, so it obeys
- * queue order like any other work. Each block of the kernel computes a
+ * queue order like any other work. GEMM runs the blocked routine of
+ * cpu_gemm.c; for the other operators each block of the kernel computes a
  * range of output rows with the shared reference (backends/ops_ref).
  * The descriptor and pointers travel in the launch arguments, so a plan
  * may be destroyed while work that used it is still queued.
  */
+#include "cpu_gemm.h"
 #include "cpu_internal.h"
 #include "ocu_ops_ref.h"
 
@@ -166,6 +168,11 @@ static ocu_status cpu_op_execute(ocu_op_plan *plan, ocu_queue *queue,
             return OCU_ERR_INVALID_VALUE;
         }
         l.data[i] = t->data;
+    }
+
+    /* GEMM: the blocked routine (cpu_gemm.c) unless OCU_CPU_GEMM=ref. */
+    if (l.desc.op == OCU_OP_GEMM && cpu_gemm_available()) {
+        return cpu_gemm_launch(queue, &l.desc, l.data);
     }
 
     l.rows = ocu_ref_rows(&l.desc);
