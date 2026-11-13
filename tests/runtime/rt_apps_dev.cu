@@ -18,6 +18,12 @@
 #include <type_traits>
 #include <vector>
 
+// Line 154 stores a double literal through an int hint on purpose: it checks
+// that the stored value converts to the pointee type.
+#if defined(__clang__)
+#pragma clang diagnostic ignored "-Wliteral-conversion"
+#endif
+
 namespace cg = cooperative_groups;
 
 static int g_fail, g_checks;
