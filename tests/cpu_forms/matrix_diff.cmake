@@ -1,0 +1,112 @@
+# matrix_diff.cmake: differential run of a CPU-path program over the matrix of
+# docs/cpu-region-loops.md "Tests for an independent session": the program is
+# run with OCU_CPU_FORM=fiber and with each form in FORMS (default: loop), in
+# fixed order and with several random seeds, with warp size WARP, with each
+# OS-thread count in THREADS. For every combination the forms must give
+#   - the same exit code,
+#   - the same standard output (one line per case: name and hash of its
+#     output) and standard error,
+#   - the same device-memory trace (OCU_CPU_TRACE: a hash of all device and
+#     pinned memory after every launch).
+# The program's own checks (exit code) must also pass in every run.
+#
+#   cmake -DRUN=<program> -DNAME=<name> -DWORK=<dir> [-DARGS=<groups>]
+#         [-DWARP=32|64] [-DTHREADS=1;6] [-DSEEDS=3;41;977] [-DFORMS=loop]
+#         [-DEXTRA_ENV=A=1;B=2] [-DSETARCH=.. -DARCH=..] -P matrix_diff.cmake
+cmake_minimum_required(VERSION 3.20)
+foreach(v RUN NAME WORK)
+  if(NOT DEFINED ${v})
+    message(FATAL_ERROR "matrix_diff: ${v} not set")
+  endif()
+endforeach()
+if(NOT DEFINED WARP)
+  set(WARP 32)
+endif()
+if(NOT DEFINED THREADS)
+  set(THREADS "1;6")
+endif()
+if(NOT DEFINED SEEDS)
+  set(SEEDS "3;41;977")
+endif()
+if(NOT DEFINED FORMS)
+  set(FORMS loop)
+endif()
+set(dir ${WORK}/${NAME})
+file(REMOVE_RECURSE ${dir})
+file(MAKE_DIRECTORY ${dir})
+set(prefix)
+if(SETARCH AND ARCH)
+  set(prefix ${SETARCH} ${ARCH} -R)
+endif()
+
+# One run: result variables rc, out, err, trace in the caller's scope.
+function(one_run form order seed threads tag)
+  file(REMOVE ${dir}/${tag}.trace)
+  set(env OCU_CPU_FORM=${form} OCU_CPU_ORDER=${order} OCU_CPU_SEED=${seed}
+          OCU_CPU_THREADS=${threads} OCU_CPU_WARP=${WARP} OCU_CPU_TRACE=${dir}/${tag}.trace)
+  execute_process(
+    COMMAND ${CMAKE_COMMAND} -E env ${env} ${EXTRA_ENV} ${prefix} ${RUN} ${ARGS}
+    RESULT_VARIABLE rc OUTPUT_VARIABLE out ERROR_VARIABLE err TIMEOUT 300)
+  set(trace "")
+  if(EXISTS ${dir}/${tag}.trace)
+    file(READ ${dir}/${tag}.trace trace)
+    string(REGEX REPLACE " form [a-z]+" "" trace "${trace}")
+  endif()
+  file(WRITE ${dir}/${tag}.out "${out}")
+  file(WRITE ${dir}/${tag}.err "${err}")
+  set(rc "${rc}" PARENT_SCOPE)
+  set(out "${out}" PARENT_SCOPE)
+  set(err "${err}" PARENT_SCOPE)
+  set(trace "${trace}" PARENT_SCOPE)
+endfunction()
+
+set(failed 0)
+set(runs 0)
+set(orders "fixed|1")
+foreach(s IN LISTS SEEDS)
+  list(APPEND orders "random|${s}")
+endforeach()
+foreach(thr IN LISTS THREADS)
+  foreach(o IN LISTS orders)
+    string(REPLACE "|" ";" o "${o}")
+    list(GET o 0 ord)
+    list(GET o 1 seed)
+    set(tagbase w${WARP}-t${thr}-${ord}-${seed})
+    one_run(fiber ${ord} ${seed} ${thr} ${tagbase}-fiber)
+    set(rc_f "${rc}")
+    set(out_f "${out}")
+    set(err_f "${err}")
+    set(trace_f "${trace}")
+    string(REGEX MATCHALL "\n" nl "${trace_f}")
+    list(LENGTH nl launches)
+    if(NOT rc_f STREQUAL "0")
+      message(SEND_ERROR "${NAME} ${tagbase}: the fiber form itself fails (exit ${rc_f}); see ${dir}/${tagbase}-fiber.out\n${out_f}")
+      set(failed 1)
+    endif()
+    foreach(form IN LISTS FORMS)
+      one_run(${form} ${ord} ${seed} ${thr} ${tagbase}-${form})
+      math(EXPR runs "${runs}+1")
+      set(what "")
+      if(NOT rc STREQUAL rc_f)
+        string(APPEND what " exit code ${rc_f} vs ${rc};")
+      endif()
+      if(NOT out STREQUAL out_f)
+        string(APPEND what " standard output differs;")
+      endif()
+      if(NOT err STREQUAL err_f)
+        string(APPEND what " standard error differs;")
+      endif()
+      if(NOT trace STREQUAL trace_f)
+        string(APPEND what " device memory after a launch differs;")
+      endif()
+      if(NOT what STREQUAL "")
+        message(SEND_ERROR "${NAME} ${tagbase} ${form}:${what} files in ${dir}")
+        set(failed 1)
+      endif()
+    endforeach()
+  endforeach()
+endforeach()
+if(failed)
+  message(FATAL_ERROR "${NAME}: fiber and ${FORMS} differ or fail")
+endif()
+message(STATUS "${NAME}: ${runs} comparisons (warp ${WARP}, threads ${THREADS}, orders fixed + seeds ${SEEDS}), ${launches} launches in the last trace, all identical")
