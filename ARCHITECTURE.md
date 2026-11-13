@@ -134,6 +134,7 @@ Functions in `cublas_v2.h` do not go through the provider table. The host side i
 - A program links the variant for the target it is built for: `ocu-nvcc -lcublas` (the variant that matches the target), `CUDA::cublas` in CMake (the toolkit's FindCUDAToolkit, the variant that matches `OCU_TARGET`), and inside this repository `ocu_add_cpu_cu_executable(t a.cu LIBRARIES ocu_cublas_cpu)` and `ocu_add_nvidia_cu_executable(t a.cu LIBRARIES ocu_cublas_nvidia)`.
 - NVIDIA's own library is not called, even on the NVIDIA target. The point is that the same kernel serves every target.
 - If a fast path that uses a vendor library becomes necessary, add it through the provider mechanism above (even then, `libs` does not branch on chip name).
+- GEMM first asks the active backend's op table (below, `docs/spec/op-table.md` section 8): when the table's GEMM accepts the exact problem with binary32 accumulation, the backend computes it on the stream's queue (launch ordering rules through `ocu_rt_submit`); everything else (device-mode scalars, pointer-array batches, 64F, alpha 0, refused descriptors) runs on the kernels. The choice depends only on the table's answers. On the CPU backend this replaces 256 fibers per tile with a blocked routine (`backends/cpu/cpu_gemm.c`): 512³ f16 GEMM 75 → 530 GFLOP/s with 8 threads. The NVIDIA backend has no op table, so it keeps the kernels.
 
 ### Op table (`ocu_ops`)
 
@@ -215,6 +216,7 @@ It runs GPU code as is on the CPU. The goal is to check correctness, not speed. 
 | `OCU_CPU_STRICT` | `1` | Treat a thread that finished before a sync as an error | Works |
 | `OCU_CPU_SPIN_US` | integer | How long an idle pool thread watches for a new launch before sleeping (µs). Default 50; 0 sleeps at once | Works |
 | `OCU_CPU_STATS` | `1` | At exit, print per-kernel launches, blocks, fiber switches, waits and time, plus copy time, to standard error | Works |
+| `OCU_CPU_GEMM` | `ref`, `generic` | Op table GEMM of the CPU backend: `ref` uses the row-by-row reference, `generic` the blocked routine without AVX2. Default: blocked, AVX2/FMA/F16C when the processor has them | Works |
 | `OCU_OPENCL_LIBRARY` | file path | Library the OpenCL backend opens. If unset, `libOpenCL.so.1` | Works |
 | `OCU_OPENCL_VERBOSE` | `1` | Reasons for missing devices, build failure logs | Works |
 | `OCU_NPUSIM_SCRATCH_KB` | integer | npusim on-chip memory size. Default 256 | Works |

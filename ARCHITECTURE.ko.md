@@ -133,6 +133,7 @@ libs/blas  ──(get_provider("blas"))──▶  백엔드
 - 프로그램은 자기가 빌드된 대상의 변형을 링크한다: `ocu-nvcc -lcublas`(대상에 맞는 변형), CMake의 `CUDA::cublas`(툴킷의 FindCUDAToolkit, `OCU_TARGET`에 맞는 변형), 이 저장소 안에서는 `ocu_add_cpu_cu_executable(t a.cu LIBRARIES ocu_cublas_cpu)`·`ocu_add_nvidia_cu_executable(t a.cu LIBRARIES ocu_cublas_nvidia)`.
 - 엔비디아의 라이브러리는 NVIDIA 대상에서도 부르지 않는다. 같은 커널이 모든 대상을 맡는 것이 목적이다.
 - 칩 회사 라이브러리를 쓰는 빠른 길이 필요해지면 위의 제공자 방식으로 더한다(그때도 `libs` 안에서 칩 이름으로 가르지 않는다).
+- GEMM은 먼저 활성 백엔드의 연산 표(아래, `docs/spec/op-table.ko.md` 8절)에 묻는다. 표의 GEMM이 그 문제를 binary32 누적으로 받으면 백엔드가 스트림의 대기열에서 계산한다(실행과 같은 순서 규칙, `ocu_rt_submit`). 나머지(장치 모드 스칼라, 포인터 배열 배치, 64F, alpha 0, 거절된 설명자)는 커널로 돈다. 고르는 기준은 표의 답뿐이다. CPU 백엔드에서는 타일마다 파이버 256개 대신 블록 단위 루틴(`backends/cpu/cpu_gemm.c`)이 돈다: 512³ f16 GEMM 8스레드 75 → 530 GFLOP/s. NVIDIA 백엔드는 연산 표가 없어 커널 그대로다.
 
 ### 연산 표 (`ocu_ops`)
 
@@ -214,6 +215,7 @@ GPU 코드를 CPU에서 그대로 실행한다. 속도가 아니라 정확성 �
 | `OCU_CPU_STRICT` | `1` | 동기화 전에 끝난 스레드를 오류로 | 동작 |
 | `OCU_CPU_SPIN_US` | 정수 | 쉬는 묶음 스레드가 잠들기 전 새 실행을 지켜보는 시간(µs). 기본 50, 0이면 바로 잠듦 | 동작 |
 | `OCU_CPU_STATS` | `1` | 끝날 때 커널별 실행 수·블록·파이버 전환·기다림·시간과 복사 시간을 표준 오류로 | 동작 |
+| `OCU_CPU_GEMM` | `ref`, `generic` | CPU 백엔드 연산 표의 GEMM: `ref`는 행 단위 기준 구현, `generic`은 AVX2 없는 블록 루틴. 기본은 블록 루틴(프로세서에 있으면 AVX2·FMA·F16C) | 동작 |
 | `OCU_OPENCL_LIBRARY` | 파일 경로 | OpenCL 백엔드가 여는 라이브러리. 없으면 `libOpenCL.so.1` | 동작 |
 | `OCU_OPENCL_VERBOSE` | `1` | 빠진 장치의 이유, 빌드 실패 기록 | 동작 |
 | `OCU_NPUSIM_SCRATCH_KB` | 정수 | npusim 온칩 메모리 크기. 기본 256 | 동작 |

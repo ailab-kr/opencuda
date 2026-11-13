@@ -1685,6 +1685,22 @@ cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t *config, const void *fu
     return ocu_rt_launch_config_done(config);
 }
 
+cudaError_t ocu_rt_submit(cudaStream_t stream, ocu_rt_submit_fn fn, void *ctx,
+                          ocu_status *status)
+{
+    if (status != NULL) *status = OCU_ERR_NOT_SUPPORTED;
+    if (fn == NULL || status == NULL) return set_error(cudaErrorInvalidValue);
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    submission sub;
+    e = submit_begin(d, stream, &sub);
+    if (e != cudaSuccess) return e;
+    *status = fn(sub.q, ctx);
+    submit_end(&sub);
+    return cudaSuccess;
+}
+
 cudaError_t ocu_rt_launch(ocu_kernel *kernel, const ocu_launch_params *params,
                           cudaStream_t stream)
 {

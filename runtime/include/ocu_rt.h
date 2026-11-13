@@ -28,6 +28,20 @@ cudaError_t ocu_rt_launch(ocu_kernel *kernel, const ocu_launch_params *params,
                           cudaStream_t stream);
 
 /*
+ * Submit work that is not a kernel (for libraries: an operator-table
+ * execute, see docs/spec/op-table.md section 8) to `stream` with the same
+ * ordering rules as a launch. `fn` is called once with the backend queue
+ * of the stream while those rules hold; what it returns is stored in
+ * *status (the runtime does not turn it into an error, so a library can
+ * fall back to another path when the backend refuses). The return value is
+ * the runtime error that prevented the call (no device, a sticky kernel
+ * failure, ...), recorded as the thread's last error, or cudaSuccess.
+ */
+typedef ocu_status (*ocu_rt_submit_fn)(ocu_queue *queue, void *ctx);
+cudaError_t ocu_rt_submit(cudaStream_t stream, ocu_rt_submit_fn fn, void *ctx,
+                          ocu_status *status);
+
+/*
  * Device code registered by compiled host code (runtime/cudart/fatbin.c).
  * OCU_ERR_NOT_FOUND when the address was never registered.
  */
