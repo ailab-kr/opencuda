@@ -361,9 +361,10 @@ cmake --build your-build
 
 ```mermaid
 flowchart LR
-    N1["Now<br/>reference + suite + contract<br/>llama.cpp on CPU, NVIDIA"] --> N2["Next<br/>real non-NVIDIA hardware:<br/>Apple GPU, AMD, Intel, NPUs"]
-    N2 --> N3["Then<br/>'same answer' defined for<br/>floating-point applications"]
-    N3 --> N4["Later<br/>public scoreboard with<br/>third-party submissions"]
+    M1["0.1<br/>first public release"] --> M2["0.2<br/>first non-NVIDIA GPU"]
+    M2 --> M3["0.3<br/>broad application set"]
+    M3 --> M4["0.4<br/>NPU and public scoreboard"]
+    M4 --> M5["1.0<br/>stable contract"]
 ```
 
 1. **Results on real non-NVIDIA hardware.** llama.cpp on Apple GPUs, AMD and
@@ -385,7 +386,7 @@ flowchart LR
 6. **Opening the process.** Public CI, versioned releases, a native MSVC
    build, and a scoreboard that accepts results from other implementations.
 
-Exit measures for each item are in [docs/public/ROADMAP.md](docs/public/ROADMAP.md).
+Milestones and exit measures are in [docs/public/ROADMAP.md](docs/public/ROADMAP.md). No dates are promised.
 
 ## FAQ
 

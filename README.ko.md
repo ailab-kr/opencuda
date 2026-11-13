@@ -347,9 +347,10 @@ cmake --build your-build
 
 ```mermaid
 flowchart LR
-    N1["지금<br/>기준 구현 + 시험 + 규격<br/>CPU·NVIDIA에서 llama.cpp"] --> N2["다음<br/>엔비디아가 아닌 실제 하드웨어:<br/>Apple GPU, AMD, Intel, NPU"]
-    N2 --> N3["그다음<br/>부동소수점 프로그램의<br/>'같은 답' 정의"]
-    N3 --> N4["나중<br/>외부 제출을 받는<br/>공개 성적표"]
+    M1["0.1<br/>첫 공개판"] --> M2["0.2<br/>엔비디아 밖 첫 GPU"]
+    M2 --> M3["0.3<br/>대상 프로그램 확대"]
+    M3 --> M4["0.4<br/>NPU와 공개 성적표"]
+    M4 --> M5["1.0<br/>규격 고정"]
 ```
 
 1. **엔비디아가 아닌 실제 하드웨어에서 낸 결과.** Apple GPU, AMD·Intel GPU, 연산 표를
@@ -365,7 +366,7 @@ flowchart LR
    FFT·난수. PyTorch 수준의 라이브러리(cuDNN, NCCL)는 장기 목표다.
 6. **과정 공개.** 공개 CI, 버전을 매긴 출시, MSVC 직접 빌드, 다른 구현의 결과도 받는 성적표.
 
-항목별 완료 기준은 [docs/public/ROADMAP.ko.md](docs/public/ROADMAP.ko.md)를 본다.
+이정표와 완료 기준은 [docs/public/ROADMAP.ko.md](docs/public/ROADMAP.ko.md)에 있다. 날짜는 약속하지 않는다.
 
 ## 자주 묻는 질문
 
