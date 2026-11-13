@@ -27,6 +27,16 @@ if(OCU_BACKEND_CPU)
   set_tests_properties(cpu_backend_64workers PROPERTIES
     ENVIRONMENT "OCU_CPU_THREADS=64")
 
+  # Hand-made module images: version 2 without / with a whole-block entry,
+  # version 3, a declining entry, a block entry that calls the barrier.
+  add_executable(test_cpu_images backend/test_cpu_images.c)
+  target_link_libraries(test_cpu_images PRIVATE ocu_backend_cpu)
+  add_test(NAME cpu_images COMMAND test_cpu_images)
+  add_test(NAME cpu_images_random COMMAND test_cpu_images)
+  set_tests_properties(cpu_images_random PROPERTIES ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_SEED=11")
+  add_test(NAME cpu_images_threads_warp64 COMMAND test_cpu_images)
+  set_tests_properties(cpu_images_threads_warp64 PROPERTIES ENVIRONMENT "OCU_CPU_THREADS=1;OCU_CPU_WARP=64")
+
   add_executable(test_cpu_warp backend/test_cpu_warp.c)
   target_link_libraries(test_cpu_warp PRIVATE ocu_backend_cpu)
   foreach(mode "warp32;OCU_CPU_WARP=32" "warp64;OCU_CPU_WARP=64"
@@ -925,6 +935,21 @@ if(OCU_BACKEND_NPUSIM)
   endforeach()
 endif()
 
+# ---- tests of the CPU path's two kernel forms: the cases program (cpu_forms/cases.cu)
+if(OCU_BACKEND_CPU)
+  ocu_add_cpu_cu_executable(cpu_form_cases cpu_forms/cases.cu cpu_forms/cases_ext.cu cpu_forms/cases_many.cu)
+  # Random race-free kernels without synchronisation points (cpu_forms/gen_kernels.py),
+  # two generator seeds; each program checks every thread against a host evaluation.
+  foreach(_gs 11 29)
+    set(_gen ${CMAKE_CURRENT_BINARY_DIR}/cpu_forms_gen_${_gs}.cu)
+    add_custom_command(OUTPUT ${_gen}
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/cpu_forms/gen_kernels.py ${_gs} 40 ${_gen}
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cpu_forms/gen_kernels.py)
+    ocu_add_cpu_cu_executable(cpu_form_gen_${_gs} ${_gen})
+    add_test(NAME cpu_forms_gen_${_gs}_plain COMMAND cpu_form_gen_${_gs})
+  endforeach()
+endif()
+
 # ---- the CPU path's two kernel forms (docs/cpu-region-loops.md, stage 1):
 # every CPU-path test program run with OCU_CPU_FORM=fiber and =loop, fixed
 # and random order, must exit the same, print the same and leave the same
@@ -946,4 +971,81 @@ if(OCU_BACKEND_CPU AND OCU_CPU_LOOPS_PLUGIN)
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cpu_forms/form_diff.cmake)
     endif()
   endforeach()
+
+  # Independent tests of the two forms (card backend-cpu, list "블록 통째
+  # 반복문"): the cases program (cpu_forms/cases.cu) over the whole matrix
+  # fiber against loop and dispatch x fixed order and random seeds x warp
+  # 32/64 x 1 and 6 OS threads (cpu_forms/matrix_diff.cmake).
+  if(TARGET cpu_form_cases)
+    set(_cf_dir ${CMAKE_CURRENT_SOURCE_DIR}/cpu_forms)
+    foreach(w 32 64)
+      add_test(NAME cpu_forms_cases_w${w}
+        COMMAND ${CMAKE_COMMAND} -DRUN=$<TARGET_FILE:cpu_form_cases> -DNAME=cases_w${w}
+                -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cpu_forms -DWARP=${w} "-DFORMS=loop;dispatch"
+                -DSETARCH=${OCU_SETARCH} -DARCH=${CMAKE_HOST_SYSTEM_PROCESSOR}
+                -P ${_cf_dir}/matrix_diff.cmake)
+      set_tests_properties(cpu_forms_cases_w${w} PROPERTIES TIMEOUT 1500)
+    endforeach()
+    # strict mode, and the groups that need their own settings
+    add_test(NAME cpu_forms_cases_strict
+      COMMAND ${CMAKE_COMMAND} -DRUN=$<TARGET_FILE:cpu_form_cases> -DNAME=cases_strict
+              -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cpu_forms -DEXTRA_ENV=OCU_CPU_STRICT=1 -DFORMS=loop
+              -DSEEDS=5 -DSETARCH=${OCU_SETARCH} -DARCH=${CMAKE_HOST_SYSTEM_PROCESSOR}
+              -P ${_cf_dir}/matrix_diff.cmake)
+    add_test(NAME cpu_forms_cases_stack
+      COMMAND ${CMAKE_COMMAND} -DRUN=$<TARGET_FILE:cpu_form_cases> -DNAME=cases_stack
+              -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cpu_forms -DARGS=stack -DEXTRA_ENV=OCU_CPU_STACK_KB=64
+              -DTHREADS=1 -DSEEDS= "-DFORMS=loop;dispatch" -DSETARCH=${OCU_SETARCH} -DARCH=${CMAKE_HOST_SYSTEM_PROCESSOR}
+              -P ${_cf_dir}/matrix_diff.cmake)
+    # random order, one form at a time (the loop form does not notice the
+    # overflow there: reported as an expected failure by the program)
+    foreach(f fiber loop)
+      add_test(NAME cpu_forms_cases_stack_random_${f} COMMAND cpu_form_cases stack)
+      set_tests_properties(cpu_forms_cases_stack_random_${f} PROPERTIES ENVIRONMENT
+        "OCU_CPU_STACK_KB=64;OCU_CPU_THREADS=1;OCU_CPU_ORDER=random;OCU_CPU_SEED=7;OCU_CPU_FORM=${f}")
+    endforeach()
+    add_test(NAME cpu_forms_cases_sshared
+      COMMAND ${CMAKE_COMMAND} -DRUN=$<TARGET_FILE:cpu_form_cases> -DNAME=cases_sshared
+              -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cpu_forms -DARGS=sshared -DTHREADS=1 "-DFORMS=loop;dispatch"
+              -DSETARCH=${OCU_SETARCH} -DARCH=${CMAKE_HOST_SYSTEM_PROCESSOR}
+              -P ${_cf_dir}/matrix_diff.cmake)
+    add_test(NAME cpu_forms_cases_many
+      COMMAND ${CMAKE_COMMAND} -DRUN=$<TARGET_FILE:cpu_form_cases> -DNAME=cases_many
+              -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cpu_forms -DARGS=many -DTHREADS=1 -DSEEDS=7 -DFORMS=loop
+              -DSETARCH=${OCU_SETARCH} -DARCH=${CMAKE_HOST_SYSTEM_PROCESSOR}
+              -P ${_cf_dir}/matrix_diff.cmake)
+    add_test(NAME cpu_forms_cases_big
+      COMMAND ${CMAKE_COMMAND} -DRUN=$<TARGET_FILE:cpu_form_cases> -DNAME=cases_big
+              -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cpu_forms -DARGS=big "-DTHREADS=1;6" -DSEEDS= -DFORMS=loop
+              -DSETARCH=${OCU_SETARCH} -DARCH=${CMAKE_HOST_SYSTEM_PROCESSOR}
+              -P ${_cf_dir}/matrix_diff.cmake)
+    set_tests_properties(cpu_forms_cases_big PROPERTIES TIMEOUT 1200)
+    foreach(_gs 11 29)
+      if(TARGET cpu_form_gen_${_gs})
+        add_test(NAME cpu_forms_gen_${_gs}
+          COMMAND ${CMAKE_COMMAND} -DRUN=$<TARGET_FILE:cpu_form_gen_${_gs}> -DNAME=gen_${_gs}
+                  -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cpu_forms "-DFORMS=loop;dispatch"
+                  -DSETARCH=${OCU_SETARCH} -DARCH=${CMAKE_HOST_SYSTEM_PROCESSOR}
+                  -P ${_cf_dir}/matrix_diff.cmake)
+        add_test(NAME cpu_forms_gen_${_gs}_all_loops
+          COMMAND ${CMAKE_COMMAND} -DRUN=$<TARGET_FILE:cpu_form_gen_${_gs}> -P ${_cf_dir}/all_loops.cmake)
+      endif()
+    endforeach()
+    add_test(NAME cpu_forms_last_writer
+      COMMAND ${CMAKE_COMMAND} -DRUN=$<TARGET_FILE:cpu_form_cases> -P ${_cf_dir}/seed_check.cmake)
+    # The plain program in its default form: its own checks
+    add_test(NAME cpu_forms_cases_plain COMMAND cpu_form_cases)
+    set_tests_properties(cpu_forms_cases_plain PROPERTIES ENVIRONMENT "OCU_CPU_FORM=loop")
+    if(NOT WIN32 AND NOT CMAKE_CROSSCOMPILING AND OCU_TOOLKIT_DIR)
+      add_test(NAME cpu_forms_golden
+        COMMAND ${CMAKE_COMMAND} -DNVCC=${OCU_TOOLKIT_DIR}/bin/ocu-nvcc -DSRC=${_cf_dir}
+                -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cpu_forms/golden -P ${_cf_dir}/golden_check.cmake)
+      add_test(NAME cpu_forms_variants
+        COMMAND ${CMAKE_COMMAND} -DNVCC=${OCU_TOOLKIT_DIR}/bin/ocu-nvcc -DSRC=${_cf_dir}
+                -DWORK=${CMAKE_CURRENT_BINARY_DIR}/cpu_forms/variants -DBUILD=${PROJECT_BINARY_DIR}
+                -DINSTALL_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/cpu_forms/variants_install
+                -P ${_cf_dir}/variants.cmake)
+      set_tests_properties(cpu_forms_golden cpu_forms_variants PROPERTIES TIMEOUT 1200)
+    endif()
+  endif()
 endif()
