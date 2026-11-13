@@ -10,3 +10,7 @@ endif()
 if(TARGET ocu_cublas_nvidia)
   ocu_add_nvidia_cu_executable(bench_cublas bench_cublas.cu LIBRARIES ocu_cublas_nvidia ocu_bench)
 endif()
+# The same benchmark on the CPU path (pass small sizes, e.g. 256 512 1024).
+if(TARGET ocu_cublas_cpu)
+  ocu_add_cpu_cu_executable(bench_cublas_cpu bench_cublas.cu LIBRARIES ocu_cublas_cpu ocu_bench)
+endif()

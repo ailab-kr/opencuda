@@ -21,11 +21,15 @@
 #include <cuda_runtime.h>
 
 #include "cublas_v2.h"
+#include "ocu_ops.h"
+#include "ocu_rt.h"
 
 #include <math.h>
+#include <mutex>
 #include <new>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define CB_HD __host__ __device__
 
@@ -38,6 +42,17 @@ struct ocu_cublas_context {
     size_t workspace_bytes;
     float *scratch; /* device memory for host-mode scalar results */
     int sm_count;
+    /* Operator-table GEMM plans (see gemm_by_op), cached per handle. */
+    struct plan_slot {
+        ocu_device *dev;
+        ocu_op_desc desc;
+        ocu_op_plan *plan;
+    };
+    static constexpr int kPlanSlots = 32;
+    std::mutex plans_lock;
+    const ocu_op_table *plans_table;
+    plan_slot plans[kPlanSlots];
+    int plans_next;
 };
 
 namespace {
@@ -551,6 +566,136 @@ double host_scalar(scale s, const void *p)
     }
 }
 
+/* ---- operator-table path -------------------------------------------------
+ * A backend may offer an operator table (docs/spec/op-table.md) whose GEMM
+ * runs the product in its own way (on the CPU backend: a blocked, vectorised
+ * routine instead of 256 GPU threads per tile). Section 8 of that spec is
+ * followed: query the exact descriptor, plan once (cached per handle), and
+ * execute on the stream's queue with the launch ordering rules. Whether this
+ * path is taken depends only on the table's answers, never on which backend
+ * is active; anything the table refuses runs on the kernels above.
+ *
+ * Taken only where the result keeps the kernels' contract: host-mode
+ * scalars, alpha != 0 and k > 0 (so A and B are read), strided rather than
+ * pointer-array batches, and binary32 accumulation (caps.accum_dtype).
+ */
+ocu_dtype op_dtype(cudaDataType_t t)
+{
+    switch (t) {
+    case CUDA_R_32F: return OCU_DT_F32;
+    case CUDA_R_16F: return OCU_DT_F16;
+    case CUDA_R_16BF: return OCU_DT_BF16;
+    default: return OCU_DT_NONE;
+    }
+}
+
+/* Row-major view [rows, cols] with row stride ld (a column-major matrix with
+   leading dimension ld seen from the other side), batched when batch > 1. */
+bool op_matrix(ocu_tensor_desc &d, ocu_dtype dt, int batch, long long bstride, bool may_broadcast,
+               long long rows, long long cols, long long ld)
+{
+    d.dtype = dt;
+    if (batch == 1) {
+        d.rank = 2;
+        d.shape[0] = rows; d.shape[1] = cols;
+        d.stride[0] = ld; d.stride[1] = 1;
+        return true;
+    }
+    if (bstride < 0 || (bstride == 0 && !may_broadcast)) return false;
+    d.rank = 3;
+    d.shape[0] = bstride == 0 ? 1 : batch; /* stride 0: the same matrix for every entry */
+    d.shape[1] = rows; d.shape[2] = cols;
+    d.stride[0] = bstride == 0 ? ld * rows : bstride;
+    d.stride[1] = ld; d.stride[2] = 1;
+    return true;
+}
+
+struct op_submission {
+    const ocu_op_table *t;
+    ocu_op_plan *plan;
+    ocu_tensor ts[3];
+};
+
+ocu_status op_execute(ocu_queue *q, void *ctx)
+{
+    op_submission *s = static_cast<op_submission *>(ctx);
+    return s->t->execute(s->plan, q, s->ts, 3);
+}
+
+/* The cached plan for `d`, planning it (after a query) when new. NULL when
+   the table refuses it. Called with h->plans_lock held. */
+ocu_op_plan *op_plan_for(cublasHandle_t h, const ocu_op_table *t, ocu_device *dev,
+                         const ocu_op_desc &d)
+{
+    if (h->plans_table != nullptr && h->plans_table != t) return nullptr; /* backend changed */
+    for (auto &s : h->plans) {
+        if (s.plan != nullptr && s.dev == dev && memcmp(&s.desc, &d, sizeof d) == 0) return s.plan;
+    }
+    ocu_op_caps caps;
+    if (t->query(dev, &d, &caps) != OCU_OK || caps.accum_dtype != OCU_DT_F32) return nullptr;
+    ocu_op_plan *plan = nullptr;
+    if (t->plan(dev, &d, &plan) != OCU_OK || plan == nullptr) return nullptr;
+    auto &slot = h->plans[h->plans_next];
+    h->plans_next = (h->plans_next + 1) % ocu_cublas_context::kPlanSlots;
+    if (slot.plan != nullptr) t->destroy(slot.plan);
+    slot.dev = dev;
+    slot.desc = d;
+    slot.plan = plan;
+    h->plans_table = t;
+    return plan;
+}
+
+/* true: done (or failed with *status set); false: use the kernels. */
+bool gemm_by_op(cublasHandle_t h, const gemm_params &p, cudaDataType_t at, cudaDataType_t ct,
+                int batch, cublasStatus_t *status)
+{
+    if (p.a_arr != nullptr || p.alpha_dev != nullptr || p.alpha == 0.0 || p.k <= 0) return false;
+    const ocu_dtype in = op_dtype(at), out = op_dtype(ct);
+    if (in == OCU_DT_NONE || out == OCU_DT_NONE) return false;
+    const ocu_backend *b = ocu_rt_backend();
+    const ocu_op_table *t = b != nullptr ? ocu_ops_of(b) : nullptr;
+    if (t == nullptr) return false;
+    ocu_device *dev = ocu_rt_device();
+    if (dev == nullptr) return false;
+
+    /* Column-major C(m x n) = op(A) op(B) is the row-major
+       C'(n x m) = op(B)'(n x k) op(A)'(k x m) (spec section 8). */
+    ocu_op_desc d;
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d;
+    d.op = OCU_OP_GEMM;
+    d.num_tensors = 3;
+    d.p.gemm.trans_a = (uint32_t)p.opb;
+    d.p.gemm.trans_b = (uint32_t)p.opa;
+    d.p.gemm.alpha = (float)p.alpha;
+    d.p.gemm.beta = (float)p.beta;
+    const bool ok =
+        op_matrix(d.tensors[0], in, batch, p.sb, true, p.opb ? p.k : p.n, p.opb ? p.n : p.k, p.ldb) &&
+        op_matrix(d.tensors[1], in, batch, p.sa, true, p.opa ? p.m : p.k, p.opa ? p.k : p.m, p.lda) &&
+        op_matrix(d.tensors[2], out, batch, p.sc, false, p.n, p.m, p.ldc);
+    if (!ok) return false;
+
+    std::lock_guard<std::mutex> guard(h->plans_lock);
+    op_submission s;
+    s.t = t;
+    s.plan = op_plan_for(h, t, dev, d);
+    if (s.plan == nullptr) return false;
+    s.ts[0].data = const_cast<void *>(p.b); s.ts[0].desc = d.tensors[0];
+    s.ts[1].data = const_cast<void *>(p.a); s.ts[1].desc = d.tensors[1];
+    s.ts[2].data = p.c;                     s.ts[2].desc = d.tensors[2];
+    ocu_status st = OCU_ERR_NOT_SUPPORTED;
+    cudaError_t e = ocu_rt_submit(h->stream, op_execute, &s, &st);
+    if (e != cudaSuccess) {
+        *status = from_cuda(e);
+        return true;
+    }
+    /* Refused before anything was queued (for example memory the backend
+       did not allocate): the kernels handle it. */
+    if (st != OCU_OK) return false;
+    *status = CUBLAS_STATUS_SUCCESS;
+    return true;
+}
+
 /* Every GEMM entry point ends here. Pointer arrays (a_arr...) or strides. */
 cublasStatus_t gemm_any(cublasHandle_t h, cublasOperation_t transa, cublasOperation_t transb,
                         int m, int n, int k, const void *alpha, const void *a,
@@ -585,6 +730,8 @@ cublasStatus_t gemm_any(cublasHandle_t h, cublasOperation_t transa, cublasOperat
         p.beta = host_scalar(scale_of(cb), beta);
         if ((p.alpha == 0.0 || k == 0) && p.beta == 1.0) return CUBLAS_STATUS_SUCCESS;
     }
+    cublasStatus_t st;
+    if (gemm_by_op(h, p, at, ct, batch, &st)) return st;
     switch (cb) {
     case combo::s: return launch_gemm<float, float, float, float>(h, p, batch);
 #ifndef OCU_CUBLAS_NO_FP64
@@ -660,6 +807,11 @@ cublasStatus_t cublasDestroy_v2(cublasHandle_t handle)
 {
     if (handle == nullptr) return CUBLAS_STATUS_NOT_INITIALIZED;
     cudaError_t e = cudaFree(handle->scratch); /* waits for work using it */
+    if (handle->plans_table != nullptr) {
+        for (auto &s : handle->plans) {
+            if (s.plan != nullptr) handle->plans_table->destroy(s.plan); /* waits too */
+        }
+    }
     delete handle;
     return e == cudaSuccess ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_INTERNAL_ERROR;
 }
