@@ -231,7 +231,7 @@ static void test_memset3d()
         Bytes init(b.bytes(), 0x3c);
         put(b, init);
         FAILS(cudaMemset3D(p, 0, make_cudaExtent(p.pitch + 1, 1, 1))); CHECK_KEEP(b, init, "memset3D width pitch+1");
-        FAILS(cudaMemset3D(p, 0, make_cudaExtent(1, 1, D + 100000))); XKEEP(b, init, "memset3D depth D+100000 beyond the allocation: error returned but slices were already written");
+        FAILS(cudaMemset3D(p, 0, make_cudaExtent(1, 1, D + 100000))); CHECK_KEEP(b, init, "memset3D depth D+100000 beyond the allocation leaves memory unchanged");
         FAILS(cudaMemset3D(p, 0, make_cudaExtent(~(size_t)0, ~(size_t)0, ~(size_t)0))); CHECK_KEEP(b, init, "memset3D all SIZE_MAX");
         (void)cudaGetLastError();
     }
@@ -443,12 +443,12 @@ static void test_memcpy3d()
         bad.kind = cudaMemcpyDeviceToDevice;
         bad.extent = make_cudaExtent(30, 4, 100);
         EXPECT(cudaMemcpy3D(&bad), cudaErrorInvalidValue);
-        XKEEP(d, db, "memcpy3D depth 100 > allocation: error returned but the first slices were already copied");
+        CHECK_KEEP(d, db, "memcpy3D depth 100 > allocation leaves memory unchanged");
         // offsets that push the box out of the destination
         bad.extent = make_cudaExtent(30, 4, 3);
         bad.dstPos = make_cudaPos(0, 0, 1);
         EXPECT(cudaMemcpy3D(&bad), cudaErrorInvalidValue);
-        XKEEP(d, db, "memcpy3D dstPos z=1 + depth 3 > dst depth 3: error returned but 2 slices already copied");
+        CHECK_KEEP(d, db, "memcpy3D dstPos z=1 + depth 3 > dst depth 3 leaves memory unchanged");
         bad.dstPos = make_cudaPos(0, 0, 0);
         bad.srcPos = make_cudaPos(0, 1, 0);       // 4 rows from row 1 exceeds ysize 4
         EXPECT(cudaMemcpy3D(&bad), cudaErrorInvalidValue);
