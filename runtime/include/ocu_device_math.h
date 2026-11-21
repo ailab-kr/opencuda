@@ -24,7 +24,13 @@
 #ifndef OCU_DEVICE_MATH_H
 #define OCU_DEVICE_MATH_H
 
+#if !defined(__has_include) || (__has_include(<cstdint>) && __has_include(<utility>))
 #include <cstdint>
+#else /* a device pass with no (complete) C++ standard library: the AMD path
+         compiled by the GPU driver's compiler library */
+#include <stdint.h>
+namespace std { using ::int32_t; using ::int64_t; using ::uint32_t; using ::uint64_t; }
+#endif
 
 #include "ocu_device_math_tables.h"
 #include "ocu_fma_exact.h"

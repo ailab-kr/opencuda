@@ -601,6 +601,37 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
       endforeach()
     endif()
   endif()
+  # The AMD backend (HIP runtime). Unmodified .cu files are compiled for the
+  # GPU in the machine by tools/amdgpu/ocu_amd_cc.py through the driver's own
+  # compiler library (amd_comgr); no Clang executable is needed. Exits 77
+  # (skipped) without an AMD GPU and driver.
+  if(OCU_BACKEND_AMD)
+    set(OCU_AMDGPU_ARCH "" CACHE STRING "AMD GPU the AMD tests compile for (empty: the first device's)")
+    set(_ocu_amd_arch "")
+    if(OCU_AMDGPU_ARCH)
+      set(_ocu_amd_arch --arch ${OCU_AMDGPU_ARCH})
+    endif()
+    add_test(NAME amd_lang
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/amd/check_amd_lang.py ${_ocu_amd_arch})
+    set_tests_properties(amd_lang PROPERTIES SKIP_RETURN_CODE 77)
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/amd_img)
+    foreach(_t "probe_kernel|${PROJECT_SOURCE_DIR}/compiler/probe/probe_kernel.cu|test_amd_cu2co"
+               "cu2msl_features|${CMAKE_CURRENT_SOURCE_DIR}/metal/cu2msl_features.cu|test_amd_features")
+      string(REPLACE "|" ";" _t "${_t}")
+      list(GET _t 0 _name)
+      list(GET _t 1 _src)
+      list(GET _t 2 _exe)
+      set(_img ${CMAKE_CURRENT_BINARY_DIR}/amd_img/${_name}.co)
+      add_test(NAME amd_compile_${_name}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/amdgpu/ocu_amd_cc.py ${_ocu_amd_arch}
+                ${_src} -o ${_img})
+      set_tests_properties(amd_compile_${_name} PROPERTIES FIXTURES_SETUP amd_${_name})
+      add_executable(${_exe} amd/${_exe}.c)
+      target_link_libraries(${_exe} PRIVATE ocu_backend_amd)
+      add_test(NAME amd_run_${_name} COMMAND ${_exe} ${_img})
+      set_tests_properties(amd_run_${_name} PROPERTIES FIXTURES_REQUIRED amd_${_name} SKIP_RETURN_CODE 77)
+    endforeach()
+  endif()
   if(OCU_CLANG_GPU_TARGETS)
     # The same compile-time cases for the NVIDIA path (case 8 is only
     # enforceable there: device-only functions called from host code).

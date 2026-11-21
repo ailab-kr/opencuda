@@ -41,7 +41,8 @@ if(OCU_BACKEND_METAL)
 endif()
 
 if(OCU_BACKEND_AMD)
-  message(FATAL_ERROR "The AMD backend is not implemented yet (see backends/amd/README.md).")
+  find_package(Threads REQUIRED)
+  add_subdirectory(amd)
 endif()
 
 if(OCU_BACKEND_INTEL)
