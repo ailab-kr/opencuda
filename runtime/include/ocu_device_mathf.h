@@ -37,7 +37,12 @@
 #ifndef OCU_DEVICE_MATHF_H
 #define OCU_DEVICE_MATHF_H
 
+#if !defined(__has_include) || (__has_include(<cstdint>) && __has_include(<utility>))
 #include <cstdint>
+#else /* see ocu_device_math.h */
+#include <stdint.h>
+namespace std { using ::int32_t; using ::int64_t; using ::uint32_t; using ::uint64_t; }
+#endif
 
 #ifndef OCU_DMF_TABLE
 #define OCU_DMF_TABLE constexpr

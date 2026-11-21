@@ -201,7 +201,8 @@ divergence against the oracle instead
 | **Apple GPU (Metal)** | first cut | Backend tests 53 / 53 on M3 and M1 Pro. The CUDA → Metal Shading Language translator handles 49 of 79 Rodinia kernels. |
 | **OpenCL** | working on PoCL | 103 / 103 tests. Rodinia: 17 build, 14 match. Kernels go through SPIR-V. |
 | **NPU simulator** | design target | No kernel launches, device memory the host cannot touch, a scratchpad limit, counted DMA traffic |
-| AMD, Intel GPUs | device code compiles | no runtime backend yet |
+| **AMD GPUs** | first implementation | Unmodified .cu tests 47 / 47 on a Radeon 780M (gfx1103, Windows, driver only): device code built with the driver's own compiler library, run through the HIP runtime. The C backend is written and type-checked, not yet built ([details](backends/amd/README.md)) |
+| Intel GPUs | device code compiles | no runtime backend yet |
 
 ### Benchmarks and platforms
 

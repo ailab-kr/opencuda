@@ -7,6 +7,7 @@
  *
  *   OCU_CPU_PATH   the CPU path (rewritten .cu compiled as C++17)
  *   __CUDA__       Clang's CUDA mode (host pass and NVPTX device pass)
+ *   __HIP__        Clang's HIP mode: the AMD GPU path (amdgcn device pass)
  *   neither        plain host code: the runtime API only
  */
 #ifndef OCU_CUDA_RUNTIME_H
@@ -18,6 +19,8 @@
 #include "ocu_cuda_lang_cpu.h"
 #elif defined(__CUDA__) && !defined(__HIP__)
 #include "ocu_cuda_lang_nvptx.h"
+#elif defined(__HIP__)
+#include "ocu_cuda_lang_amdgcn.h"
 #endif
 
 /*
@@ -26,7 +29,8 @@
  * kernel's parameter, then the launch goes the way cudaLaunchKernel goes
  * on this path, with the attribute handling of cudaLaunchKernelExC.
  */
-#if defined(__cplusplus) && __cplusplus >= 201402L
+#if defined(__cplusplus) && __cplusplus >= 201402L && \
+    (!defined(__has_include) || (__has_include(<tuple>) && __has_include(<utility>) && __has_include(<type_traits>)))
 #include <tuple>
 #include <type_traits>
 #include <utility>
