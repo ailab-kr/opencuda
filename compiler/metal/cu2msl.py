@@ -91,8 +91,9 @@ def clang_env() -> dict:
 def device_cmd(clang: str, flags: list[str], define: str = "OCU_METAL_PATH") -> list[str]:
     rt = REPO / "runtime" / "include"
     return [clang, "-x", "cuda", "--cuda-device-only", "-nocudainc", "-nocudalib",
-            f"--cuda-path={cuda_path()}", "--cuda-gpu-arch=sm_80", "-std=c++17",
-            f"-I{rt}", "-include", str(rt / "cuda_runtime.h"),
+            f"--cuda-path={cuda_path()}", f"--cuda-gpu-arch={os.environ.get('OCU_CU_DEVICE_ARCH', 'sm_80')}", "-std=c++17",
+            # nvcc defines __CUDACC__ in both passes; Clang only in its own CUDA headers (-nocudainc)
+            "-D__CUDACC__", f"-I{rt}", "-include", str(rt / "cuda_runtime.h"),
             "-include", str(COMPAT / "ocu_metal_legacy_texture.h"), "-include", str(COMPAT / "helper_cuda.h"), f"-D{define}",
             "-Wno-unknown-cuda-version", *flags, "-idirafter", str(COMPAT)]
 

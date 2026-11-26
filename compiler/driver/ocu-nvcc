@@ -227,7 +227,7 @@ def default_target() -> str:
     was called by (ocu-nvcc-cpu, ocu-nvcc-nvidia: links in the toolkit
     folder, so a build system's compiler path fixes the target), else the
     environment variable OCU_TARGET, else cpu."""
-    m = re.fullmatch(r"ocu-nvcc-(cpu|nvidia)", SELF.name)
+    m = re.fullmatch(r"ocu-nvcc-(cpu|nvidia|opencl|intel|spirv)", SELF.name)
     if m:
         return m.group(1)
     return os.environ.get("OCU_TARGET") or "cpu"
@@ -457,8 +457,8 @@ def parse(argv: list[str]) -> SimpleNamespace:
         os.environ.setdefault("OCU_OPENCL_SUBGROUP", "32")
         os.environ.setdefault("OCU_OPENCL_SUBGROUP_OTHER", "16")
         o.target = "opencl"
-    if o.target not in ("cpu", "nvidia", "opencl"):
-        raise UsageError(f"--ocu-target={o.target}: expected cpu, nvidia, opencl or intel")
+    if o.target not in ("cpu", "nvidia", "opencl", "spirv"):
+        raise UsageError(f"--ocu-target={o.target}: expected cpu, nvidia, opencl, intel or spirv")
     for item in o.inputs:   # nvcc: -x applies to every input
         if item[1] is None:
             item[1] = lang_global
@@ -532,7 +532,8 @@ def toolkit_cpu_loops() -> str | None:
 def runtime_link(libdir: Path, blas: bool, target: str = "cpu") -> list[str]:
     # -lcublas: the cublas_v2.h library built for the same target as the
     # CUDA code (libs/cublas), then the internal BLAS layer.
-    names = ([f"ocu_cublas_{target}", "ocu_blas"] if blas else []) + \
+    lib_target = "opencl" if target == "spirv" else target  # the OpenCL backend runs both
+    names = ([f"ocu_cublas_{lib_target}", "ocu_blas"] if blas else []) + \
         ["ocu_cudart", "ocu_core", "ocu_backend_cpu", "ocu_backend_nvidia", "ocu_backend_opencl", "ocu_backend_metal",
          "ocu_backend_npusim", "ocu_ops_ref"]  # ops_ref after the backends that use it
     files = [str(libdir / f"lib{n}.a") for n in names if (libdir / f"lib{n}.a").is_file()]
@@ -644,7 +645,7 @@ class Driver:
         if o.verbose:
             host.append("-v")
         return SimpleNamespace(
-            target=o.target, arch=self.ptx_arch() if o.target == "nvidia" else None,
+            target=o.target, arch=self.ptx_arch() if o.target in ("nvidia", "opencl", "spirv") else None,
             I=[], D=[], O=level, g=o.g or o.G, cache=None, lang=lang, std=o.std,
             pre=list(o.pre), host=host, device=device, deps=deps,
             cxx=self.cxx, cc=self.cc,

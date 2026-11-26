@@ -29,7 +29,7 @@
 
 #include <type_traits>
 
-#if !defined(OCU_CPU_PATH) && !(defined(__CUDA__) && !defined(__HIP__))
+#if !defined(OCU_CPU_PATH) && !defined(OCU_SPIRV_PATH) && !(defined(__CUDA__) && !defined(__HIP__))
 #error "cooperative_groups.h is for device code (CPU path or Clang CUDA mode)"
 #endif
 

@@ -17,6 +17,8 @@
 
 #if defined(OCU_CPU_PATH)
 #include "ocu_cuda_lang_cpu.h"
+#elif defined(OCU_SPIRV_PATH)
+#include "ocu_cuda_lang_spirv.h"
 #elif defined(__CUDA__) && !defined(__HIP__)
 #include "ocu_cuda_lang_nvptx.h"
 #elif defined(__HIP__)
@@ -51,6 +53,17 @@ inline cudaError_t launch(const cudaLaunchConfig_t *config, void (*kernel)(P...)
 }
 } // namespace ocu_launch_ex_
 
+#if defined(OCU_SPIRV_PATH) && defined(__HIP_DEVICE_COMPILE__)
+/* The SPIR-V device pass (Clang in HIP mode for spirv64) gives kernels a
+   calling convention in their type, so `void (*)(P...)` does not match a
+   kernel there; host code is parsed in that pass but never generated, so
+   any kernel is accepted (the host pass has the real function above). */
+template <typename F, typename... ActTypes>
+static inline cudaError_t cudaLaunchKernelEx(const cudaLaunchConfig_t *, F, ActTypes &&...)
+{
+    return cudaSuccess;
+}
+#else
 template <typename... ExpTypes, typename... ActTypes>
 static inline cudaError_t cudaLaunchKernelEx(const cudaLaunchConfig_t *config,
                                              void (*kernel)(ExpTypes...), ActTypes &&...args)
@@ -66,12 +79,13 @@ static inline cudaError_t cudaLaunchKernelEx(const cudaLaunchConfig_t *config,
     return ocu_rt_launch_config_done(config);
 }
 #endif
+#endif
 
 /* OpenCL path (compiler/opencl): device code may call assert(); the C
    library's expansion calls the host function __assert_fail, so both Clang
    passes get a device-side declaration (the generated OpenCL source checks
    assert() with its prelude's macro). */
-#if defined(__cplusplus) && defined(__CUDA__) && (defined(OCU_OPENCL_PATH) || defined(OCU_OPENCL_HOST_PASS)) && \
+#if defined(__cplusplus) && defined(__CUDA__) && (defined(OCU_OPENCL_PATH) || defined(OCU_OPENCL_HOST_PASS) || defined(OCU_SPIRV_PATH)) && \
     !defined(OCU_OPENCL_ASSERT_DECL)
 #define OCU_OPENCL_ASSERT_DECL 1
 __device__ static inline void __assert_fail(const char *, const char *, unsigned int, const char *) {}

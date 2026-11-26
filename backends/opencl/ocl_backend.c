@@ -68,6 +68,9 @@ struct ocu_kernel {
     bool               takes_glob;   /* the variables block is a parameter */
     size_t             byval;        /* >0: packed arguments passed by value, this many bytes */
     uint64_t           svm_gen;      /* allocation table generation last given to the kernel */
+    bool               direct;       /* compiled SPIR-V: one OpenCL argument per CUDA parameter */
+    bool               dyn;          /* direct: one more argument, the launch's dynamic shared memory */
+    char              *ptr_param;    /* direct: per parameter, 1 = global pointer (set as SVM pointer) */
     pthread_mutex_t    lock;         /* argument setting + enqueue is one step */
     struct ocu_kernel *next;
 };
@@ -87,6 +90,7 @@ struct ocu_module {
     size_t             nglobals;
     pthread_mutex_t    lock;
     struct ocu_kernel *kernels;
+    bool               direct;    /* "OCUSPV1": compiled SPIR-V (compiler/spirv), CUDA parameters as they are */
 };
 
 struct ocu_marker {
@@ -753,7 +757,8 @@ static ocu_status ocl_module_load(ocu_device *d, const void *image, size_t bytes
     if (d == NULL) return OCU_ERR_INVALID_HANDLE;
     if (image == NULL || out == NULL || bytes < 8) return OCU_ERR_INVALID_VALUE;
     const char *img = image;
-    if (memcmp(img, "OCUOCL1\n", 8) != 0) return OCU_ERR_INVALID_VALUE;
+    const bool direct = memcmp(img, "OCUSPV1\n", 8) == 0;
+    if (!direct && memcmp(img, "OCUOCL1\n", 8) != 0) return OCU_ERR_INVALID_VALUE;
     const char *sep = NULL;
     for (size_t i = 8; i + 4 <= bytes; ++i) {
         if (img[i - 1] == '\n' && memcmp(img + i, "---\n", 4) == 0) {
@@ -773,6 +778,7 @@ static ocu_status ocl_module_load(ocu_device *d, const void *image, size_t bytes
     memcpy(m->meta, img + 8, meta_len);
     m->meta[meta_len] = '\0';
     m->dev = d;
+    m->direct = direct;
     unsigned long long src_len = 0, spv_len = 0, clc_len = 0;
     for (const char *l = m->meta; *l; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : l + strlen(l)) {
         if (strncmp(l, "source ", 7) == 0) src_len = strtoull(l + 7, NULL, 10);
@@ -874,6 +880,39 @@ static ocu_status ocl_module_unload(ocu_module *m)
     return st;
 }
 
+/* "sparam <name> <p8|vN>... [dyn]" of a compiled SPIR-V module (compiler/spirv/cu2spv.py) */
+static void parse_sparams(struct ocu_kernel *k, const char *meta)
+{
+    size_t len = strlen(k->name);
+    for (const char *line = meta; line != NULL && *line;
+         line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL) {
+        if (strncmp(line, "sparam ", 7) != 0 || strncmp(line + 7, k->name, len) != 0 ||
+            (line[7 + len] != ' ' && line[7 + len] != '\n' && line[7 + len] != '\0'))
+            continue;
+        const char *p = line + 7 + len;
+        size_t sizes[256];
+        char ptr[256];
+        uint32_t n = 0;
+        while (*p == ' ' && n < 256) {
+            ++p;
+            if (strncmp(p, "dyn", 3) == 0) { k->dyn = true; p += 3; continue; }
+            if (*p != 'p' && *p != 'v') break;
+            ptr[n] = *p == 'p';
+            char *end;
+            sizes[n] = strtoul(p + 1, &end, 10);
+            p = end;
+            ++n;
+        }
+        k->param_sizes = n ? malloc(n * sizeof(size_t)) : NULL;
+        k->ptr_param = n ? malloc(n) : NULL;
+        if (n && (k->param_sizes == NULL || k->ptr_param == NULL)) return;
+        if (n) { memcpy(k->param_sizes, sizes, n * sizeof(size_t)); memcpy(k->ptr_param, ptr, n); }
+        k->nparams = n;
+        k->direct = true;
+        return;
+    }
+}
+
 static void parse_params(struct ocu_kernel *k, const char *meta)
 {
     size_t len = strlen(k->name);
@@ -940,8 +979,8 @@ static ocu_status ocl_module_get_kernel(ocu_module *m, const char *name, ocu_ker
         cl_uint nargs = 0;
         a->GetKernelInfo(ck, CL_KERNEL_NUM_ARGS, sizeof(nargs), &nargs, NULL);
         pthread_mutex_init(&k->lock, NULL);
-        parse_params(k, m->meta);
-        k->takes_glob = k->byval ? nargs == 3 : nargs == 4;
+        if (m->direct) parse_sparams(k, m->meta); else parse_params(k, m->meta);
+        k->takes_glob = !k->direct && (k->byval ? nargs == 3 : nargs == 4);
         k->next = m->kernels;
         m->kernels = k;
         *out = k;
@@ -1084,6 +1123,37 @@ static ocu_status finish_launch(ocu_queue *queue, ocu_queue *q, ocu_kernel *k, c
     return st;
 }
 
+/* Compiled SPIR-V: each CUDA parameter is an OpenCL kernel argument; global
+   pointers go as SVM pointers, everything else by value; the launch's dynamic
+   shared memory is one more (local) argument. */
+static ocu_status launch_direct(ocu_queue *queue, ocu_queue *q, ocu_kernel *k, const ocu_launch_params *p)
+{
+    ocu_device *d = k->module->dev;
+    if (p->num_args != k->nparams) return OCU_ERR_INVALID_VALUE;
+    const ocl_api *a = ocl_load();
+    size_t global[3] = {(size_t)p->grid[0] * p->block[0], (size_t)p->grid[1] * p->block[1],
+                        (size_t)p->grid[2] * p->block[2]};
+    size_t local[3] = {p->block[0], p->block[1], p->block[2]};
+    size_t dyn = (p->shared_memory_bytes + 15) / 16 * 16;
+    cl_event ev = NULL;
+    cl_int err = CL_SUCCESS;
+    pthread_mutex_lock(&k->lock);
+    for (uint32_t i = 0; i < p->num_args && err == CL_SUCCESS; ++i) {
+        if (k->ptr_param[i]) {
+            void *ptr = NULL;
+            memcpy(&ptr, p->args[i], sizeof ptr);
+            err = a->SetKernelArgSVMPointer(k->k, i, ptr);
+        } else {
+            err = a->SetKernelArg(k->k, i, k->param_sizes[i], p->args[i]);
+        }
+    }
+    if (err == CL_SUCCESS && k->dyn) err = a->SetKernelArg(k->k, p->num_args, dyn < 16 ? 16 : dyn, NULL);
+    if (err == CL_SUCCESS) err = set_svm_ptrs(k, d);
+    if (err == CL_SUCCESS) err = a->EnqueueNDRangeKernel(queue->q, k->k, 3, NULL, global, local, 0, NULL, &ev);
+    pthread_mutex_unlock(&k->lock);
+    return finish_launch(queue, q, k, err, ev);
+}
+
 /* Arguments by value: the packed values are one kernel argument (the
    translator fixed the offsets), no buffer per launch. */
 static ocu_status launch_byval(ocu_queue *queue, ocu_queue *q, ocu_kernel *k, const ocu_launch_params *p,
@@ -1145,6 +1215,7 @@ static ocu_status ocl_kernel_launch(ocu_queue *q, ocu_kernel *k, const ocu_launc
         total = (total + a - 1) / a * a + p->arg_sizes[i];
         if (total > OCU_MAX_ARG_BYTES) return OCU_ERR_INVALID_VALUE;
     }
+    if (k->direct) return launch_direct(queue, q, k, p);
     if (k->byval) return launch_byval(queue, q, k, p, total);
     unsigned char *packed = calloc(1, total + 16);
     uint32_t *offsets = calloc(p->num_args + 1, sizeof(uint32_t));
