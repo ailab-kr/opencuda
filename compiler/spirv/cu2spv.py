@@ -261,6 +261,58 @@ def rewrite(ll: str) -> tuple[str, list[str]]:
     return out, meta
 
 
+GLOBAL_P2I = re.compile(r"^\s*(%[\w.]+) = ptrtoint ptr addrspace\(1\) (%[\w.]+) to i64$", re.M)
+GENERIC_I2P = re.compile(r"^\s*(%[\w.]+) = inttoptr i64 (%[\w.]+) to ptr addrspace\(4\)$", re.M)
+
+
+def global_pointers(ll: str) -> str:
+    """Clang's HIP mode turns each global pointer argument into a generic one
+    through an integer (ptrtoint + inttoptr). That hides the address space:
+    every load and store becomes a generic one, which the driver must test
+    for local memory at run time. As an addrspacecast instead, LLVM's
+    InferAddressSpaces gives the accesses back their global address space."""
+    # Value names are local to a function: one function at a time.
+    parts = re.split(r"(?m)^(?=define )", ll)
+    out = []
+    for part in parts:
+        p2i = dict(GLOBAL_P2I.findall(part))
+
+        def cast(m):
+            dst, src = m.group(1), m.group(2)
+            if src not in p2i:
+                return m.group(0)
+            return f"  {dst} = addrspacecast ptr addrspace(1) {p2i[src]} to ptr addrspace(4)"
+        out.append(GENERIC_I2P.sub(cast, part) if p2i else part)
+    return "".join(out)
+
+
+DIV64 = re.compile(r"^(\s*)(%[\w.]+) = (sdiv|udiv|srem|urem)(?: exact)? i64 ([^,]+), (.+)$", re.M)
+
+
+def _div_helper(op: str) -> str:
+    # 32-bit fast path when both operands are small and non-negative (the
+    # signed ops need < 2^31), as NVPTX's BypassSlowDivision does: Intel GPUs
+    # have no 64-bit divide, the driver emulates it.
+    u = op[0] == "u"
+    shift = 32 if u else 31
+    op32 = "udiv" if op.endswith("div") else "urem"
+    return (f"define internal i64 @__ocu_{op}64(i64 %a, i64 %b) alwaysinline {{\n"
+            f"  %o = or i64 %a, %b\n  %h = lshr i64 %o, {shift}\n  %s = icmp eq i64 %h, 0\n"
+            f"  br i1 %s, label %f, label %l\nf:\n  %a32 = trunc i64 %a to i32\n  %b32 = trunc i64 %b to i32\n"
+            f"  %q32 = {op32} i32 %a32, %b32\n  %q = zext i32 %q32 to i64\n  ret i64 %q\n"
+            f"l:\n  %q2 = {op} i64 %a, %b\n  ret i64 %q2\n}}\n")
+
+
+def bypass_div64(ll: str) -> str:
+    used = set()
+
+    def call(m):
+        used.add(m.group(3))
+        return f"{m.group(1)}{m.group(2)} = call i64 @__ocu_{m.group(3)}64(i64 {m.group(4)}, i64 {m.group(5)})"
+    ll = DIV64.sub(call, ll)
+    return ll + "\n" + "".join(_div_helper(op) for op in sorted(used))
+
+
 def main(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
@@ -274,7 +326,7 @@ def main(argv):
     llvm_as = tool("llvm-as", "OCU_SPV_LLVM_AS")
     llc = tool("llc", "OCU_SPV_LLC")
     # SPIR-V extensions the OpenCL drivers take (all of them would add ones a driver refuses)
-    ext = os.environ.get("OCU_SPV_EXT", "+SPV_EXT_shader_atomic_float_add,+SPV_KHR_no_integer_wrap_decoration,+SPV_INTEL_subgroups")
+    ext = os.environ.get("OCU_SPV_EXT", "+SPV_EXT_shader_atomic_float_add,+SPV_KHR_no_integer_wrap_decoration,+SPV_INTEL_subgroups,+SPV_KHR_integer_dot_product")
     arch = int(re.sub(r"\D", "", a.arch) or 80) * 10
     with tempfile.TemporaryDirectory() as tmp:
         t = Path(a.keep) if a.keep else Path(tmp)
@@ -301,8 +353,19 @@ def main(argv):
         if not meta:
             Path(a.o).write_bytes(b"OCUSPV1\n---\n")
             return 0
+        infer = os.environ.get("OCU_SPV_INFER", "1") != "0"
+        if infer:
+            text = global_pointers(text)
+        div = infer and os.environ.get("OCU_SPV_DIV64", "1") != "0"
+        if div:
+            text = bypass_div64(text)
         ll2.write_text(text)
-        r = subprocess.run([llvm_as, str(ll2), "-o", str(bc)], capture_output=True, text=True)
+        opt = os.environ.get("OCU_SPV_OPT") or str(Path(llc).with_name("opt"))
+        if infer and Path(opt).exists():
+            r = subprocess.run([opt, "-passes=always-inline,infer-address-spaces,instcombine,simplifycfg", str(ll2), "-o", str(bc)],
+                               capture_output=True, text=True)
+        else:
+            r = subprocess.run([llvm_as, str(ll2), "-o", str(bc)], capture_output=True, text=True)
         if r.returncode:
             sys.stderr.write("cu2spv: the adjusted IR does not assemble:\n" + r.stderr[-3000:])
             return 1

@@ -102,6 +102,10 @@ typedef enum ocu_op {
  * GEMM, shape[0] of a row or element-wise output) is the largest; execute
  * may pass fewer rows. */
 #define OCU_OP_FLAG_VAR_ROWS 0x1u
+/* PTR_ARRAY (GEMM): each tensor's data is a device array of shape[0]
+ * pointers, one matrix per batch entry (cublas*Batched); stride[0] is
+ * ignored. A backend that does not take it refuses the descriptor. */
+#define OCU_OP_FLAG_PTR_ARRAY 0x2u
 
 typedef struct ocu_op_desc {
     uint32_t        struct_size; /* sizeof(ocu_op_desc) of the caller */

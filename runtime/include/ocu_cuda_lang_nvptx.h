@@ -271,6 +271,30 @@ OCU_D unsigned __umul24(unsigned a, unsigned b) { return __nvvm_mul24_ui(a, b); 
 OCU_D int __mulhi(int a, int b) { return __nvvm_mulhi_i(a, b); }
 OCU_D unsigned __umulhi(unsigned a, unsigned b) { return __nvvm_mulhi_ui(a, b); }
 OCU_D long long __mul64hi(long long a, long long b) { return __nvvm_mulhi_ll(a, b); }
+/* Byte-wise dot product with accumulate: the dp4a instruction from sm_61. */
+OCU_D int __dp4a(int a, int b, int c)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+    int r;
+    asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
+    return r;
+#else
+    unsigned r = (unsigned)c;
+    for (int i = 0; i < 32; i += 8) r += (unsigned)((int)(signed char)(a >> i) * (int)(signed char)(b >> i));
+    return (int)r;
+#endif
+}
+OCU_D unsigned __dp4a(unsigned a, unsigned b, unsigned c)
+{
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+    unsigned r;
+    asm("dp4a.u32.u32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
+    return r;
+#else
+    for (int i = 0; i < 32; i += 8) c += ((a >> i) & 255u) * ((b >> i) & 255u);
+    return c;
+#endif
+}
 OCU_D unsigned long long __umul64hi(unsigned long long a, unsigned long long b) { return __nvvm_mulhi_ull(a, b); }
 /* 3-bit byte indices only: PTX prmt treats the fourth bit of a selector nibble as
    "replicate the sign", which __byte_perm does not do. */

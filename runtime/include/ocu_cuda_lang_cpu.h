@@ -499,6 +499,18 @@ inline unsigned __brev(unsigned v)
     return r;
 }
 inline int __mul24(int a, int b) { return a * b; }
+/* Byte-wise dot product with accumulate (sm_61), wrapping like the hardware. */
+inline int __dp4a(int a, int b, int c)
+{
+    unsigned r = (unsigned)c;
+    for (int i = 0; i < 32; i += 8) r += (unsigned)((int)(signed char)(a >> i) * (int)(signed char)(b >> i));
+    return (int)r;
+}
+inline unsigned __dp4a(unsigned a, unsigned b, unsigned c)
+{
+    for (int i = 0; i < 32; i += 8) c += ((a >> i) & 255u) * ((b >> i) & 255u);
+    return c;
+}
 inline unsigned __umul24(unsigned a, unsigned b) { return a * b; }
 
 /* ---- device intrinsics shared with the NVPTX path ---------------------------- */

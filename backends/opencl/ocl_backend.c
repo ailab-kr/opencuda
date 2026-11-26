@@ -20,6 +20,19 @@
 
 /* ---- objects ---------------------------------------------------------------- */
 
+/* OCU_OPENCL_HOSTPROF=1: host time spent in each backend entry, printed at exit. */
+#include <time.h>
+enum { HP_LAUNCH, HP_ARGS, HP_SVM, HP_ENQ, HP_FIN, HP_COPY, HP_SET, HP_SYNC, HP_MARK, HP_ALLOC, HP_FREE, HP_N };
+static const char *hp_names[HP_N] = {"launch(total)", " .args", " .svm_ptrs", " .enqueue", " .finish", "mem_copy", "mem_set", "queue_sync", "marker", "alloc", "free"};
+static double hp_t[HP_N]; static unsigned long hp_c[HP_N]; static double hp_first, hp_last;
+static int hp_on_v = -1;
+static inline double hp_now(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec*1e6+ts.tv_nsec*1e-3; }
+static void hp_report(void){ fprintf(stderr,"ocu opencl hostprof: span %.1f ms\n",(hp_last-hp_first)/1e3);
+  for(int i=0;i<HP_N;i++) if(hp_c[i]) fprintf(stderr,"  %-14s %8lu x %8.2f us = %9.1f ms\n",hp_names[i],hp_c[i],hp_t[i]/hp_c[i],hp_t[i]/1e3); }
+static inline int hp_on(void){ if(hp_on_v<0){ const char*e=getenv("OCU_OPENCL_HOSTPROF"); hp_on_v=e&&*e=='1'; if(hp_on_v) atexit(hp_report);} return hp_on_v; }
+#define HP_B(id) double hp_s_##id = hp_on() ? hp_now() : 0
+#define HP_E(id) do{ if(hp_on_v>0){ double e_=hp_now(); hp_t[id]+=e_-hp_s_##id; hp_c[id]++; if(!hp_first) hp_first=hp_s_##id; hp_last=e_; } }while(0)
+
 typedef struct ocl_alloc {
     char  *ptr;   /* SVM address: the same for host-side calls and kernels */
     size_t size;
@@ -294,7 +307,16 @@ static ocu_status ocl_dev_info(uint32_t index, ocu_dev_info *info)
 
 static ocu_status ocl_queue_create(ocu_device *d, ocu_queue **out);
 static ocu_status ocl_queue_destroy(ocu_queue *q);
+static ocu_status ocl_kernel_launch(ocu_queue *q, ocu_kernel *k, const ocu_launch_params *p);
+static ocu_status ocl_mem_copy(ocu_device *d, ocu_queue *q, void *dst, const void *src, size_t bytes, ocu_copy_dir dir);
+static ocu_status ocl_mem_set(ocu_device *d, ocu_queue *q, void *dst, int value, size_t bytes);
 static ocu_status ocl_queue_sync(ocu_queue *q);
+static ocu_status ocl_marker_record(ocu_marker *m, ocu_queue *q);
+static ocu_status ocl_mem_alloc(ocu_device *d, size_t bytes, void **ptr);
+static ocu_status ocl_mem_free(ocu_device *d, void *ptr);
+static int trace_on(void);
+static void trace_add_name(const char *name, cl_event ev);
+static ocu_status ocl_queue_sync_impl(ocu_queue *q);
 
 static ocu_status map_err(cl_int e)
 {
@@ -415,7 +437,7 @@ static cl_int event_status(cl_event ev)
     return s;
 }
 
-static ocu_status ocl_queue_sync(ocu_queue *q)
+static ocu_status ocl_queue_sync_impl(ocu_queue *q)
 {
     if (q == NULL) return OCU_ERR_INVALID_HANDLE;
     const ocl_api *a = ocl_load();
@@ -567,7 +589,7 @@ static ocu_status alloc_svm(ocu_device *d, size_t bytes, cl_svm_mem_flags flags,
     return OCU_OK;
 }
 
-static ocu_status ocl_mem_alloc(ocu_device *d, size_t bytes, void **ptr)
+static ocu_status ocl_mem_alloc_impl(ocu_device *d, size_t bytes, void **ptr)
 {
     return alloc_svm(d, bytes, 0, ptr);
 }
@@ -580,7 +602,7 @@ static ocu_status ocl_mem_alloc_shared(ocu_device *d, size_t bytes, void **ptr)
     return alloc_svm(d, bytes, CL_MEM_SVM_FINE_GRAIN_BUFFER, ptr);
 }
 
-static ocu_status ocl_mem_free(ocu_device *d, void *ptr)
+static ocu_status ocl_mem_free_impl(ocu_device *d, void *ptr)
 {
     if (d == NULL) return OCU_ERR_INVALID_HANDLE;
     if (ptr == NULL) return OCU_OK;
@@ -605,7 +627,7 @@ static ocu_status finish_enqueue(ocu_queue *queue, bool sync, cl_int err, cl_eve
     return st;
 }
 
-static ocu_status ocl_mem_copy(ocu_device *d, ocu_queue *q, void *dst, const void *src, size_t bytes,
+static ocu_status ocl_mem_copy_impl(ocu_device *d, ocu_queue *q, void *dst, const void *src, size_t bytes,
                                ocu_copy_dir dir)
 {
     if (d == NULL || (q != NULL && q->dev != d)) return OCU_ERR_INVALID_HANDLE;
@@ -625,10 +647,11 @@ static ocu_status ocl_mem_copy(ocu_device *d, ocu_queue *q, void *dst, const voi
     cl_event ev = NULL;
     cl_int err = ocl_load()->EnqueueSVMMemcpy(queue->q, q == NULL ? CL_TRUE : CL_FALSE, dst, src, bytes,
                                               0, NULL, &ev);
+    if (err == CL_SUCCESS && trace_on()) trace_add_name(dir == OCU_COPY_HOST_TO_DEVICE ? (bytes < 4096 ? "[memcpy H2D <4K]" : bytes < 65536 ? "[memcpy H2D <64K]" : bytes < (1 << 20) ? "[memcpy H2D <1M]" : bytes < (16 << 20) ? "[memcpy H2D <16M]" : "[memcpy H2D >=16M]") : dir == OCU_COPY_DEVICE_TO_HOST ? "[memcpy D2H]" : "[memcpy D2D]", ev);
     return finish_enqueue(queue, q == NULL, err, ev);
 }
 
-static ocu_status ocl_mem_set(ocu_device *d, ocu_queue *q, void *dst, int value, size_t bytes)
+static ocu_status ocl_mem_set_impl(ocu_device *d, ocu_queue *q, void *dst, int value, size_t bytes)
 {
     if (d == NULL || (q != NULL && q->dev != d)) return OCU_ERR_INVALID_HANDLE;
     if (bytes == 0) return OCU_OK;
@@ -1065,7 +1088,9 @@ static void trace_report(void)
     typedef struct { const char *name; double us; size_t n; } agg;
     agg *g = calloc(trace_n + 1, sizeof(agg));
     size_t ng = 0;
-    double total = 0;
+    double total = 0, gap_small = 0, gap_mid = 0, gap_big = 0;
+    size_t n_small = 0, n_mid = 0, n_big = 0;
+    cl_ulong prev_end = 0, first_start = 0;
     for (size_t i = 0; i < trace_n; ++i) {
         cl_ulong t0 = 0, t1 = 0;
         a->WaitForEvents(1, &trace_v[i].ev);
@@ -1073,6 +1098,12 @@ static void trace_report(void)
         a->GetEventProfilingInfo(trace_v[i].ev, CL_PROFILING_COMMAND_END, sizeof(t1), &t1, NULL);
         double us = (t1 - t0) / 1e3;
         total += us;
+        if (i > 0 && prev_end && t0 >= prev_end) {
+            double gap = (t0 - prev_end) / 1e3;
+            if (gap < 50) { gap_small += gap; n_small++; } else if (gap < 1000) { gap_mid += gap; n_mid++; } else { gap_big += gap; n_big++; }
+        }
+        if (t1 > prev_end) prev_end = t1;
+        if (i == 0) first_start = t0;
         size_t j = 0;
         while (j < ng && strcmp(g[j].name, trace_v[i].name) != 0) ++j;
         if (j == ng) { g[ng].name = trace_v[i].name; ++ng; }
@@ -1083,6 +1114,8 @@ static void trace_report(void)
         for (size_t j = i + 1; j < ng; ++j)
             if (g[j].us > g[i].us) { agg t = g[i]; g[i] = g[j]; g[j] = t; }
     fprintf(stderr, "ocu opencl trace: %zu launches, %.1f ms of kernel time\n", trace_n, total / 1e3);
+    fprintf(stderr, "ocu opencl trace: GPU span %.1f ms; gaps <50us: %zu x %.2f us = %.1f ms, 50us-1ms: %zu = %.1f ms, >1ms: %zu = %.1f ms\n",
+            (prev_end - first_start) / 1e6, n_small, n_small ? gap_small / n_small : 0, gap_small / 1e3, n_mid, gap_mid / 1e3, n_big, gap_big / 1e3);
     for (size_t i = 0; i < ng && i < 25; ++i)
         fprintf(stderr, "  %6.2f%%  %9.1f us  %6zu x  %8.1f us/launch  %s\n", 100 * g[i].us / total, g[i].us, g[i].n,
                 g[i].us / g[i].n, g[i].name);
@@ -1138,6 +1171,7 @@ static ocu_status launch_direct(ocu_queue *queue, ocu_queue *q, ocu_kernel *k, c
     cl_event ev = NULL;
     cl_int err = CL_SUCCESS;
     pthread_mutex_lock(&k->lock);
+    HP_B(HP_ARGS);
     for (uint32_t i = 0; i < p->num_args && err == CL_SUCCESS; ++i) {
         if (k->ptr_param[i]) {
             void *ptr = NULL;
@@ -1148,10 +1182,16 @@ static ocu_status launch_direct(ocu_queue *queue, ocu_queue *q, ocu_kernel *k, c
         }
     }
     if (err == CL_SUCCESS && k->dyn) err = a->SetKernelArg(k->k, p->num_args, dyn < 16 ? 16 : dyn, NULL);
+    HP_E(HP_ARGS); HP_B(HP_SVM);
     if (err == CL_SUCCESS) err = set_svm_ptrs(k, d);
+    HP_E(HP_SVM); HP_B(HP_ENQ);
     if (err == CL_SUCCESS) err = a->EnqueueNDRangeKernel(queue->q, k->k, 3, NULL, global, local, 0, NULL, &ev);
+    HP_E(HP_ENQ);
     pthread_mutex_unlock(&k->lock);
-    return finish_launch(queue, q, k, err, ev);
+    HP_B(HP_FIN);
+    ocu_status fst = finish_launch(queue, q, k, err, ev);
+    HP_E(HP_FIN);
+    return fst;
 }
 
 /* Arguments by value: the packed values are one kernel argument (the
@@ -1189,7 +1229,7 @@ static ocu_status launch_byval(ocu_queue *queue, ocu_queue *q, ocu_kernel *k, co
     return finish_launch(queue, q, k, err, ev);
 }
 
-static ocu_status ocl_kernel_launch(ocu_queue *q, ocu_kernel *k, const ocu_launch_params *p)
+static ocu_status ocl_kernel_launch_impl(ocu_queue *q, ocu_kernel *k, const ocu_launch_params *p)
 {
     if (k == NULL) return OCU_ERR_INVALID_HANDLE;
     if (p == NULL || (p->num_args > 0 && (p->args == NULL || p->arg_sizes == NULL))) {
@@ -1306,7 +1346,7 @@ static ocu_status ocl_marker_destroy(ocu_marker *m)
 }
 
 /* A marker command completes after the queue's earlier work. */
-static ocu_status ocl_marker_record(ocu_marker *m, ocu_queue *q)
+static ocu_status ocl_marker_record_impl(ocu_marker *m, ocu_queue *q)
 {
     if (m == NULL || (q != NULL && q->dev != m->dev)) return OCU_ERR_INVALID_HANDLE;
     const ocl_api *a = ocl_load();
@@ -1429,9 +1469,18 @@ static const char k_sgemm_src[] =
     "    const int ks = (int)(get_group_id(2) % S);\n"
     "    const int kbeg = ks * kc, kend = min(K, kbeg + kc);\n"
     "    const long cz = get_group_id(2);\n"
+    "#ifndef PARR\n"
+    "#define PARR 0\n"
+    "#endif\n"
+    "#if PARR\n"
+    "    global const float *A = ((global const float *global const *)A0)[bz];\n"
+    "    global const float *B = ((global const float *global const *)B0)[bz];\n"
+    "    global float *C = ((global float *global const *)C0)[bz];\n"
+    "#else\n"
     "    global const float *A = A0 + bz * sa;\n"
     "    global const float *B = B0 + bz * sb;\n"
     "    global float *C = C0 + (S > 1 ? cz : bz) * sc;\n"
+    "#endif\n"
     "    float acc[TM][TN];\n"
     "    for (int i = 0; i < TM; ++i)\n"
     "        for (int j = 0; j < TN; ++j) acc[i][j] = 0.0f;\n"
@@ -1554,13 +1603,23 @@ static const char k_hgemm_src[] =
     "    const int sgm = sg % SGM, sgn = sg / SGM;\n"
     "    const int n0 = get_group_id(0) * BN, m0 = get_group_id(1) * BM;\n"
     "    const long bz = get_group_id(2);\n"
+    "#if PARR\n"
+    "    global const ushort *A = ((global const ushort *global const *)A0)[bz];\n"
+    "    global const ushort *B = ((global const ushort *global const *)B0)[bz];\n"
+    "#else\n"
     "    global const ushort *A = A0 + bz * sa;\n"
     "    global const ushort *B = B0 + bz * sb;\n"
+    "#endif\n"
     "    // OUT: 0 f32, 1 f16, 2 bf16 (round to nearest even)\n"
-    "#if OUT == 0\n"
-    "    global float *C = (global float *)C0v + bz * sc;\n"
+    "#if PARR\n"
+    "    global void *Cb = ((global void *global const *)C0v)[bz];\n"
     "#else\n"
-    "    global ushort *C = (global ushort *)C0v + bz * sc;\n"
+    "    global void *Cb = C0v;\n"
+    "#endif\n"
+    "#if OUT == 0\n"
+    "    global float *C = (global float *)Cb + (PARR ? 0 : bz * sc);\n"
+    "#else\n"
+    "    global ushort *C = (global ushort *)Cb + (PARR ? 0 : bz * sc);\n"
     "#endif\n"
     "    float8 acc[4][4];\n"
     "    for (int i = 0; i < 4; ++i)\n"
@@ -1690,6 +1749,86 @@ static const char k_hgemm_src[] =
     "    }\n"
     "}\n";
 
+static const char k_hgemm4_src[] =
+    "// XMX GEMM with 2D block loads (Xe2, cl_intel_subgroup_2d_block_io): no shared memory; the\n"
+    "// hardware reads A tiles in DPAS layout and B ([N x K] rows) transposed into VNNI pairs.\n"
+    "// Row-major C[MxN] = alpha * A[MxK] * B[NxK]^T + beta * C. Conditions (checked by the host):\n"
+    "// K, lda, ldb multiples of 8; A, B (and batch strides) 64-byte aligned; K >= 32.\n"
+    "#pragma OPENCL EXTENSION cl_intel_subgroup_2d_block_io : enable\n"
+    "#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable\n"
+    "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n"
+    "#define TM 32\n"
+    "#define TN 64\n"
+    "#define WM (SGM * TM)\n"
+    "#define WN (SGN * TN)\n"
+    "#if BF16\n"
+    "#define MAD intel_sub_group_bf16_bf16_matrix_mad_k16\n"
+    "#else\n"
+    "#define MAD intel_sub_group_f16_f16_matrix_mad_k16\n"
+    "#endif\n"
+    "__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(16 * SGM * SGN, 1, 1)))\n"
+    "kernel void ocu_hgemm4(int M, int N, int K, float alpha, float beta,\n"
+    "                       global const ushort *A0, long lda, long sa,\n"
+    "                       global const ushort *B0, long ldb, long sb,\n"
+    "                       global void *C0v, long ldc, long sc)\n"
+    "{\n"
+    "    const int sg = get_sub_group_id(), lane = get_sub_group_local_id();\n"
+    "    const int sgm = sg % SGM, sgn = sg / SGM;\n"
+    "    const int m0 = get_group_id(1) * WM + sgm * TM, n0 = get_group_id(0) * WN + sgn * TN;\n"
+    "    const long bz = get_group_id(2);\n"
+    "    global const ushort *A = A0 + bz * sa;\n"
+    "    global const ushort *B = B0 + bz * sb;\n"
+    "#if OUT == 0\n"
+    "    global float *C = (global float *)C0v + bz * sc;\n"
+    "#else\n"
+    "    global ushort *C = (global ushort *)C0v + bz * sc;\n"
+    "#endif\n"
+    "    const int wA = K * 2, pA = (int)lda * 2, wB = K * 2, pB = (int)ldb * 2;\n"
+    "    float8 acc[4][4];\n"
+    "    for (int i = 0; i < 4; ++i)\n"
+    "        for (int j = 0; j < 4; ++j) acc[i][j] = (float8)0.0f;\n"
+    "    for (int k0 = 0; k0 < K; k0 += 16) {\n"
+    "        ushort8 a[4];\n"
+    "        uint8 b[4];\n"
+    "        intel_sub_group_2d_block_read_16b_32r16x1c((global void *)A, wA, M, pA, (int2)(k0, m0), (private ushort *)a);\n"
+    "        for (int j = 0; j < 4; ++j)\n"
+    "            intel_sub_group_2d_block_read_transpose_32b_16r8x1c((global void *)B, wB, N, pB, (int2)(k0 / 2, n0 + 16 * j),\n"
+    "                                                                (private uint *)&b[j]);\n"
+    "        intel_sub_group_2d_block_prefetch_16b_32r16x1c((global void *)A, wA, M, pA, (int2)(k0 + 32, m0));\n"
+    "        intel_sub_group_2d_block_prefetch_16b_32r16x1c((global void *)B, wB, N, pB, (int2)(k0 + 32, n0));\n"
+    "        intel_sub_group_2d_block_prefetch_16b_32r16x1c((global void *)B, wB, N, pB, (int2)(k0 + 32, n0 + 32));\n"
+    "        for (int i = 0; i < 4; ++i)\n"
+    "            for (int j = 0; j < 4; ++j) acc[i][j] = MAD(as_short8(a[i]), as_int8(b[j]), acc[i][j]);\n"
+    "    }\n"
+    "    for (int i = 0; i < 4; ++i)\n"
+    "        for (int j = 0; j < 4; ++j) {\n"
+    "            const int gn = n0 + 16 * j + lane;\n"
+    "            const float v8[8] = {acc[i][j].s0, acc[i][j].s1, acc[i][j].s2, acc[i][j].s3,\n"
+    "                                 acc[i][j].s4, acc[i][j].s5, acc[i][j].s6, acc[i][j].s7};\n"
+    "            for (int r = 0; r < 8; ++r) {\n"
+    "                const int gm = m0 + 8 * i + r;\n"
+    "                if (gm < M && gn < N) {\n"
+    "                    const long at = (long)gm * ldc + gn;\n"
+    "                    float v = alpha * v8[r];\n"
+    "#if OUT == 0\n"
+    "                    if (beta != 0.0f) v = fma(beta, C[at], v);\n"
+    "                    C[at] = v;\n"
+    "#elif OUT == 1\n"
+    "                    if (beta != 0.0f) v = fma(beta, vload_half(at, (global const half *)C), v);\n"
+    "                    vstore_half_rte(v, at, (global half *)C);\n"
+    "#else\n"
+    "                    if (beta != 0.0f) v = fma(beta, as_float((uint)C[at] << 16), v);\n"
+    "                    uint u = as_uint(v);\n"
+    "                    if ((u & 0x7f800000u) != 0x7f800000u) u += 0x7fffu + ((u >> 16) & 1u);\n"
+    "                    else if (u & 0x007fffffu) u |= 0x00400000u;\n"
+    "                    C[at] = (ushort)(u >> 16);\n"
+    "#endif\n"
+    "                }\n"
+    "            }\n"
+    "        }\n"
+    "}\n"
+;
+
 typedef struct ocu_op_plan {
     ocu_device *dev;
     cl_kernel   k;
@@ -1698,13 +1837,16 @@ typedef struct ocu_op_plan {
     float       alpha, beta;
     int         S, kc;      /* split-K: S slices of kc (S == 1: none) */
     ocu_dtype   in, out;    /* input and output types */
+    int         parr;       /* OCU_OP_FLAG_PTR_ARRAY: A, B, C are pointer arrays */
+    cl_kernel   k4;         /* 2D-block-load XMX kernel when the shape allows it (else NULL) */
+    int         sgm4, sgn4; /* its sub-group grid */
     void       *part;       /* S x M x N partial sums when S > 1 */
     cl_kernel   reduce;
     char        name[96];   /* for OCU_OPENCL_TRACE */
 } ocl_gemm_plan;
 
 static pthread_mutex_t ops_lock = PTHREAD_MUTEX_INITIALIZER;
-typedef struct { ocu_device *dev; cl_kernel k[4]; cl_kernel reduce; int state; int xmx; cl_kernel hk[2][3][4]; } ocl_ops_dev; /* state: 0 new, 1 ok, -1 no */
+typedef struct { ocu_device *dev; cl_kernel k[4]; cl_kernel kp[4]; cl_kernel reduce; int state; int xmx; cl_kernel hk[2][3][4][2]; cl_kernel hk4[2][3][2]; int blk; } ocl_ops_dev; /* state: 0 new, 1 ok, -1 no */
 static ocl_ops_dev ops_devs[16];
 
 static int ops_enabled(ocu_device *d)
@@ -1766,9 +1908,62 @@ static int xmx_enabled(ocu_device *d)
 }
 
 /* The XMX kernel for (input type, output type, transposes), built on first use. ops_lock held. */
-static cl_kernel xmx_kernel(ocu_device *d, ocl_ops_dev *o, int bf, int out, int v)
+/* The 2D-block-load XMX GEMM (A [M x K], B [N x K]); cfg 0: 256 x 256 tiles, 1: 128 x 256. */
+static cl_kernel hgemm4_kernel(ocu_device *d, ocl_ops_dev *o, int bf, int out, int cfg)
 {
-    if (o->hk[bf][out][v] != NULL) return o->hk[bf][out][v];
+    if (o->hk4[bf][out][cfg] != NULL) return o->hk4[bf][out][cfg];
+    if (o->blk == 0) {
+        char ext[16384] = {0};
+        ocl_load()->GetDeviceInfo(d->entry->device, CL_DEVICE_EXTENSIONS, sizeof ext - 1, ext, NULL);
+        const char *off = getenv("OCU_OPENCL_BLOCK2D");
+        o->blk = strstr(ext, "cl_intel_subgroup_2d_block_io") != NULL && !(off != NULL && *off == '0') ? 1 : -1;
+    }
+    if (o->blk < 0) return NULL;
+    const ocl_api *a = ocl_load();
+    cl_int err = CL_SUCCESS;
+    const char *src = k_hgemm4_src;
+    cl_program prog = a->CreateProgramWithSource(d->ctx, 1, &src, NULL, &err);
+    if (prog == NULL) return NULL;
+    char opts[256];
+    snprintf(opts, sizeof opts, "-cl-std=CL3.0 -DBF16=%d -DOUT=%d -DSGM=%d -DSGN=4 -cl-intel-256-GRF-per-thread",
+             bf, out, cfg == 0 ? 8 : 4);
+    err = a->BuildProgram(prog, 1, &d->entry->device, opts, NULL, NULL);
+    cl_kernel k = err == CL_SUCCESS ? a->CreateKernel(prog, "ocu_hgemm4", &err) : NULL;
+    a->ReleaseProgram(prog);
+    if (k == NULL) {
+        if (verbose()) fprintf(stderr, "ocu opencl: the 2D-block XMX GEMM does not build here (%d)\n", (int)err);
+        o->blk = -1;
+        return NULL;
+    }
+    o->hk4[bf][out][cfg] = k;
+    return k;
+}
+
+/* The FP32 GEMM over pointer arrays (cublas*Batched), built on first use. */
+static cl_kernel sgemm_parr_kernel(ocu_device *d, ocl_ops_dev *o, int v)
+{
+    if (o->kp[v] != NULL) return o->kp[v];
+    const ocl_api *a = ocl_load();
+    cl_int err = CL_SUCCESS;
+    const char *src = k_sgemm_src;
+    cl_program prog = a->CreateProgramWithSource(d->ctx, 1, &src, NULL, &err);
+    if (prog == NULL) return NULL;
+    char opts[256];
+    const char *grf[2] = {" -cl-intel-256-GRF-per-thread", ""};
+    err = CL_BUILD_PROGRAM_FAILURE;
+    for (int g = 0; g < 2 && err != CL_SUCCESS; ++g) {
+        snprintf(opts, sizeof opts, "-cl-std=CL3.0 -DTA=%d -DTB=%d -DPARR=1 -DKNAME=ocu_sgemm%s", v >> 1, v & 1, grf[g]);
+        err = a->BuildProgram(prog, 1, &d->entry->device, opts, NULL, NULL);
+    }
+    cl_kernel k = err == CL_SUCCESS ? a->CreateKernel(prog, "ocu_sgemm", &err) : NULL;
+    a->ReleaseProgram(prog);
+    o->kp[v] = k;
+    return k;
+}
+
+static cl_kernel xmx_kernel(ocu_device *d, ocl_ops_dev *o, int bf, int out, int v, int parr)
+{
+    if (o->hk[bf][out][v][parr] != NULL) return o->hk[bf][out][v][parr];
     if (o->xmx == 0) o->xmx = xmx_enabled(d) ? 1 : -1;
     if (o->xmx < 0) return NULL;
     const ocl_api *a = ocl_load();
@@ -1777,8 +1972,8 @@ static cl_kernel xmx_kernel(ocu_device *d, ocl_ops_dev *o, int bf, int out, int 
     cl_program prog = a->CreateProgramWithSource(d->ctx, 1, &src, NULL, &err);
     if (prog == NULL) return NULL;
     char opts[256];
-    snprintf(opts, sizeof opts, "-cl-std=CL3.0 -DTA=%d -DTB=%d -DBF16=%d -DOUT=%d -DKNAME=ocu_hgemm -cl-intel-256-GRF-per-thread",
-             v >> 1, v & 1, bf, out);
+    snprintf(opts, sizeof opts, "-cl-std=CL3.0 -DTA=%d -DTB=%d -DBF16=%d -DOUT=%d -DPARR=%d -DKNAME=ocu_hgemm -cl-intel-256-GRF-per-thread",
+             v >> 1, v & 1, bf, out, parr);
     err = a->BuildProgram(prog, 1, &d->entry->device, opts, NULL, NULL);
     cl_kernel k = err == CL_SUCCESS ? a->CreateKernel(prog, "ocu_hgemm", &err) : NULL;
     a->ReleaseProgram(prog);
@@ -1787,7 +1982,7 @@ static cl_kernel xmx_kernel(ocu_device *d, ocl_ops_dev *o, int bf, int out, int 
         o->xmx = -1;
         return NULL;
     }
-    o->hk[bf][out][v] = k;
+    o->hk[bf][out][v][parr] = k;
     return k;
 }
 
@@ -1824,7 +2019,7 @@ static ocu_status ops_support(ocu_device *dev, ocu_op op, ocu_dtype dt, ocu_op_s
 
 static ocu_status gemm_shape(const ocu_op_desc *d, ocl_gemm_plan *p, int *ta, int *tb)
 {
-    if (d == NULL || d->op != OCU_OP_GEMM || d->num_tensors != 3 || (d->flags & OCU_OP_FLAG_VAR_ROWS))
+    if (d == NULL || d->op != OCU_OP_GEMM || d->num_tensors != 3 || (d->flags & ~OCU_OP_FLAG_PTR_ARRAY))
         return OCU_ERR_NOT_SUPPORTED;
     int ar, ac, br, bc, cr, cc, ab, bb, cb;
     if (!gemm_matrix(&d->tensors[0], &ar, &ac, &p->lda, &p->sa, &ab) ||
@@ -1839,6 +2034,8 @@ static ocu_status gemm_shape(const ocu_op_desc *d, ocl_gemm_plan *p, int *ta, in
     const ocu_dtype in = d->tensors[0].dtype, cout = d->tensors[2].dtype;
     if (d->tensors[1].dtype != in) return OCU_ERR_NOT_SUPPORTED;
     if (in == OCU_DT_F32 && cout != OCU_DT_F32) return OCU_ERR_NOT_SUPPORTED;
+    p->parr = (d->flags & OCU_OP_FLAG_PTR_ARRAY) != 0;
+    if (p->parr) p->sa = p->sb = p->sc = 0;
     p->in = in;
     p->out = cout;
     p->M = m; p->N = n; p->K = k; p->batch = cb;
@@ -1880,10 +2077,27 @@ static ocu_status ops_plan(ocu_device *dev, const ocu_op_desc *d, ocu_op_plan **
     *pl = p;
     pl->dev = dev;
     pl->k = o->k[ta * 2 + tb];
+    pl->k4 = NULL;
+    if (p.in == OCU_DT_F32 && p.parr) {
+        pthread_mutex_lock(&ops_lock);
+        pl->k = sgemm_parr_kernel(dev, o, ta * 2 + tb);
+        pthread_mutex_unlock(&ops_lock);
+        if (pl->k == NULL) { free(pl); return OCU_ERR_NOT_SUPPORTED; }
+    }
     pl->reduce = o->reduce;
     if (p.in != OCU_DT_F32) {
         pthread_mutex_lock(&ops_lock);
-        pl->k = xmx_kernel(dev, o, p.in == OCU_DT_BF16, p.out == OCU_DT_F32 ? 0 : p.out == OCU_DT_F16 ? 1 : 2, ta * 2 + tb);
+        pl->k = xmx_kernel(dev, o, p.in == OCU_DT_BF16, p.out == OCU_DT_F32 ? 0 : p.out == OCU_DT_F16 ? 1 : 2, ta * 2 + tb, p.parr);
+        pl->k4 = NULL;
+        if (pl->k != NULL && !p.parr && ta == 0 && tb == 1 && pl->K >= 32 && pl->K % 8 == 0 && pl->lda % 8 == 0 &&
+            pl->ldb % 8 == 0 && (pl->batch == 1 || (pl->sa % 32 == 0 && pl->sb % 32 == 0)) &&
+            (long)pl->K * 2 <= 0x7fffffffL && pl->lda * 2 <= 0x7fffffffL && pl->ldb * 2 <= 0x7fffffffL) {
+            const long big = (long)((pl->M + 255) / 256) * ((pl->N + 255) / 256) * pl->batch;
+            const int cfg = big >= 64 ? 0 : 1;
+            pl->k4 = hgemm4_kernel(dev, o, p.in == OCU_DT_BF16, p.out == OCU_DT_F32 ? 0 : p.out == OCU_DT_F16 ? 1 : 2, cfg);
+            pl->sgm4 = cfg == 0 ? 8 : 4;
+            pl->sgn4 = 4;
+        }
         pthread_mutex_unlock(&ops_lock);
         if (pl->k == NULL) { free(pl); return OCU_ERR_NOT_SUPPORTED; }
     }
@@ -1893,7 +2107,7 @@ static ocu_status ops_plan(ocu_device *dev, const ocu_op_desc *d, ocu_op_plan **
     /* Split-K when the C tiles cannot fill the GPU and K is long (for example
        a 256 x 128 result over K = 50304: 2 tiles). Slices of at least 512. */
     const long tiles = (long)((pl->M + 127) / 128) * ((pl->N + 127) / 128) * pl->batch;
-    if (p.in == OCU_DT_F32 && pl->batch == 1 && tiles < 128 && pl->K >= 2048 && getenv("OCU_OPENCL_SPLITK") == NULL) {
+    if (p.in == OCU_DT_F32 && pl->batch == 1 && !pl->parr && tiles < 128 && pl->K >= 2048 && getenv("OCU_OPENCL_SPLITK") == NULL) {
         int S = (int)((256 + tiles - 1) / tiles);
         if (S > pl->K / 512) S = pl->K / 512;
         if (S > 1) {
@@ -1929,31 +2143,53 @@ static ocu_status ops_execute(ocu_op_plan *pl, ocu_queue *q, const ocu_tensor *t
     size_t lws[3] = {xmx ? 128 : 16, xmx ? 1 : 16, 1};
     size_t gws[3] = {(size_t)((pl->N + 127) / 128) * (xmx ? 128 : 16), (size_t)((pl->M + 127) / 128) * (xmx ? 1 : 16),
                      (size_t)pl->batch * pl->S};
+    /* The block loads need 64-byte aligned matrices. */
+    cl_kernel kern = pl->k;
+    if (pl->k4 != NULL && ((uintptr_t)t[0].data & 63) == 0 && ((uintptr_t)t[1].data & 63) == 0) {
+        kern = pl->k4;
+        const int wm = 32 * pl->sgm4, wn = 64 * pl->sgn4;
+        lws[0] = (size_t)16 * pl->sgm4 * pl->sgn4;
+        gws[0] = (size_t)((pl->N + wn - 1) / wn) * lws[0];
+        gws[1] = (size_t)((pl->M + wm - 1) / wm);
+    }
     const int split = pl->S > 1;
     const float one = 1.0f, zero = 0.0f;
     const long ldp = pl->N, sp = (long)pl->M * pl->N;
     cl_event ev = NULL;
     pthread_mutex_lock(&ops_lock);
     cl_uint i = 0;
-    cl_int err = a->SetKernelArg(pl->k, i++, sizeof(int), &pl->M);
-    err |= a->SetKernelArg(pl->k, i++, sizeof(int), &pl->N);
-    err |= a->SetKernelArg(pl->k, i++, sizeof(int), &pl->K);
-    err |= a->SetKernelArg(pl->k, i++, sizeof(float), split ? &one : &pl->alpha);
-    err |= a->SetKernelArg(pl->k, i++, sizeof(float), split ? &zero : &pl->beta);
-    err |= a->SetKernelArgSVMPointer(pl->k, i++, t[0].data);
-    err |= a->SetKernelArg(pl->k, i++, sizeof(long), &pl->lda);
-    err |= a->SetKernelArg(pl->k, i++, sizeof(long), &pl->sa);
-    err |= a->SetKernelArgSVMPointer(pl->k, i++, t[1].data);
-    err |= a->SetKernelArg(pl->k, i++, sizeof(long), &pl->ldb);
-    err |= a->SetKernelArg(pl->k, i++, sizeof(long), &pl->sb);
-    err |= a->SetKernelArgSVMPointer(pl->k, i++, split ? pl->part : t[2].data);
-    err |= a->SetKernelArg(pl->k, i++, sizeof(long), split ? &ldp : &pl->ldc);
-    err |= a->SetKernelArg(pl->k, i++, sizeof(long), split ? &sp : &pl->sc);
+    cl_int err = a->SetKernelArg(kern, i++, sizeof(int), &pl->M);
+    err |= a->SetKernelArg(kern, i++, sizeof(int), &pl->N);
+    err |= a->SetKernelArg(kern, i++, sizeof(int), &pl->K);
+    err |= a->SetKernelArg(kern, i++, sizeof(float), split ? &one : &pl->alpha);
+    err |= a->SetKernelArg(kern, i++, sizeof(float), split ? &zero : &pl->beta);
+    err |= a->SetKernelArgSVMPointer(kern, i++, t[0].data);
+    err |= a->SetKernelArg(kern, i++, sizeof(long), &pl->lda);
+    err |= a->SetKernelArg(kern, i++, sizeof(long), &pl->sa);
+    err |= a->SetKernelArgSVMPointer(kern, i++, t[1].data);
+    err |= a->SetKernelArg(kern, i++, sizeof(long), &pl->ldb);
+    err |= a->SetKernelArg(kern, i++, sizeof(long), &pl->sb);
+    err |= a->SetKernelArgSVMPointer(kern, i++, split ? pl->part : t[2].data);
+    err |= a->SetKernelArg(kern, i++, sizeof(long), split ? &ldp : &pl->ldc);
+    err |= a->SetKernelArg(kern, i++, sizeof(long), split ? &sp : &pl->sc);
     if (!xmx) {
-        err |= a->SetKernelArg(pl->k, i++, sizeof(int), &pl->S);
-        err |= a->SetKernelArg(pl->k, i++, sizeof(int), &pl->kc);
+        err |= a->SetKernelArg(kern, i++, sizeof(int), &pl->S);
+        err |= a->SetKernelArg(kern, i++, sizeof(int), &pl->kc);
     }
-    if (err == CL_SUCCESS) err = a->EnqueueNDRangeKernel(queue->q, pl->k, 3, NULL, gws, lws, 0, NULL, split ? NULL : &ev);
+    if (err == CL_SUCCESS && pl->parr) {
+        /* The matrices are reached through the arrays: name every allocation. */
+        pthread_mutex_lock(&d->lock);
+        size_t na = d->count;
+        void **ptrs = malloc((na ? na : 1) * sizeof(void *));
+        if (ptrs == NULL) err = CL_OUT_OF_HOST_MEMORY;
+        else {
+            for (size_t j = 0; j < na; ++j) ptrs[j] = d->allocs[j].ptr;
+            if (na > 0) err = a->SetKernelExecInfo(kern, CL_KERNEL_EXEC_INFO_SVM_PTRS, na * sizeof(void *), ptrs);
+            free(ptrs);
+        }
+        pthread_mutex_unlock(&d->lock);
+    }
+    if (err == CL_SUCCESS) err = a->EnqueueNDRangeKernel(queue->q, kern, 3, NULL, gws, lws, 0, NULL, split ? NULL : &ev);
     if (err == CL_SUCCESS && split) {
         cl_uint r = 0;
         err = a->SetKernelArg(pl->reduce, r++, sizeof(int), &pl->M);
@@ -1968,7 +2204,10 @@ static ocu_status ops_execute(ocu_op_plan *pl, ocu_queue *q, const ocu_tensor *t
         if (err == CL_SUCCESS) err = a->EnqueueNDRangeKernel(queue->q, pl->reduce, 3, NULL, rg, rl, 0, NULL, &ev);
     }
     pthread_mutex_unlock(&ops_lock);
-    if (err == CL_SUCCESS && trace_on()) trace_add_name(pl->name, ev);
+    if (err == CL_SUCCESS && trace_on()) {
+        if (kern == pl->k4 && pl->name[0] != '2') { memmove(pl->name + 3, pl->name, sizeof pl->name - 3); memcpy(pl->name, "2d ", 3); pl->name[sizeof pl->name - 1] = 0; }
+        trace_add_name(pl->name, ev);
+    }
     return finish_enqueue(queue, q == NULL, err, ev);
 }
 
@@ -1994,6 +2233,62 @@ static const void *ocl_get_provider(const char *library)
 {
     if (library != NULL && strcmp(library, OCU_OPS_PROVIDER) == 0) return &ocl_ops;
     return NULL;
+}
+
+static ocu_status ocl_kernel_launch(ocu_queue *q, ocu_kernel *k, const ocu_launch_params *p)
+{
+    HP_B(HP_LAUNCH);
+    ocu_status r_ = ocl_kernel_launch_impl(q, k, p);
+    HP_E(HP_LAUNCH);
+    return r_;
+}
+
+static ocu_status ocl_mem_copy(ocu_device *d, ocu_queue *q, void *dst, const void *src, size_t bytes, ocu_copy_dir dir)
+{
+    HP_B(HP_COPY);
+    ocu_status r_ = ocl_mem_copy_impl(d, q, dst, src, bytes, dir);
+    HP_E(HP_COPY);
+    return r_;
+}
+
+static ocu_status ocl_mem_set(ocu_device *d, ocu_queue *q, void *dst, int value, size_t bytes)
+{
+    HP_B(HP_SET);
+    ocu_status r_ = ocl_mem_set_impl(d, q, dst, value, bytes);
+    HP_E(HP_SET);
+    return r_;
+}
+
+static ocu_status ocl_queue_sync(ocu_queue *q)
+{
+    HP_B(HP_SYNC);
+    ocu_status r_ = ocl_queue_sync_impl(q);
+    HP_E(HP_SYNC);
+    return r_;
+}
+
+static ocu_status ocl_marker_record(ocu_marker *m, ocu_queue *q)
+{
+    HP_B(HP_MARK);
+    ocu_status r_ = ocl_marker_record_impl(m, q);
+    HP_E(HP_MARK);
+    return r_;
+}
+
+static ocu_status ocl_mem_alloc(ocu_device *d, size_t bytes, void **ptr)
+{
+    HP_B(HP_ALLOC);
+    ocu_status r_ = ocl_mem_alloc_impl(d, bytes, ptr);
+    HP_E(HP_ALLOC);
+    return r_;
+}
+
+static ocu_status ocl_mem_free(ocu_device *d, void *ptr)
+{
+    HP_B(HP_FREE);
+    ocu_status r_ = ocl_mem_free_impl(d, ptr);
+    HP_E(HP_FREE);
+    return r_;
 }
 
 static const ocu_backend g_opencl = {

@@ -649,7 +649,9 @@ ocu_op_plan *op_plan_for(cublasHandle_t h, const ocu_op_table *t, ocu_device *de
 bool gemm_by_op(cublasHandle_t h, const gemm_params &p, cudaDataType_t at, cudaDataType_t ct,
                 int batch, cublasStatus_t *status)
 {
-    if (p.a_arr != nullptr || p.alpha_dev != nullptr || p.alpha == 0.0 || p.k <= 0) return false;
+    const bool parr = p.a_arr != nullptr;
+    if (parr && (p.b_arr == nullptr || p.c_arr == nullptr || batch < 2)) return false;
+    if (p.alpha_dev != nullptr || p.alpha == 0.0 || p.k <= 0) return false;
     const ocu_dtype in = op_dtype(at), out = op_dtype(ct);
     if (in == OCU_DT_NONE || out == OCU_DT_NONE) return false;
     const ocu_backend *b = ocu_rt_backend();
@@ -669,20 +671,25 @@ bool gemm_by_op(cublasHandle_t h, const gemm_params &p, cudaDataType_t at, cudaD
     d.p.gemm.trans_b = (uint32_t)p.opa;
     d.p.gemm.alpha = (float)p.alpha;
     d.p.gemm.beta = (float)p.beta;
+    /* Pointer arrays: one matrix per entry, reached through the arrays
+       (OCU_OP_FLAG_PTR_ARRAY); the stride argument only shapes the descriptor. */
+    const long long one_b = (long long)(p.opb ? p.n : p.k) * p.ldb, one_a = (long long)(p.opa ? p.k : p.m) * p.lda,
+                    one_c = (long long)p.m * p.ldc;
     const bool ok =
-        op_matrix(d.tensors[0], in, batch, p.sb, true, p.opb ? p.k : p.n, p.opb ? p.n : p.k, p.ldb) &&
-        op_matrix(d.tensors[1], in, batch, p.sa, true, p.opa ? p.m : p.k, p.opa ? p.k : p.m, p.lda) &&
-        op_matrix(d.tensors[2], out, batch, p.sc, false, p.n, p.m, p.ldc);
+        op_matrix(d.tensors[0], in, batch, parr ? one_b : p.sb, true, p.opb ? p.k : p.n, p.opb ? p.n : p.k, p.ldb) &&
+        op_matrix(d.tensors[1], in, batch, parr ? one_a : p.sa, true, p.opa ? p.m : p.k, p.opa ? p.k : p.m, p.lda) &&
+        op_matrix(d.tensors[2], out, batch, parr ? one_c : p.sc, false, p.n, p.m, p.ldc);
     if (!ok) return false;
+    if (parr) d.flags |= OCU_OP_FLAG_PTR_ARRAY;
 
     std::lock_guard<std::mutex> guard(h->plans_lock);
     op_submission s;
     s.t = t;
     s.plan = op_plan_for(h, t, dev, d);
     if (s.plan == nullptr) return false;
-    s.ts[0].data = const_cast<void *>(p.b); s.ts[0].desc = d.tensors[0];
-    s.ts[1].data = const_cast<void *>(p.a); s.ts[1].desc = d.tensors[1];
-    s.ts[2].data = p.c;                     s.ts[2].desc = d.tensors[2];
+    s.ts[0].data = parr ? (void *)p.b_arr : const_cast<void *>(p.b); s.ts[0].desc = d.tensors[0];
+    s.ts[1].data = parr ? (void *)p.a_arr : const_cast<void *>(p.a); s.ts[1].desc = d.tensors[1];
+    s.ts[2].data = parr ? (void *)p.c_arr : p.c;                     s.ts[2].desc = d.tensors[2];
     ocu_status st = OCU_ERR_NOT_SUPPORTED;
     cudaError_t e = ocu_rt_submit(h->stream, op_execute, &s, &st);
     if (e != cudaSuccess) {
@@ -732,6 +739,10 @@ cublasStatus_t gemm_any(cublasHandle_t h, cublasOperation_t transa, cublasOperat
     }
     cublasStatus_t st;
     if (gemm_by_op(h, p, at, ct, batch, &st)) return st;
+    if (getenv("OCU_CUBLAS_LOG") != nullptr)
+        fprintf(stderr, "ocu cublas: kernel path: combo %d at %d ct %d op %d%d m%d n%d k%d lda %lld ldb %lld ldc %lld "
+                        "sa %lld sb %lld sc %lld batch %d arr %d\n", (int)cb, (int)at, (int)ct, p.opa, p.opb, m, n, k,
+                (long long)lda, (long long)ldb, (long long)ldc, sa, sb, sc, batch, a_arr != nullptr);
     switch (cb) {
     case combo::s: return launch_gemm<float, float, float, float>(h, p, batch);
 #ifndef OCU_CUBLAS_NO_FP64

@@ -166,6 +166,9 @@ __device__ float native_cos(float);
 __device__ float native_recip(float);
 __device__ long mul_hi(long, long);
 __device__ unsigned long mul_hi(unsigned long, unsigned long);
+/* cl_khr_integer_dot_product: the GPU's DP4A instruction (no saturation, as __dp4a). */
+__device__ int dot_4x8packed_ss_int(unsigned, unsigned);
+__device__ unsigned dot_4x8packed_uu_uint(unsigned, unsigned);
 #define OCU_SPV_DIM_x 0
 #define OCU_SPV_DIM_y 1
 #define OCU_SPV_DIM_z 2
@@ -437,6 +440,8 @@ OCU_D int __mul24(int a, int b) { return ((a << 8) >> 8) * ((b << 8) >> 8); }
 OCU_D unsigned __umul24(unsigned a, unsigned b) { return (a & 0xffffffu) * (b & 0xffffffu); }
 OCU_D int __mulhi(int a, int b) { return (int)(((long long)a * b) >> 32); }
 OCU_D unsigned __umulhi(unsigned a, unsigned b) { return (unsigned)(((unsigned long long)a * b) >> 32); }
+OCU_D int __dp4a(int a, int b, int c) { return c + dot_4x8packed_ss_int((unsigned)a, (unsigned)b); }
+OCU_D unsigned __dp4a(unsigned a, unsigned b, unsigned c) { return c + dot_4x8packed_uu_uint(a, b); }
 OCU_D long long __mul64hi(long long a, long long b) { return (long long)mul_hi((long)a, (long)b); }
 OCU_D unsigned long long __umul64hi(unsigned long long a, unsigned long long b)
 {
