@@ -2375,6 +2375,9 @@ static ocu_status ops_plan(ocu_device *dev, const ocu_op_desc *d, ocu_op_plan **
         const long t4 = (long)((pl->M + 32 * pl->sgm4 - 1) / (32 * pl->sgm4)) * ((pl->N + 64 * pl->sgn4 - 1) / (64 * pl->sgn4));
         /* Only when the tiles are very few: the partial sums and their reduction cost a pass over C. */
         int S = t4 < 16 && pl->K >= 2048 ? (int)((32 + t4 - 1) / t4) : 1;
+        /* A very long K (a vocabulary: the LM head in the backward pass) with a few hundred tiles: each
+           work-group would walk the whole K. Slices of 16K or more, at most 8. */
+        if (S == 1 && pl->K >= 32768 && t4 < 1024) { S = (int)((pl->K + 16383) / 16384); if (S > 8) S = 8; }
         if (S > pl->K / 1024) S = pl->K / 1024;
         { const char *fs = getenv("OCU_OPENCL_SPLIT4"); if (fs != NULL) S = atoi(fs); }
         if (S > 1) {
