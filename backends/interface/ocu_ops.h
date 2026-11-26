@@ -93,7 +93,9 @@ typedef enum ocu_op {
     OCU_OP_RMS_NORM = 4, /* x, [w,] y: per row */
     OCU_OP_SOFTMAX  = 5, /* x, y:      per row, of scale * x */
     OCU_OP_ROPE     = 6, /* x, pos, y: rotary embedding (optional in v1) */
-    OCU_OP_QMATMUL  = 7  /* reserved */
+    OCU_OP_QMATMUL  = 7  /* A, W, absmax, C: C = A dequant(W)^T + beta C, W in bitsandbytes'
+                            NF4 (block 64); A bf16 [M,K], W I8 [N,K/2], absmax F32 [N,K/64],
+                            C F32 [M,N]; p.gemm.beta (optional in v1) */
 } ocu_op;
 
 #define OCU_OP_COUNT 8u /* op values are below this */

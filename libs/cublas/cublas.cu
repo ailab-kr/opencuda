@@ -616,13 +616,14 @@ bool op_matrix(ocu_tensor_desc &d, ocu_dtype dt, int batch, long long bstride, b
 struct op_submission {
     const ocu_op_table *t;
     ocu_op_plan *plan;
-    ocu_tensor ts[3];
+    ocu_tensor ts[4];
+    uint32_t n = 3;
 };
 
 ocu_status op_execute(ocu_queue *q, void *ctx)
 {
     op_submission *s = static_cast<op_submission *>(ctx);
-    return s->t->execute(s->plan, q, s->ts, 3);
+    return s->t->execute(s->plan, q, s->ts, s->n);
 }
 
 /* The cached plan for `d`, planning it (after a query) when new. NULL when
@@ -1267,3 +1268,47 @@ cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t handle, cublasOperation
 }
 
 } /* extern "C" */
+
+/* ---- OpenCuda extension: NF4 GEMM (ocu_cublas_ext.h) ---------------------- */
+
+extern "C" cublasStatus_t ocublasGemmNF4(cublasHandle_t h, int M, int N, int K, const void *A, int lda,
+                                         const unsigned char *W, const float *absmax, float beta, float *C, int ldc)
+{
+    if (h == nullptr) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (M <= 0 || N <= 0 || K <= 0 || lda < K || ldc < N || A == nullptr || W == nullptr || absmax == nullptr || C == nullptr)
+        return CUBLAS_STATUS_INVALID_VALUE;
+    const ocu_backend *b = ocu_rt_backend();
+    const ocu_op_table *t = b != nullptr ? ocu_ops_of(b) : nullptr;
+    ocu_device *dev = ocu_rt_device();
+    if (t == nullptr || dev == nullptr) return CUBLAS_STATUS_NOT_SUPPORTED;
+    ocu_op_desc d;
+    memset(&d, 0, sizeof d);
+    d.struct_size = sizeof d;
+    d.op = OCU_OP_QMATMUL;
+    d.num_tensors = 4;
+    d.p.gemm.alpha = 1.0f;
+    d.p.gemm.beta = beta;
+    auto mat = [](ocu_tensor_desc &x, ocu_dtype dt, long long r, long long c, long long ld) {
+        x.dtype = dt; x.rank = 2; x.shape[0] = r; x.shape[1] = c; x.stride[0] = ld; x.stride[1] = 1;
+    };
+    mat(d.tensors[0], OCU_DT_BF16, M, K, lda);
+    mat(d.tensors[1], OCU_DT_I8, N, K / 2, K / 2);
+    mat(d.tensors[2], OCU_DT_F32, N, K / 64, K / 64);
+    mat(d.tensors[3], OCU_DT_F32, M, N, ldc);
+    if (K % 64 != 0) return CUBLAS_STATUS_NOT_SUPPORTED;
+    std::lock_guard<std::mutex> guard(h->plans_lock);
+    op_submission s;
+    s.t = t;
+    s.n = 4;
+    /* op_plan_for wants accum f32 from the query, which the NF4 plan reports */
+    s.plan = op_plan_for(h, t, dev, d);
+    if (s.plan == nullptr) return CUBLAS_STATUS_NOT_SUPPORTED;
+    s.ts[0].data = const_cast<void *>(A);                           s.ts[0].desc = d.tensors[0];
+    s.ts[1].data = const_cast<unsigned char *>(W);                  s.ts[1].desc = d.tensors[1];
+    s.ts[2].data = const_cast<float *>(absmax);                     s.ts[2].desc = d.tensors[2];
+    s.ts[3].data = C;                                               s.ts[3].desc = d.tensors[3];
+    ocu_status st = OCU_ERR_NOT_SUPPORTED;
+    cudaError_t e = ocu_rt_submit(h->stream, op_execute, &s, &st);
+    if (e != cudaSuccess) return from_cuda(e);
+    return st == OCU_OK ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_NOT_SUPPORTED;
+}

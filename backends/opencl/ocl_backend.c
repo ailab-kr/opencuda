@@ -1887,6 +1887,79 @@ static const char k_hgemm4_src[] =
     "}\n"
 ;
 
+static const char k_nf4_src[] =
+    "// Fused NF4 GEMM on XMX (cl_intel_subgroup_2d_block_io): C[M,N] (f32) = A[M,K] (bf16) * W[N,K]^T + beta * C,\n"
+    "// W in bitsandbytes' NF4 layout: row-major, two values per byte (first in the high nibble), one f32\n"
+    "// absmax per 64 consecutive values of a row (K % 64 == 0). A sub-group owns 64 rows x 16 columns;\n"
+    "// per 64 k, one transposed 2D block read gives each lane its row of W (32 bytes); a byte is two\n"
+    "// consecutive k, i.e. one VNNI pair, looked up in a 256-entry table of bf16 code pairs. The scale is\n"
+    "// per output column and 64-k block, so the DPAS runs on the unscaled codes and the accumulator is\n"
+    "// kept in units of the current block's scale (times s_prev / s_new between blocks, s at the end).\n"
+    "#pragma OPENCL EXTENSION cl_intel_subgroup_2d_block_io : enable\n"
+    "#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable\n"
+    "#define TMI 8\n"
+    "#define SGM 2\n"
+    "#define SGN 4\n"
+    "#define SM (8 * TMI)\n"
+    "#define WM (SM * SGM)\n"
+    "#define WN (16 * SGN)\n"
+    "#define NTH (16 * SGM * SGN)\n"
+    "constant float NF4[16] = {-1.0f, -0.6961928009986877f, -0.5250730514526367f, -0.39491748809814453f,\n"
+    "    -0.28444138169288635f, -0.18477343022823334f, -0.09105003625154495f, 0.0f, 0.07958029955625534f,\n"
+    "    0.16093020141124725f, 0.24611230194568634f, 0.33791524171829224f, 0.44070982933044434f,\n"
+    "    0.5626170039176941f, 0.7229568362236023f, 1.0f};\n"
+    "inline uint bf16_rne(float f) { uint u = as_uint(f); return (u + 0x7fffu + ((u >> 16) & 1u)) >> 16; }\n"
+    "__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(NTH, 1, 1)))\n"
+    "kernel void ocu_nf4_gemm(int M, int N, int K, global const ushort *A, int lda, global const uchar *W,\n"
+    "                         global const float *absmax, global float *C, int ldc, float beta)\n"
+    "{\n"
+    "    local uint lut[256];\n"
+    "    for (int i = get_local_id(0); i < 256; i += NTH) lut[i] = bf16_rne(NF4[i >> 4]) | (bf16_rne(NF4[i & 15]) << 16);\n"
+    "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "    const int sg = get_sub_group_id(), lane = get_sub_group_local_id();\n"
+    "    const int sgm = sg % SGM, sgn = sg / SGM;\n"
+    "    const int m0 = get_group_id(1) * WM + sgm * SM, n0 = get_group_id(0) * WN + sgn * 16;\n"
+    "    const int wB = K / 2, kb = K / 64, n = n0 + lane;\n"
+    "    float8 acc[TMI];\n"
+    "    for (int i = 0; i < TMI; ++i) acc[i] = (float8)0.0f;\n"
+    "    float sp = 1.0f;\n"
+    "    for (int k0 = 0; k0 < K; k0 += 64) {\n"
+    "        uint8 q;\n"
+    "        intel_sub_group_2d_block_read_transpose_32b_16r8x1c((global void *)W, wB, N, wB, (int2)(k0 / 8, n0), (private uint *)&q);\n"
+    "        intel_sub_group_2d_block_prefetch_32b_16r8x1c((global void *)W, wB, N, wB, (int2)(k0 / 8 + 8, n0));\n"
+    "        const float sn = n < N ? absmax[n * kb + k0 / 64] : 0.0f;\n"
+    "        const int zero = sn == 0.0f;\n"
+    "        const float snew = zero ? sp : sn;\n"
+    "        const float r = sp / snew;\n"
+    "        if (sub_group_any(r != 1.0f))\n"
+    "            for (int i = 0; i < TMI; ++i) acc[i] *= r;\n"
+    "        sp = snew;\n"
+    "        const uint w[8] = {q.s0, q.s1, q.s2, q.s3, q.s4, q.s5, q.s6, q.s7};\n"
+    "        for (int s = 0; s < 4; ++s) {\n"
+    "            ushort8 a[TMI];\n"
+    "            for (int i = 0; i < TMI; i += 4)\n"
+    "                intel_sub_group_2d_block_read_16b_32r16x1c((global void *)A, K * 2, M, lda * 2, (int2)(k0 + 16 * s, m0 + 8 * i), (private ushort *)&a[i]);\n"
+    "            const uint w0 = w[2 * s], w1 = w[2 * s + 1];\n"
+    "            int8 b = (int8)(lut[w0 & 255u], lut[(w0 >> 8) & 255u], lut[(w0 >> 16) & 255u], lut[w0 >> 24],\n"
+    "                            lut[w1 & 255u], lut[(w1 >> 8) & 255u], lut[(w1 >> 16) & 255u], lut[w1 >> 24]);\n"
+    "            if (zero) b = (int8)0;\n"
+    "            for (int i = 0; i < TMI; ++i) acc[i] = intel_sub_group_bf16_bf16_matrix_mad_k16(as_short8(a[i]), b, acc[i]);\n"
+    "        }\n"
+    "    }\n"
+    "    for (int i = 0; i < TMI; ++i) {\n"
+    "        const float8 v = acc[i] * sp;\n"
+    "        const float v8[8] = {v.s0, v.s1, v.s2, v.s3, v.s4, v.s5, v.s6, v.s7};\n"
+    "        for (int r = 0; r < 8; ++r) {\n"
+    "            const int gm = m0 + 8 * i + r;\n"
+    "            if (gm < M && n < N) {\n"
+    "                global float *o = C + (size_t)gm * ldc + n;\n"
+    "                *o = beta == 0.0f ? v8[r] : fma(beta, *o, v8[r]);\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "}\n"
+;
+
 typedef struct ocu_op_plan {
     ocu_device *dev;
     cl_kernel   k;
@@ -1899,13 +1972,14 @@ typedef struct ocu_op_plan {
     cl_kernel   k4;         /* 2D-block-load XMX kernel when the shape allows it (else NULL) */
     int         sgm4, sgn4; /* its sub-group grid */
     int         bm, bn;     /* FP32 kernel tile (128 x 128 unless the shape is small) */
+    int         qm;         /* OCU_OP_QMATMUL (NF4) plan */
     void       *part;       /* S x M x N partial sums when S > 1 */
     cl_kernel   reduce;
     char        name[96];   /* for OCU_OPENCL_TRACE */
 } ocl_gemm_plan;
 
 static pthread_mutex_t ops_lock = PTHREAD_MUTEX_INITIALIZER;
-typedef struct { ocu_device *dev; cl_kernel k[4]; cl_kernel kp[4]; cl_kernel kt[4][4][4][2]; cl_kernel reduce; int state; int xmx; cl_kernel hk[2][3][4][2]; cl_kernel hk4[2][3][3][2]; int blk; } ocl_ops_dev; /* state: 0 new, 1 ok, -1 no */
+typedef struct { ocu_device *dev; cl_kernel k[4]; cl_kernel kp[4]; cl_kernel kt[4][4][4][2]; cl_kernel reduce; int state; int xmx; cl_kernel hk[2][3][4][2]; cl_kernel hk4[2][3][3][2]; cl_kernel nf4; int blk; } ocl_ops_dev; /* state: 0 new, 1 ok, -1 no */
 static ocl_ops_dev ops_devs[16];
 
 static int ops_enabled(ocu_device *d)
@@ -2081,6 +2155,19 @@ static int gemm_matrix(const ocu_tensor_desc *t, int *rows, int *cols, long *ld,
 static ocu_status ops_support(ocu_device *dev, ocu_op op, ocu_dtype dt, ocu_op_support *out)
 {
     if (dev == NULL || out == NULL) return OCU_ERR_INVALID_VALUE;
+    if (op == OCU_OP_QMATMUL && dt == OCU_DT_BF16) {
+        pthread_mutex_lock(&ops_lock);
+        ocl_ops_dev *o = ops_dev(dev);
+        pthread_mutex_unlock(&ops_lock);
+        if (o == NULL || !xmx_enabled(dev)) return OCU_ERR_NOT_SUPPORTED;
+        memset(out, 0, sizeof *out);
+        out->layouts = OCU_LAYOUT_DENSE | OCU_LAYOUT_ROW_STRIDED;
+        out->max_rank = 2;
+        out->align_bytes = 64;
+        out->accum_dtype = OCU_DT_F32;
+        out->out_dtypes = 1u << OCU_DT_F32;
+        return OCU_OK;
+    }
     if (op != OCU_OP_GEMM || (dt != OCU_DT_F32 && dt != OCU_DT_F16 && dt != OCU_DT_BF16)) return OCU_ERR_NOT_SUPPORTED;
     if (dt != OCU_DT_F32 && !xmx_enabled(dev)) return OCU_ERR_NOT_SUPPORTED;
     pthread_mutex_lock(&ops_lock);
@@ -2099,6 +2186,7 @@ static ocu_status ops_support(ocu_device *dev, ocu_op op, ocu_dtype dt, ocu_op_s
 
 static ocu_status gemm_shape(const ocu_op_desc *d, ocl_gemm_plan *p, int *ta, int *tb)
 {
+    memset(p, 0, sizeof *p);   /* every field starts defined (qm, k4, part ...) */
     if (d == NULL || d->op != OCU_OP_GEMM || d->num_tensors != 3 || (d->flags & ~OCU_OP_FLAG_PTR_ARRAY))
         return OCU_ERR_NOT_SUPPORTED;
     int ar, ac, br, bc, cr, cc, ab, bb, cb;
@@ -2124,8 +2212,60 @@ static ocu_status gemm_shape(const ocu_op_desc *d, ocl_gemm_plan *p, int *ta, in
     return OCU_OK;
 }
 
+/* OCU_OP_QMATMUL: A bf16 [M, K] (row stride lda), W I8 [N, K/2] (NF4 bytes, dense), absmax F32
+   [N, K/64] (dense), C F32 [M, N] (row stride ldc); C = A * dequant(W)^T + beta * C. */
+static ocu_status qm_shape(const ocu_op_desc *d, ocl_gemm_plan *p)
+{
+    if (d == NULL || d->op != OCU_OP_QMATMUL || d->num_tensors != 4 || d->flags != 0) return OCU_ERR_NOT_SUPPORTED;
+    const ocu_tensor_desc *a = &d->tensors[0], *w = &d->tensors[1], *s = &d->tensors[2], *c = &d->tensors[3];
+    if (a->dtype != OCU_DT_BF16 || w->dtype != OCU_DT_I8 || s->dtype != OCU_DT_F32 || c->dtype != OCU_DT_F32) return OCU_ERR_NOT_SUPPORTED;
+    if (a->rank != 2 || w->rank != 2 || s->rank != 2 || c->rank != 2) return OCU_ERR_NOT_SUPPORTED;
+    const long M = a->shape[0], K = a->shape[1], N = w->shape[0];
+    if (M <= 0 || N <= 0 || K < 128 || K % 64 != 0 || K > 0x7fffffffL / 2 || w->shape[1] != K / 2 || s->shape[0] != N ||
+        s->shape[1] != K / 64 || c->shape[0] != M || c->shape[1] != N)
+        return OCU_ERR_NOT_SUPPORTED;
+    if (a->stride[1] != 1 || a->stride[0] % 8 != 0 || w->stride[0] != K / 2 || s->stride[0] != K / 64 || c->stride[1] != 1 ||
+        c->stride[0] < N || N * (K / 64) > 0x7fffffffL)
+        return OCU_ERR_NOT_SUPPORTED;
+    memset(p, 0, sizeof *p);
+    p->qm = 1;
+    p->M = (int)M; p->N = (int)N; p->K = (int)K; p->batch = 1;
+    p->lda = a->stride[0]; p->ldc = c->stride[0];
+    p->beta = d->p.gemm.beta;
+    p->in = OCU_DT_BF16; p->out = OCU_DT_F32;
+    return OCU_OK;
+}
+
+static cl_kernel nf4_kernel(ocu_device *d, ocl_ops_dev *o)
+{
+    if (o->nf4 != NULL) return o->nf4;
+    const ocl_api *a = ocl_load();
+    cl_int err = CL_SUCCESS;
+    const char *src = k_nf4_src;
+    cl_program prog = a->CreateProgramWithSource(d->ctx, 1, &src, NULL, &err);
+    if (prog == NULL) return NULL;
+    err = a->BuildProgram(prog, 1, &d->entry->device, "-cl-std=CL3.0 -cl-intel-256-GRF-per-thread", NULL, NULL);
+    cl_kernel k = err == CL_SUCCESS ? a->CreateKernel(prog, "ocu_nf4_gemm", &err) : NULL;
+    if (k == NULL && verbose()) fprintf(stderr, "ocu opencl: the NF4 GEMM does not build here (%d)\n", (int)err);
+    a->ReleaseProgram(prog);
+    o->nf4 = k;
+    return k;
+}
+
 static ocu_status ops_query(ocu_device *dev, const ocu_op_desc *d, ocu_op_caps *caps)
 {
+    if (d != NULL && d->op == OCU_OP_QMATMUL) {
+        ocl_gemm_plan p;
+        ocu_op_support sup;
+        if (dev == NULL || caps == NULL) return OCU_ERR_INVALID_VALUE;
+        ocu_status st = qm_shape(d, &p);
+        if (st != OCU_OK) return st;
+        if (ops_support(dev, OCU_OP_QMATMUL, OCU_DT_BF16, &sup) != OCU_OK) return OCU_ERR_NOT_SUPPORTED;
+        memset(caps, 0, sizeof *caps);
+        caps->tol = OCU_TOL_DOT;
+        caps->accum_dtype = OCU_DT_F32;
+        return OCU_OK;
+    }
     ocl_gemm_plan p;
     int ta, tb;
     ocu_op_support sup;
@@ -2144,6 +2284,24 @@ static ocu_status ops_query(ocu_device *dev, const ocu_op_desc *d, ocu_op_caps *
 static ocu_status ops_plan(ocu_device *dev, const ocu_op_desc *d, ocu_op_plan **out)
 {
     if (dev == NULL || out == NULL) return OCU_ERR_INVALID_VALUE;
+    if (d != NULL && d->op == OCU_OP_QMATMUL) {
+        ocl_gemm_plan p;
+        ocu_status st = qm_shape(d, &p);
+        if (st != OCU_OK) return st;
+        pthread_mutex_lock(&ops_lock);
+        ocl_ops_dev *o = ops_dev(dev);
+        cl_kernel k = o != NULL && xmx_enabled(dev) ? nf4_kernel(dev, o) : NULL;
+        pthread_mutex_unlock(&ops_lock);
+        if (k == NULL) return OCU_ERR_NOT_SUPPORTED;
+        ocl_gemm_plan *pl = malloc(sizeof *pl);
+        if (pl == NULL) return OCU_ERR_OUT_OF_MEMORY;
+        *pl = p;
+        pl->dev = dev;
+        pl->k = k;
+        snprintf(pl->name, sizeof pl->name, "ocu_nf4_gemm(xmx) M%d N%d K%d", pl->M, pl->N, pl->K);
+        *out = pl;
+        return OCU_OK;
+    }
     ocl_gemm_plan p;
     int ta, tb;
     ocu_status st = gemm_shape(d, &p, &ta, &tb);
@@ -2262,6 +2420,35 @@ static ocu_status ops_plan(ocu_device *dev, const ocu_op_desc *d, ocu_op_plan **
 
 static ocu_status ops_execute(ocu_op_plan *pl, ocu_queue *q, const ocu_tensor *t, uint32_t n)
 {
+    if (pl != NULL && pl->qm) {
+        if (t == NULL || n != 4) return OCU_ERR_INVALID_VALUE;
+        ocu_device *d = pl->dev;
+        if (q != NULL && q->dev != d) return OCU_ERR_INVALID_HANDLE;
+        for (int i = 0; i < 4; ++i)
+            if (!table_has(d, t[i].data, 1)) return OCU_ERR_NOT_SUPPORTED;
+        if ((((uintptr_t)t[0].data | (uintptr_t)t[1].data) & 63) != 0) return OCU_ERR_NOT_SUPPORTED;
+        ocu_queue *queue = q != NULL ? q : d->sync_q;
+        const ocl_api *a = ocl_load();
+        const int lda = (int)pl->lda, ldc = (int)pl->ldc;
+        size_t lws[3] = {128, 1, 1}, gws[3] = {(size_t)((pl->N + 63) / 64) * 128, (size_t)((pl->M + 127) / 128), 1};
+        cl_event ev = NULL;
+        pthread_mutex_lock(&ops_lock);
+        cl_uint i = 0;
+        cl_int err = a->SetKernelArg(pl->k, i++, sizeof(int), &pl->M);
+        err |= a->SetKernelArg(pl->k, i++, sizeof(int), &pl->N);
+        err |= a->SetKernelArg(pl->k, i++, sizeof(int), &pl->K);
+        err |= a->SetKernelArgSVMPointer(pl->k, i++, t[0].data);
+        err |= a->SetKernelArg(pl->k, i++, sizeof(int), &lda);
+        err |= a->SetKernelArgSVMPointer(pl->k, i++, t[1].data);
+        err |= a->SetKernelArgSVMPointer(pl->k, i++, t[2].data);
+        err |= a->SetKernelArgSVMPointer(pl->k, i++, t[3].data);
+        err |= a->SetKernelArg(pl->k, i++, sizeof(int), &ldc);
+        err |= a->SetKernelArg(pl->k, i++, sizeof(float), &pl->beta);
+        if (err == CL_SUCCESS) err = a->EnqueueNDRangeKernel(queue->q, pl->k, 3, NULL, gws, lws, 0, NULL, &ev);
+        pthread_mutex_unlock(&ops_lock);
+        if (err == CL_SUCCESS && trace_on()) trace_add_name(pl->name, ev);
+        return finish_enqueue(queue, q == NULL, err, ev);
+    }
     if (pl == NULL || t == NULL || n != 3) return OCU_ERR_INVALID_VALUE;
     ocu_device *d = pl->dev;
     if (q != NULL && q->dev != d) return OCU_ERR_INVALID_HANDLE;
