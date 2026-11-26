@@ -120,7 +120,7 @@ __device__ __forceinline__ int linear_tid()
 /* Uninitialised storage for N values of T (usable as a __shared__ member). */
 template <typename T, int N>
 struct raw_array {
-    alignas(T) unsigned char bytes[sizeof(T) * N];
+    alignas(alignof(T) > 16 ? alignof(T) : 16) unsigned char bytes[sizeof(T) * N];
     __device__ __forceinline__ T *data() { return reinterpret_cast<T *>(bytes); }
 };
 
@@ -149,6 +149,22 @@ __device__ __forceinline__ T block_inclusive(T *buf0, T *buf1, int threads, int 
     }
     last = a;
     return a[tid];
+}
+
+/*
+ * The global side of a transposing load/store: the tile moved between global
+ * and shared memory in 16-byte pieces, neighbouring threads taking
+ * neighbouring pieces, so each access instruction covers whole cache lines
+ * (item-wide accesses of 1- or 2-byte types cover a fraction of one, and
+ * thread-contiguous wide ones leave gaps between lanes). True when done.
+ */
+template <int BYTES, int THREADS>
+__device__ __forceinline__ bool copy_striped16(void *dst, const void *src, int tid)
+{
+    if (BYTES % 16 != 0 || (((uintptr_t)dst | (uintptr_t)src) & 15) != 0) return false;
+    for (int c = tid; c < BYTES / 16; c += THREADS)
+        reinterpret_cast<uint4 *>(dst)[c] = reinterpret_cast<const uint4 *>(src)[c];
+    return true;
 }
 
 } // namespace ocu_detail
@@ -381,9 +397,16 @@ private:
             }
         } else if (TRANSPOSE) {
             T *sm = s_.buf.data();
-            for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
-                int k = i * BLOCK_THREADS + tid_;
-                if (k < valid) sm[k] = it[k];
+            bool wide = false;
+            if constexpr (std::is_pointer<It>::value && std::is_trivially_copyable<T>::value) {
+                if (valid >= TILE)
+                    wide = ocu_detail::copy_striped16<(int)sizeof(T) * TILE, BLOCK_THREADS>(sm, (const void *)it, tid_);
+            }
+            if (!wide) {
+                for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+                    int k = i * BLOCK_THREADS + tid_;
+                    if (k < valid) sm[k] = it[k];
+                }
             }
             __syncthreads();
             for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
@@ -451,9 +474,16 @@ private:
             T *sm = s_.buf.data();
             for (int i = 0; i < ITEMS_PER_THREAD; ++i) sm[tid_ * ITEMS_PER_THREAD + i] = items[i];
             __syncthreads();
-            for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
-                int k = i * BLOCK_THREADS + tid_;
-                if (k < valid) it[k] = sm[k];
+            bool wide = false;
+            if constexpr (std::is_pointer<It>::value && std::is_trivially_copyable<T>::value) {
+                if (valid >= TILE)
+                    wide = ocu_detail::copy_striped16<(int)sizeof(T) * TILE, BLOCK_THREADS>((void *)it, sm, tid_);
+            }
+            if (!wide) {
+                for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+                    int k = i * BLOCK_THREADS + tid_;
+                    if (k < valid) it[k] = sm[k];
+                }
             }
         } else {
             for (int i = 0; i < ITEMS_PER_THREAD; ++i) {

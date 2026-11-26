@@ -1905,7 +1905,7 @@ typedef struct ocu_op_plan {
 } ocl_gemm_plan;
 
 static pthread_mutex_t ops_lock = PTHREAD_MUTEX_INITIALIZER;
-typedef struct { ocu_device *dev; cl_kernel k[4]; cl_kernel kp[4]; cl_kernel kt[4][4][4][2]; cl_kernel reduce; int state; int xmx; cl_kernel hk[2][3][4][2]; cl_kernel hk4[2][3][2][2]; int blk; } ocl_ops_dev; /* state: 0 new, 1 ok, -1 no */
+typedef struct { ocu_device *dev; cl_kernel k[4]; cl_kernel kp[4]; cl_kernel kt[4][4][4][2]; cl_kernel reduce; int state; int xmx; cl_kernel hk[2][3][4][2]; cl_kernel hk4[2][3][3][2]; int blk; } ocl_ops_dev; /* state: 0 new, 1 ok, -1 no */
 static ocl_ops_dev ops_devs[16];
 
 static int ops_enabled(ocu_device *d)
@@ -1967,7 +1967,8 @@ static int xmx_enabled(ocu_device *d)
 }
 
 /* The XMX kernel for (input type, output type, transposes), built on first use. ops_lock held. */
-/* The 2D-block-load XMX GEMM (A [M x K], B [N x K]); cfg 0: 256 x 256 tiles, 1: 128 x 256. */
+/* The 2D-block-load XMX GEMM; cfg 0: 256 x 256 tiles, 1: 128 x 256, 2: 256 x 64 (short M: every
+   work-group covers all of M, so B -- the weights, usually -- is read once). */
 static cl_kernel hgemm4_kernel(ocu_device *d, ocl_ops_dev *o, int bf, int out, int cfg, int tb)
 {
     if (o->hk4[bf][out][cfg][tb] != NULL) return o->hk4[bf][out][cfg][tb];
@@ -1984,8 +1985,8 @@ static cl_kernel hgemm4_kernel(ocu_device *d, ocl_ops_dev *o, int bf, int out, i
     cl_program prog = a->CreateProgramWithSource(d->ctx, 1, &src, NULL, &err);
     if (prog == NULL) return NULL;
     char opts[256];
-    snprintf(opts, sizeof opts, "-cl-std=CL3.0 -DBF16=%d -DOUT=%d -DSGM=%d -DSGN=4 -DTB=%d -cl-intel-256-GRF-per-thread",
-             bf, out, cfg == 0 ? 8 : 4, tb);
+    snprintf(opts, sizeof opts, "-cl-std=CL3.0 -DBF16=%d -DOUT=%d -DSGM=%d -DSGN=%d -DTB=%d -cl-intel-256-GRF-per-thread",
+             bf, out, cfg == 1 ? 4 : 8, cfg == 2 ? 1 : 4, tb);
     err = a->BuildProgram(prog, 1, &d->entry->device, opts, NULL, NULL);
     cl_kernel k = err == CL_SUCCESS ? a->CreateKernel(prog, "ocu_hgemm4", &err) : NULL;
     a->ReleaseProgram(prog);
@@ -2173,10 +2174,13 @@ static ocu_status ops_plan(ocu_device *dev, const ocu_op_desc *d, ocu_op_plan **
             pl->ldb % 8 == 0 && (pl->batch == 1 || (pl->sa % 32 == 0 && pl->sb % 32 == 0)) &&
             (long)pl->K * 2 <= 0x7fffffffL && pl->lda * 2 <= 0x7fffffffL && pl->ldb * 2 <= 0x7fffffffL) {
             const long big = (long)((pl->M + 255) / 256) * ((pl->N + 255) / 256) * pl->batch;
-            const int cfg = big >= 64 ? 0 : 1;
+            int cfg = big >= 64 ? 0 : 1;
+            /* Short M: 256 x 64 tiles read B once, but only pay when there are enough of them. */
+            const long tall = (long)((pl->M + 255) / 256) * ((pl->N + 63) / 64) * pl->batch;
+            if (pl->M <= 512 && tall >= 32 && getenv("OCU_OPENCL_NO_TALL") == NULL) cfg = 2;
             pl->k4 = hgemm4_kernel(dev, o, p.in == OCU_DT_BF16, p.out == OCU_DT_F32 ? 0 : p.out == OCU_DT_F16 ? 1 : 2, cfg, tb);
-            pl->sgm4 = cfg == 0 ? 8 : 4;
-            pl->sgn4 = 4;
+            pl->sgm4 = cfg == 1 ? 4 : 8;
+            pl->sgn4 = cfg == 2 ? 1 : 4;
         }
         pthread_mutex_unlock(&ops_lock);
         if (pl->k == NULL) { free(pl); return OCU_ERR_NOT_SUPPORTED; }
@@ -2210,10 +2214,11 @@ static ocu_status ops_plan(ocu_device *dev, const ocu_op_desc *d, ocu_op_plan **
     const long tiles = (long)((pl->M + pl->bm - 1) / pl->bm) * ((pl->N + pl->bn - 1) / pl->bn) * pl->batch;
     /* The 2D-block XMX kernel: split K when its tiles cannot fill the GPU (f32 output). */
     if (pl->k4 != NULL && p.out == OCU_DT_F32 && pl->batch == 1 && getenv("OCU_OPENCL_SPLITK") == NULL) {
-        const long t4 = (long)((pl->M + 32 * pl->sgm4 - 1) / (32 * pl->sgm4)) * ((pl->N + 255) / 256);
+        const long t4 = (long)((pl->M + 32 * pl->sgm4 - 1) / (32 * pl->sgm4)) * ((pl->N + 64 * pl->sgn4 - 1) / (64 * pl->sgn4));
         /* Only when the tiles are very few: the partial sums and their reduction cost a pass over C. */
         int S = t4 < 16 && pl->K >= 2048 ? (int)((32 + t4 - 1) / t4) : 1;
         if (S > pl->K / 1024) S = pl->K / 1024;
+        { const char *fs = getenv("OCU_OPENCL_SPLIT4"); if (fs != NULL) S = atoi(fs); }
         if (S > 1) {
             int kc = (pl->K + S - 1) / S;
             kc = (kc + 31) / 32 * 32;
