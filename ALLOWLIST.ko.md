@@ -32,4 +32,10 @@
 
 | 자료 | 주소 | 추가한 날 |
 |---|---|---|
-| (아직 없음) | | |
+| Khronos OpenCL 3.0 API·OpenCL C 명세, SPIR-V 명세 | https://registry.khronos.org/OpenCL/ , https://registry.khronos.org/SPIR-V/ | 2026-11-26 |
+| Khronos OpenCL 확장 명세: cl_intel_subgroups, cl_intel_subgroup_2d_block_io, cl_intel_subgroup_matrix_multiply_accumulate, cl_intel_unified_shared_memory, cl_khr_integer_dot_product | https://registry.khronos.org/OpenCL/extensions/ | 2026-11-26 |
+| LLVM / Clang 문서(HIP 언어 모드, SPIR-V 백엔드, InferAddressSpaces, BypassSlowDivision) | https://llvm.org/docs/ , https://clang.llvm.org/docs/ | 2026-11-26 |
+| CUB 공개 API 문서(BlockLoad, BlockStore, BlockReduce, WarpReduce) | https://nvidia.github.io/cccl/cub/ | 2026-11-26 |
+| cuBLAS / cuBLASLt API 설명서(함수 설명만) | https://docs.nvidia.com/cuda/cublas/ | 2026-11-26 |
+| bitsandbytes 소스(MIT): 저장 형식을 맞추려고 읽은 NF4 코드 표와 블록 배치(블록 64, f32 absmax, 앞 값이 상위 4비트). 시험 프로그램으로 고치지 않고 빌드 | https://github.com/bitsandbytes-foundation/bitsandbytes | 2026-11-26 |
+| QLoRA 논문(Dettmers 외 2023): NF4 자료형 | https://arxiv.org/abs/2305.14314 | 2026-11-26 |

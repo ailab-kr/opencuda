@@ -32,4 +32,10 @@ If you need a new source, add it to this list first, then use it.
 
 | Source | Address | Date added |
 |---|---|---|
-| (none yet) | | |
+| Khronos OpenCL 3.0 API and OpenCL C specifications, SPIR-V specification | https://registry.khronos.org/OpenCL/ , https://registry.khronos.org/SPIR-V/ | 2026-11-26 |
+| Khronos OpenCL extension specifications: cl_intel_subgroups, cl_intel_subgroup_2d_block_io, cl_intel_subgroup_matrix_multiply_accumulate, cl_intel_unified_shared_memory, cl_khr_integer_dot_product | https://registry.khronos.org/OpenCL/extensions/ | 2026-11-26 |
+| LLVM / Clang documentation (HIP language mode, SPIR-V back end, InferAddressSpaces, BypassSlowDivision) | https://llvm.org/docs/ , https://clang.llvm.org/docs/ | 2026-11-26 |
+| CUB public API documentation (BlockLoad, BlockStore, BlockReduce, WarpReduce) | https://nvidia.github.io/cccl/cub/ | 2026-11-26 |
+| cuBLAS / cuBLASLt API reference (function descriptions only) | https://docs.nvidia.com/cuda/cublas/ | 2026-11-26 |
+| bitsandbytes source, MIT licence: the NF4 code table and block layout (block 64, f32 absmax, high nibble first), read to match its storage format; built unmodified as a test program | https://github.com/bitsandbytes-foundation/bitsandbytes | 2026-11-26 |
+| QLoRA paper (Dettmers et al. 2023): the NF4 data type | https://arxiv.org/abs/2305.14314 | 2026-11-26 |
