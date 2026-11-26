@@ -286,6 +286,36 @@ cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t handle, cublasOperation
 
 #ifdef __cplusplus
 }
+
+/* C++: the older calls that pass a cudaDataType_t as the compute type. */
+static inline cublasStatus_t cublasGemmEx(cublasHandle_t handle, cublasOperation_t transa, cublasOperation_t transb, int m,
+                                          int n, int k, const void *alpha, const void *A, cudaDataType_t Atype, int lda,
+                                          const void *B, cudaDataType_t Btype, int ldb, const void *beta, void *C,
+                                          cudaDataType_t Ctype, int ldc, cudaDataType_t computeType, cublasGemmAlgo_t algo)
+{
+    return cublasGemmEx(handle, transa, transb, m, n, k, alpha, A, Atype, lda, B, Btype, ldb, beta, C, Ctype, ldc,
+                        (cublasComputeType_t)computeType, algo);
+}
+static inline cublasStatus_t cublasGemmBatchedEx(cublasHandle_t handle, cublasOperation_t transa, cublasOperation_t transb,
+                                                 int m, int n, int k, const void *alpha, const void *const Aarray[],
+                                                 cudaDataType_t Atype, int lda, const void *const Barray[], cudaDataType_t Btype,
+                                                 int ldb, const void *beta, void *const Carray[], cudaDataType_t Ctype, int ldc,
+                                                 int batchCount, cudaDataType_t computeType, cublasGemmAlgo_t algo)
+{
+    return cublasGemmBatchedEx(handle, transa, transb, m, n, k, alpha, Aarray, Atype, lda, Barray, Btype, ldb, beta, Carray,
+                               Ctype, ldc, batchCount, (cublasComputeType_t)computeType, algo);
+}
+static inline cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t handle, cublasOperation_t transa,
+                                                        cublasOperation_t transb, int m, int n, int k, const void *alpha,
+                                                        const void *A, cudaDataType_t Atype, int lda, long long int strideA,
+                                                        const void *B, cudaDataType_t Btype, int ldb, long long int strideB,
+                                                        const void *beta, void *C, cudaDataType_t Ctype, int ldc,
+                                                        long long int strideC, int batchCount, cudaDataType_t computeType,
+                                                        cublasGemmAlgo_t algo)
+{
+    return cublasGemmStridedBatchedEx(handle, transa, transb, m, n, k, alpha, A, Atype, lda, strideA, B, Btype, ldb, strideB,
+                                      beta, C, Ctype, ldc, strideC, batchCount, (cublasComputeType_t)computeType, algo);
+}
 #endif
 
 #endif /* OCU_CUBLAS_API_H */

@@ -48,7 +48,10 @@ struct ocu_cublas_context {
         ocu_op_desc desc;
         ocu_op_plan *plan;
     };
-    static constexpr int kPlanSlots = 32;
+    /* Open addressing by a hash of (device, descriptor): programs such as a
+       training loop use dozens of GEMM shapes, and replacing a plan frees its
+       split-K buffer, which waits for the device. */
+    static constexpr int kPlanSlots = 1024;
     std::mutex plans_lock;
     const ocu_op_table *plans_table;
     plan_slot plans[kPlanSlots];
@@ -628,15 +631,24 @@ ocu_op_plan *op_plan_for(cublasHandle_t h, const ocu_op_table *t, ocu_device *de
                          const ocu_op_desc &d)
 {
     if (h->plans_table != nullptr && h->plans_table != t) return nullptr; /* backend changed */
-    for (auto &s : h->plans) {
-        if (s.plan != nullptr && s.dev == dev && memcmp(&s.desc, &d, sizeof d) == 0) return s.plan;
+    uint64_t hs = 1469598103934665603ull ^ (uint64_t)(uintptr_t)dev;
+    const unsigned char *bytes = reinterpret_cast<const unsigned char *>(&d);
+    for (size_t i = 0; i < sizeof d; ++i) hs = (hs ^ bytes[i]) * 1099511628211ull;
+    const int home = (int)(hs % ocu_cublas_context::kPlanSlots);
+    int free_slot = -1;
+    for (int probe = 0; probe < 16; ++probe) {
+        auto &s = h->plans[(home + probe) % ocu_cublas_context::kPlanSlots];
+        if (s.plan == nullptr) {
+            if (free_slot < 0) free_slot = (home + probe) % ocu_cublas_context::kPlanSlots;
+            continue;
+        }
+        if (s.dev == dev && memcmp(&s.desc, &d, sizeof d) == 0) return s.plan;
     }
     ocu_op_caps caps;
     if (t->query(dev, &d, &caps) != OCU_OK || caps.accum_dtype != OCU_DT_F32) return nullptr;
     ocu_op_plan *plan = nullptr;
     if (t->plan(dev, &d, &plan) != OCU_OK || plan == nullptr) return nullptr;
-    auto &slot = h->plans[h->plans_next];
-    h->plans_next = (h->plans_next + 1) % ocu_cublas_context::kPlanSlots;
+    auto &slot = h->plans[free_slot >= 0 ? free_slot : home]; /* full run: replace the home slot */
     if (slot.plan != nullptr) t->destroy(slot.plan);
     slot.dev = dev;
     slot.desc = d;

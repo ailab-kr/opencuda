@@ -81,6 +81,7 @@ struct ocu_kernel {
     bool               takes_glob;   /* the variables block is a parameter */
     size_t             byval;        /* >0: packed arguments passed by value, this many bytes */
     uint64_t           svm_gen;      /* allocation table generation last given to the kernel */
+    int                indirect;     /* 1: Intel indirect-access flags set (no SVM list), -1: not available */
     bool               direct;       /* compiled SPIR-V: one OpenCL argument per CUDA parameter */
     bool               dyn;          /* direct: one more argument, the launch's dynamic shared memory */
     char              *ptr_param;    /* direct: per parameter, 1 = global pointer (set as SVM pointer) */
@@ -1049,10 +1050,27 @@ static size_t arg_align(size_t size)
 /* Every allocation may be reached through a pointer the kernel reads from
    its arguments or from memory: the kernel gets the whole table, again only
    when it changed since this kernel last got it. Called with k->lock held. */
+/* Intel (cl_intel_unified_shared_memory): the kernel may reach any allocation
+   through pointers in memory. One flag per kernel instead of the list of every
+   allocation, which the driver otherwise makes resident on each launch. */
+static int indirect_flags(cl_kernel k)
+{
+    static int mode = -1;
+    if (mode < 0) { const char *e = getenv("OCU_OPENCL_INDIRECT"); mode = e == NULL || *e != '0'; }
+    if (!mode) return 0;
+    const cl_bool yes = CL_TRUE;
+    const ocl_api *a = ocl_load();
+    return a->SetKernelExecInfo(k, 0x4200 /* INDIRECT_HOST_ACCESS_INTEL */, sizeof yes, &yes) == CL_SUCCESS &&
+           a->SetKernelExecInfo(k, 0x4201 /* INDIRECT_DEVICE_ACCESS_INTEL */, sizeof yes, &yes) == CL_SUCCESS &&
+           a->SetKernelExecInfo(k, 0x4202 /* INDIRECT_SHARED_ACCESS_INTEL */, sizeof yes, &yes) == CL_SUCCESS;
+}
+
 static cl_int set_svm_ptrs(ocu_kernel *k, ocu_device *d)
 {
     const ocl_api *a = ocl_load();
     cl_int err = CL_SUCCESS;
+    if (k->indirect == 0) k->indirect = indirect_flags(k->k) ? 1 : -1;
+    if (k->indirect > 0) return CL_SUCCESS;
     pthread_mutex_lock(&d->lock);
     if (k->svm_gen != d->gen || d->gen == 0) {
         size_t n = d->count;
@@ -1519,10 +1537,30 @@ static const char k_sgemm_src[] =
     "        #pragma unroll\n"
     "        for (int kk = 0; kk < BK; ++kk) {\n"
     "            // b[j] = Bs[kk][lx + 16 j]: one block read gives lane lx its 8 values\n"
+    "#if TN == 8\n"
     "            const float8 b = as_float8(intel_sub_group_block_read8((local const uint *)&Bs[kk][0]));\n"
-    "            const float8 a = vload8(0, &As[kk][ly * TM]);  // same 8 values in the whole sub-group\n"
-    "            const float av[8] = {a.s0, a.s1, a.s2, a.s3, a.s4, a.s5, a.s6, a.s7};\n"
     "            const float bv[8] = {b.s0, b.s1, b.s2, b.s3, b.s4, b.s5, b.s6, b.s7};\n"
+    "#elif TN == 4\n"
+    "            const float4 b = as_float4(intel_sub_group_block_read4((local const uint *)&Bs[kk][0]));\n"
+    "            const float bv[4] = {b.s0, b.s1, b.s2, b.s3};\n"
+    "#elif TN == 2\n"
+    "            const float2 b = as_float2(intel_sub_group_block_read2((local const uint *)&Bs[kk][0]));\n"
+    "            const float bv[2] = {b.s0, b.s1};\n"
+    "#else\n"
+    "            const float bv[1] = {as_float(intel_sub_group_block_read((local const uint *)&Bs[kk][0]))};\n"
+    "#endif\n"
+    "#if TM == 8\n"
+    "            const float8 a = vload8(0, &As[kk][ly * TM]);  // same values in the whole sub-group\n"
+    "            const float av[8] = {a.s0, a.s1, a.s2, a.s3, a.s4, a.s5, a.s6, a.s7};\n"
+    "#elif TM == 4\n"
+    "            const float4 a = vload4(0, &As[kk][ly * TM]);\n"
+    "            const float av[4] = {a.s0, a.s1, a.s2, a.s3};\n"
+    "#elif TM == 2\n"
+    "            const float2 a = vload2(0, &As[kk][ly * TM]);\n"
+    "            const float av[2] = {a.s0, a.s1};\n"
+    "#else\n"
+    "            const float av[1] = {As[kk][ly]};\n"
+    "#endif\n"
     "            #pragma unroll\n"
     "            for (int i = 0; i < TM; ++i)\n"
     "                #pragma unroll\n"
@@ -1752,8 +1790,11 @@ static const char k_hgemm_src[] =
 static const char k_hgemm4_src[] =
     "// XMX GEMM with 2D block loads (Xe2, cl_intel_subgroup_2d_block_io): no shared memory; the\n"
     "// hardware reads A tiles in DPAS layout and B ([N x K] rows) transposed into VNNI pairs.\n"
-    "// Row-major C[MxN] = alpha * A[MxK] * B[NxK]^T + beta * C. Conditions (checked by the host):\n"
-    "// K, lda, ldb multiples of 8; A, B (and batch strides) 64-byte aligned; K >= 32.\n"
+    "// Row-major C[MxN] = alpha * A[MxK] * op(B) + beta * C; TB=1: B is [N x K] (op = transpose), TB=0: B is\n"
+    "// [K x N], read with the hardware's VNNI transform. Conditions (checked by the host): K, lda, ldb\n"
+    "// multiples of 8; A, B (and batch strides) 64-byte aligned; K >= 32 (TB=0: N >= 32, even).\n"
+    "// Split-K: z = batch * S + slice; a slice's k range is clipped by the block reads' surface size\n"
+    "// (reads outside it return 0), and its partial sums go to C at slice offset (the host reduces).\n"
     "#pragma OPENCL EXTENSION cl_intel_subgroup_2d_block_io : enable\n"
     "#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable\n"
     "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n"
@@ -1770,33 +1811,50 @@ static const char k_hgemm4_src[] =
     "kernel void ocu_hgemm4(int M, int N, int K, float alpha, float beta,\n"
     "                       global const ushort *A0, long lda, long sa,\n"
     "                       global const ushort *B0, long ldb, long sb,\n"
-    "                       global void *C0v, long ldc, long sc)\n"
+    "                       global void *C0v, long ldc, long sc, int S, int kc)\n"
     "{\n"
     "    const int sg = get_sub_group_id(), lane = get_sub_group_local_id();\n"
     "    const int sgm = sg % SGM, sgn = sg / SGM;\n"
     "    const int m0 = get_group_id(1) * WM + sgm * TM, n0 = get_group_id(0) * WN + sgn * TN;\n"
-    "    const long bz = get_group_id(2);\n"
+    "    const long bz = get_group_id(2) / S;\n"
+    "    const int ks = (int)(get_group_id(2) % S);\n"
+    "    const int kbeg = ks * kc, kend = min(K, kbeg + kc);\n"
     "    global const ushort *A = A0 + bz * sa;\n"
     "    global const ushort *B = B0 + bz * sb;\n"
     "#if OUT == 0\n"
-    "    global float *C = (global float *)C0v + bz * sc;\n"
+    "    global float *C = (global float *)C0v + (S > 1 ? (long)get_group_id(2) : bz) * sc;\n"
     "#else\n"
     "    global ushort *C = (global ushort *)C0v + bz * sc;\n"
     "#endif\n"
-    "    const int wA = K * 2, pA = (int)lda * 2, wB = K * 2, pB = (int)ldb * 2;\n"
+    "    const int wA = kend * 2, pA = (int)lda * 2, pB = (int)ldb * 2;\n"
+    "#if TB\n"
+    "    const int wB = kend * 2, hB = N;\n"
+    "#else\n"
+    "    const int wB = N * 2, hB = kend;\n"
+    "#endif\n"
     "    float8 acc[4][4];\n"
     "    for (int i = 0; i < 4; ++i)\n"
     "        for (int j = 0; j < 4; ++j) acc[i][j] = (float8)0.0f;\n"
-    "    for (int k0 = 0; k0 < K; k0 += 16) {\n"
+    "    for (int k0 = kbeg; k0 < kend; k0 += 16) {\n"
     "        ushort8 a[4];\n"
     "        uint8 b[4];\n"
     "        intel_sub_group_2d_block_read_16b_32r16x1c((global void *)A, wA, M, pA, (int2)(k0, m0), (private ushort *)a);\n"
     "        for (int j = 0; j < 4; ++j)\n"
-    "            intel_sub_group_2d_block_read_transpose_32b_16r8x1c((global void *)B, wB, N, pB, (int2)(k0 / 2, n0 + 16 * j),\n"
+    "#if TB\n"
+    "            intel_sub_group_2d_block_read_transpose_32b_16r8x1c((global void *)B, wB, hB, pB, (int2)(k0 / 2, n0 + 16 * j),\n"
     "                                                                (private uint *)&b[j]);\n"
+    "#else\n"
+    "            intel_sub_group_2d_block_read_transform_16b_16r16x1c((global void *)B, wB, hB, pB, (int2)(n0 + 16 * j, k0),\n"
+    "                                                                 (private uint *)&b[j]);\n"
+    "#endif\n"
     "        intel_sub_group_2d_block_prefetch_16b_32r16x1c((global void *)A, wA, M, pA, (int2)(k0 + 32, m0));\n"
-    "        intel_sub_group_2d_block_prefetch_16b_32r16x1c((global void *)B, wB, N, pB, (int2)(k0 + 32, n0));\n"
-    "        intel_sub_group_2d_block_prefetch_16b_32r16x1c((global void *)B, wB, N, pB, (int2)(k0 + 32, n0 + 32));\n"
+    "#if TB\n"
+    "        intel_sub_group_2d_block_prefetch_16b_32r16x1c((global void *)B, wB, hB, pB, (int2)(k0 + 32, n0));\n"
+    "        intel_sub_group_2d_block_prefetch_16b_32r16x1c((global void *)B, wB, hB, pB, (int2)(k0 + 32, n0 + 32));\n"
+    "#else\n"
+    "        intel_sub_group_2d_block_prefetch_16b_16r16x2c((global void *)B, wB, hB, pB, (int2)(n0, k0 + 32));\n"
+    "        intel_sub_group_2d_block_prefetch_16b_16r16x2c((global void *)B, wB, hB, pB, (int2)(n0 + 32, k0 + 32));\n"
+    "#endif\n"
     "        for (int i = 0; i < 4; ++i)\n"
     "            for (int j = 0; j < 4; ++j) acc[i][j] = MAD(as_short8(a[i]), as_int8(b[j]), acc[i][j]);\n"
     "    }\n"
@@ -1840,13 +1898,14 @@ typedef struct ocu_op_plan {
     int         parr;       /* OCU_OP_FLAG_PTR_ARRAY: A, B, C are pointer arrays */
     cl_kernel   k4;         /* 2D-block-load XMX kernel when the shape allows it (else NULL) */
     int         sgm4, sgn4; /* its sub-group grid */
+    int         bm, bn;     /* FP32 kernel tile (128 x 128 unless the shape is small) */
     void       *part;       /* S x M x N partial sums when S > 1 */
     cl_kernel   reduce;
     char        name[96];   /* for OCU_OPENCL_TRACE */
 } ocl_gemm_plan;
 
 static pthread_mutex_t ops_lock = PTHREAD_MUTEX_INITIALIZER;
-typedef struct { ocu_device *dev; cl_kernel k[4]; cl_kernel kp[4]; cl_kernel reduce; int state; int xmx; cl_kernel hk[2][3][4][2]; cl_kernel hk4[2][3][2]; int blk; } ocl_ops_dev; /* state: 0 new, 1 ok, -1 no */
+typedef struct { ocu_device *dev; cl_kernel k[4]; cl_kernel kp[4]; cl_kernel kt[4][4][4][2]; cl_kernel reduce; int state; int xmx; cl_kernel hk[2][3][4][2]; cl_kernel hk4[2][3][2][2]; int blk; } ocl_ops_dev; /* state: 0 new, 1 ok, -1 no */
 static ocl_ops_dev ops_devs[16];
 
 static int ops_enabled(ocu_device *d)
@@ -1909,9 +1968,9 @@ static int xmx_enabled(ocu_device *d)
 
 /* The XMX kernel for (input type, output type, transposes), built on first use. ops_lock held. */
 /* The 2D-block-load XMX GEMM (A [M x K], B [N x K]); cfg 0: 256 x 256 tiles, 1: 128 x 256. */
-static cl_kernel hgemm4_kernel(ocu_device *d, ocl_ops_dev *o, int bf, int out, int cfg)
+static cl_kernel hgemm4_kernel(ocu_device *d, ocl_ops_dev *o, int bf, int out, int cfg, int tb)
 {
-    if (o->hk4[bf][out][cfg] != NULL) return o->hk4[bf][out][cfg];
+    if (o->hk4[bf][out][cfg][tb] != NULL) return o->hk4[bf][out][cfg][tb];
     if (o->blk == 0) {
         char ext[16384] = {0};
         ocl_load()->GetDeviceInfo(d->entry->device, CL_DEVICE_EXTENSIONS, sizeof ext - 1, ext, NULL);
@@ -1925,8 +1984,8 @@ static cl_kernel hgemm4_kernel(ocu_device *d, ocl_ops_dev *o, int bf, int out, i
     cl_program prog = a->CreateProgramWithSource(d->ctx, 1, &src, NULL, &err);
     if (prog == NULL) return NULL;
     char opts[256];
-    snprintf(opts, sizeof opts, "-cl-std=CL3.0 -DBF16=%d -DOUT=%d -DSGM=%d -DSGN=4 -cl-intel-256-GRF-per-thread",
-             bf, out, cfg == 0 ? 8 : 4);
+    snprintf(opts, sizeof opts, "-cl-std=CL3.0 -DBF16=%d -DOUT=%d -DSGM=%d -DSGN=4 -DTB=%d -cl-intel-256-GRF-per-thread",
+             bf, out, cfg == 0 ? 8 : 4, tb);
     err = a->BuildProgram(prog, 1, &d->entry->device, opts, NULL, NULL);
     cl_kernel k = err == CL_SUCCESS ? a->CreateKernel(prog, "ocu_hgemm4", &err) : NULL;
     a->ReleaseProgram(prog);
@@ -1935,7 +1994,27 @@ static cl_kernel hgemm4_kernel(ocu_device *d, ocl_ops_dev *o, int bf, int out, i
         o->blk = -1;
         return NULL;
     }
-    o->hk4[bf][out][cfg] = k;
+    o->hk4[bf][out][cfg][tb] = k;
+    return k;
+}
+
+/* The FP32 GEMM with a BM x BN tile (16 .. 128 each; 128 x 128 is o->k / o->kp), built on first use. */
+static cl_kernel sgemm_tile_kernel(ocu_device *d, ocl_ops_dev *o, int v, int bm, int bn, int parr)
+{
+    const int im = bm == 16 ? 0 : bm == 32 ? 1 : bm == 64 ? 2 : 3, in = bn == 16 ? 0 : bn == 32 ? 1 : bn == 64 ? 2 : 3;
+    if (o->kt[v][im][in][parr] != NULL) return o->kt[v][im][in][parr];
+    const ocl_api *a = ocl_load();
+    cl_int err = CL_SUCCESS;
+    const char *src = k_sgemm_src;
+    cl_program prog = a->CreateProgramWithSource(d->ctx, 1, &src, NULL, &err);
+    if (prog == NULL) return NULL;
+    char opts[256];
+    snprintf(opts, sizeof opts, "-cl-std=CL3.0 -DTA=%d -DTB=%d -DPARR=%d -DBM=%d -DBN=%d -DKNAME=ocu_sgemm", v >> 1, v & 1,
+             parr, bm, bn);
+    err = a->BuildProgram(prog, 1, &d->entry->device, opts, NULL, NULL);
+    cl_kernel k = err == CL_SUCCESS ? a->CreateKernel(prog, "ocu_sgemm", &err) : NULL;
+    a->ReleaseProgram(prog);
+    o->kt[v][im][in][parr] = k;
     return k;
 }
 
@@ -2089,12 +2168,13 @@ static ocu_status ops_plan(ocu_device *dev, const ocu_op_desc *d, ocu_op_plan **
         pthread_mutex_lock(&ops_lock);
         pl->k = xmx_kernel(dev, o, p.in == OCU_DT_BF16, p.out == OCU_DT_F32 ? 0 : p.out == OCU_DT_F16 ? 1 : 2, ta * 2 + tb, p.parr);
         pl->k4 = NULL;
-        if (pl->k != NULL && !p.parr && ta == 0 && tb == 1 && pl->K >= 32 && pl->K % 8 == 0 && pl->lda % 8 == 0 &&
+        if (pl->k != NULL && !p.parr && ta == 0 && (tb == 1 || (pl->N >= 32 && pl->N % 2 == 0)) && pl->K >= 32 &&
+            pl->K % 8 == 0 && pl->lda % 8 == 0 &&
             pl->ldb % 8 == 0 && (pl->batch == 1 || (pl->sa % 32 == 0 && pl->sb % 32 == 0)) &&
             (long)pl->K * 2 <= 0x7fffffffL && pl->lda * 2 <= 0x7fffffffL && pl->ldb * 2 <= 0x7fffffffL) {
             const long big = (long)((pl->M + 255) / 256) * ((pl->N + 255) / 256) * pl->batch;
             const int cfg = big >= 64 ? 0 : 1;
-            pl->k4 = hgemm4_kernel(dev, o, p.in == OCU_DT_BF16, p.out == OCU_DT_F32 ? 0 : p.out == OCU_DT_F16 ? 1 : 2, cfg);
+            pl->k4 = hgemm4_kernel(dev, o, p.in == OCU_DT_BF16, p.out == OCU_DT_F32 ? 0 : p.out == OCU_DT_F16 ? 1 : 2, cfg, tb);
             pl->sgm4 = cfg == 0 ? 8 : 4;
             pl->sgn4 = 4;
         }
@@ -2104,12 +2184,36 @@ static ocu_status ops_plan(ocu_device *dev, const ocu_op_desc *d, ocu_op_plan **
     pl->S = 1;
     pl->kc = pl->K;
     pl->part = NULL;
+    pl->bm = pl->bn = 128;
+    if (p.in == OCU_DT_F32 && getenv("OCU_OPENCL_SGEMM_TILES") == NULL) {
+        /* Small or skinny shapes (LoRA's rank-16 sides, attention heads): smaller tiles, so
+           that the GPU gets enough work-groups and few computed values are thrown away. */
+        int bm = 128, bn = 128;
+        while (bm > 16 && bm / 2 >= pl->M) bm /= 2;
+        while (bn > 16 && bn / 2 >= pl->N) bn /= 2;
+        /* The 128 x 128 tile (8 x 8 values per work-item) is several times faster per
+           value; smaller ones only when the shape is very small. */
+        for (;;) {
+            const long wg = (long)((pl->M + bm - 1) / bm) * ((pl->N + bn - 1) / bn) * pl->batch;
+            if (wg >= 16 || (bm <= 64 && bn <= 64)) break;
+            if (bm >= bn && bm > 64) bm /= 2; else if (bn > 64) bn /= 2; else break;
+        }
+        if (bm != 128 || bn != 128) {
+            pthread_mutex_lock(&ops_lock);
+            cl_kernel k = sgemm_tile_kernel(dev, o, ta * 2 + tb, bm, bn, p.parr);
+            pthread_mutex_unlock(&ops_lock);
+            if (k != NULL) { pl->k = k; pl->bm = bm; pl->bn = bn; }
+        }
+    }
     /* Split-K when the C tiles cannot fill the GPU and K is long (for example
        a 256 x 128 result over K = 50304: 2 tiles). Slices of at least 512. */
-    const long tiles = (long)((pl->M + 127) / 128) * ((pl->N + 127) / 128) * pl->batch;
-    if (p.in == OCU_DT_F32 && pl->batch == 1 && !pl->parr && tiles < 128 && pl->K >= 2048 && getenv("OCU_OPENCL_SPLITK") == NULL) {
-        int S = (int)((256 + tiles - 1) / tiles);
-        if (S > pl->K / 512) S = pl->K / 512;
+    const long tiles = (long)((pl->M + pl->bm - 1) / pl->bm) * ((pl->N + pl->bn - 1) / pl->bn) * pl->batch;
+    /* The 2D-block XMX kernel: split K when its tiles cannot fill the GPU (f32 output). */
+    if (pl->k4 != NULL && p.out == OCU_DT_F32 && pl->batch == 1 && getenv("OCU_OPENCL_SPLITK") == NULL) {
+        const long t4 = (long)((pl->M + 32 * pl->sgm4 - 1) / (32 * pl->sgm4)) * ((pl->N + 255) / 256);
+        /* Only when the tiles are very few: the partial sums and their reduction cost a pass over C. */
+        int S = t4 < 16 && pl->K >= 2048 ? (int)((32 + t4 - 1) / t4) : 1;
+        if (S > pl->K / 1024) S = pl->K / 1024;
         if (S > 1) {
             int kc = (pl->K + S - 1) / S;
             kc = (kc + 31) / 32 * 32;
@@ -2122,7 +2226,29 @@ static ocu_status ops_plan(ocu_device *dev, const ocu_op_desc *d, ocu_op_plan **
             }
         }
     }
-    snprintf(pl->name, sizeof pl->name, "%s %c%c M%d N%d K%d x%d split %d",
+    /* Also for accuracy: a very long K (a vocabulary) is summed in slices of
+       at most 8192, so no output adds 150000 products in one chain. */
+    const int long_k = pl->K > 16384;
+    /* Skinny results (LoRA's rank-16 side: a few work-groups) split even a short K, in slices of 128 or more. */
+    const int skinny = tiles < 32 && pl->K >= 512;
+    if (p.in == OCU_DT_F32 && pl->batch == 1 && !pl->parr && (tiles < 128 || long_k) && (pl->K >= 2048 || skinny) &&
+        getenv("OCU_OPENCL_SPLITK") == NULL) {
+        int S = tiles < 128 ? (int)((256 + tiles - 1) / tiles) : 1;
+        if (S > pl->K / (skinny && pl->K < 2048 ? 128 : 512)) S = pl->K / (skinny && pl->K < 2048 ? 128 : 512);
+        if (long_k && S < (pl->K + 8191) / 8192) S = (pl->K + 8191) / 8192;
+        if (S > 1) {
+            int kc = (pl->K + S - 1) / S;
+            kc = (kc + 31) / 32 * 32;
+            S = (pl->K + kc - 1) / kc;
+            void *part = NULL;
+            if (S > 1 && ocl_mem_alloc(dev, (size_t)S * pl->M * pl->N * sizeof(float), &part) == OCU_OK) {
+                pl->S = S;
+                pl->kc = kc;
+                pl->part = part;
+            }
+        }
+    }
+    snprintf(pl->name, sizeof pl->name, pl->bm != 128 || pl->bn != 128 ? "%s %c%c M%d N%d K%d x%d split %d t" : "%s %c%c M%d N%d K%d x%d split %d",
              p.in == OCU_DT_F32 ? "ocu_sgemm" : p.in == OCU_DT_F16 ? "ocu_hgemm(xmx f16)" : "ocu_hgemm(xmx bf16)",
              ta ? 'T' : 'N', tb ? 'T' : 'N', pl->M, pl->N, pl->K, pl->batch, pl->S);
     *out = pl;
@@ -2143,6 +2269,10 @@ static ocu_status ops_execute(ocu_op_plan *pl, ocu_queue *q, const ocu_tensor *t
     size_t lws[3] = {xmx ? 128 : 16, xmx ? 1 : 16, 1};
     size_t gws[3] = {(size_t)((pl->N + 127) / 128) * (xmx ? 128 : 16), (size_t)((pl->M + 127) / 128) * (xmx ? 1 : 16),
                      (size_t)pl->batch * pl->S};
+    if (!xmx) {
+        gws[0] = (size_t)((pl->N + pl->bn - 1) / pl->bn) * 16;
+        gws[1] = (size_t)((pl->M + pl->bm - 1) / pl->bm) * 16;
+    }
     /* The block loads need 64-byte aligned matrices. */
     cl_kernel kern = pl->k;
     if (pl->k4 != NULL && ((uintptr_t)t[0].data & 63) == 0 && ((uintptr_t)t[1].data & 63) == 0) {
@@ -2152,7 +2282,10 @@ static ocu_status ops_execute(ocu_op_plan *pl, ocu_queue *q, const ocu_tensor *t
         gws[0] = (size_t)((pl->N + wn - 1) / wn) * lws[0];
         gws[1] = (size_t)((pl->M + wm - 1) / wm);
     }
-    const int split = pl->S > 1;
+    /* A split plan of the 2D kernel runs unsplit on the fallback kernel (misaligned matrices). */
+    const int S_run = (xmx && kern != pl->k4) ? 1 : pl->S;
+    const int split = S_run > 1;
+    gws[2] = (size_t)pl->batch * S_run;
     const float one = 1.0f, zero = 0.0f;
     const long ldp = pl->N, sp = (long)pl->M * pl->N;
     cl_event ev = NULL;
@@ -2172,9 +2305,10 @@ static ocu_status ops_execute(ocu_op_plan *pl, ocu_queue *q, const ocu_tensor *t
     err |= a->SetKernelArgSVMPointer(kern, i++, split ? pl->part : t[2].data);
     err |= a->SetKernelArg(kern, i++, sizeof(long), split ? &ldp : &pl->ldc);
     err |= a->SetKernelArg(kern, i++, sizeof(long), split ? &sp : &pl->sc);
-    if (!xmx) {
-        err |= a->SetKernelArg(kern, i++, sizeof(int), &pl->S);
-        err |= a->SetKernelArg(kern, i++, sizeof(int), &pl->kc);
+    if (!xmx || kern == pl->k4) {
+        const int kc_run = split ? pl->kc : pl->K;
+        err |= a->SetKernelArg(kern, i++, sizeof(int), &S_run);
+        err |= a->SetKernelArg(kern, i++, sizeof(int), &kc_run);
     }
     if (err == CL_SUCCESS && pl->parr) {
         /* The matrices are reached through the arrays: name every allocation. */

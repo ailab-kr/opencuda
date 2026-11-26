@@ -335,6 +335,8 @@ def main(argv):
         cmd = [clang, "-x", "hip", "--offload=spirv64", "-nogpulib", "-nogpuinc", "--offload-device-only",
                "-std=c++17", "-O2", "-S", "-emit-llvm", "-ffp-contract=fast",
                # HIP mode does not define __CUDA__, which OpenCuda's headers test for device code
+               # nor should CUDA programs see HIP's macros: they pick their HIP code with them
+               "-U__HIPCC__", "-U__HIP__",
                "-DOCU_SPIRV_PATH=1", "-D__CUDACC__", "-D__CUDA__=1", f"-DOCU_SPV_CUDA_ARCH={arch}", f"-D__CUDA_ARCH_LIST__={arch}",
                f"-I{RT}", "-include", str(RT / "cuda_runtime.h"), "-Wno-unknown-cuda-version",
                *[f"-I{i}" for i in a.I], *[f"-D{d}" for d in a.D], a.src, "-o", str(ll)]

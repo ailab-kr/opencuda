@@ -12,6 +12,9 @@
  *                                               InclusiveScan, ExclusiveScan
  *                                               (one item or an array per thread)
  *   BlockLoad / BlockStore<T, X, ITEMS, ALG>    blocked and striped arrangements
+ *   BlockReduce<T, BLOCK_DIM_X, ALG, Y, Z>      Reduce, Sum (one item, an array per
+ *                                               thread, or the first num_valid threads)
+ *   WarpReduce<T, LOGICAL_WARP_THREADS>         Reduce, Sum (optionally valid_items)
  *   DeviceReduce                                Sum, Max, Min, Reduce
  *   DeviceScan                                  InclusiveSum, ExclusiveSum,
  *                                               InclusiveScan, ExclusiveScan
@@ -1376,6 +1379,127 @@ struct DeviceSegmentedSort {
     OCU_CUB_SEGSORT_KEYS(StableSortKeysDescending, true)
 #undef OCU_CUB_SEGSORT_PAIRS
 #undef OCU_CUB_SEGSORT_KEYS
+};
+
+/* ---- BlockReduce, WarpReduce ------------------------------------------ */
+
+/*
+ * As documented: the aggregate is returned to thread 0 (lane 0 of each
+ * logical warp for WarpReduce); other threads' return values are
+ * undefined (here: also the aggregate). Inputs combine in thread order,
+ * op(lower, higher), so the operator need only be associative. Every
+ * thread of the block (warp) must call; TempStorage may be reused after a
+ * __syncthreads() (__syncwarp()).
+ */
+enum BlockReduceAlgorithm {
+    BLOCK_REDUCE_RAKING_COMMUTATIVE_ONLY,
+    BLOCK_REDUCE_RAKING,
+    BLOCK_REDUCE_WARP_REDUCTIONS
+};
+
+template <typename T, int BLOCK_DIM_X, BlockReduceAlgorithm ALGORITHM = BLOCK_REDUCE_WARP_REDUCTIONS,
+          int BLOCK_DIM_Y = 1, int BLOCK_DIM_Z = 1, int LEGACY_PTX_ARCH = 0>
+class BlockReduce {
+    static constexpr int BLOCK_THREADS = BLOCK_DIM_X * BLOCK_DIM_Y * BLOCK_DIM_Z;
+
+public:
+    struct TempStorage {
+        ocu_detail::raw_array<T, BLOCK_THREADS> buf;
+    };
+
+    __device__ __forceinline__ BlockReduce(TempStorage &temp_storage)
+        : s_(temp_storage), tid_(ocu_detail::linear_tid<BLOCK_DIM_X, BLOCK_DIM_Y, BLOCK_DIM_Z>())
+    {
+    }
+
+    template <typename ReductionOp>
+    __device__ __forceinline__ T Reduce(T input, ReductionOp op)
+    {
+        return reduce(input, op, BLOCK_THREADS);
+    }
+
+    template <typename ReductionOp>
+    __device__ __forceinline__ T Reduce(T input, ReductionOp op, int num_valid)
+    {
+        return reduce(input, op, num_valid < BLOCK_THREADS ? num_valid : BLOCK_THREADS);
+    }
+
+    template <int ITEMS_PER_THREAD, typename ReductionOp>
+    __device__ __forceinline__ T Reduce(T (&inputs)[ITEMS_PER_THREAD], ReductionOp op)
+    {
+        T v = inputs[0];
+        for (int i = 1; i < ITEMS_PER_THREAD; ++i) v = op(v, inputs[i]);
+        return reduce(v, op, BLOCK_THREADS);
+    }
+
+    __device__ __forceinline__ T Sum(T input) { return Reduce(input, cub::Sum()); }
+    __device__ __forceinline__ T Sum(T input, int num_valid) { return Reduce(input, cub::Sum(), num_valid); }
+    template <int ITEMS_PER_THREAD>
+    __device__ __forceinline__ T Sum(T (&inputs)[ITEMS_PER_THREAD]) { return Reduce(inputs, cub::Sum()); }
+
+private:
+    TempStorage &s_;
+    int tid_;
+
+    template <typename ReductionOp>
+    __device__ __forceinline__ T reduce(T v, ReductionOp op, int n)
+    {
+        T *b = s_.buf.data();
+        b[tid_] = v;
+        __syncthreads();
+        for (int d = 1; d < BLOCK_THREADS; d *= 2) {
+            if (tid_ % (2 * d) == 0 && tid_ + d < n) b[tid_] = op(b[tid_], b[tid_ + d]);
+            __syncthreads();
+        }
+        return b[0];
+    }
+};
+
+template <typename T, int LOGICAL_WARP_THREADS = 32, int LEGACY_PTX_ARCH = 0>
+class WarpReduce {
+public:
+    struct TempStorage {
+        ocu_detail::raw_array<T, LOGICAL_WARP_THREADS> buf;
+    };
+
+    __device__ __forceinline__ WarpReduce(TempStorage &temp_storage)
+        : s_(temp_storage), lane_((int)(ocu_detail::linear_tid<1024, 1, 1>() % LOGICAL_WARP_THREADS))
+    {
+        /* linear thread id over x, y, z (the block's dims are not template parameters here) */
+        lane_ = (int)((threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z)) % LOGICAL_WARP_THREADS);
+    }
+
+    template <typename ReductionOp>
+    __device__ __forceinline__ T Reduce(T input, ReductionOp op) { return reduce(input, op, LOGICAL_WARP_THREADS); }
+
+    template <typename ReductionOp>
+    __device__ __forceinline__ T Reduce(T input, ReductionOp op, int valid_items)
+    {
+        return reduce(input, op, valid_items < LOGICAL_WARP_THREADS ? valid_items : LOGICAL_WARP_THREADS);
+    }
+
+    __device__ __forceinline__ T Sum(T input) { return Reduce(input, cub::Sum()); }
+    __device__ __forceinline__ T Sum(T input, int valid_items) { return Reduce(input, cub::Sum(), valid_items); }
+
+private:
+    TempStorage &s_;
+    int lane_;
+
+    template <typename ReductionOp>
+    __device__ __forceinline__ T reduce(T v, ReductionOp op, int n)
+    {
+        T *b = s_.buf.data();
+        b[lane_] = v;
+        __syncwarp();
+        for (int d = 1; d < LOGICAL_WARP_THREADS; d *= 2) {
+            T mine = b[lane_];
+            T other = lane_ + d < LOGICAL_WARP_THREADS ? b[lane_ + d] : mine;
+            __syncwarp();
+            if (lane_ % (2 * d) == 0 && lane_ + d < n) b[lane_] = op(mine, other);
+            __syncwarp();
+        }
+        return b[0];
+    }
 };
 
 } // namespace cub
