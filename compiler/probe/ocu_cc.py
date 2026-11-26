@@ -366,7 +366,7 @@ def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
         path = pinned_cuda_path(work.parent if args.cache is None else Path(args.cache))
         cuda = [clang, "-x", "cuda", f"-std={std}", "-nocudainc", "-nocudalib",
                 f"--cuda-path={path}", "--cuda-gpu-arch=sm_80", *ours,
-                "-D__CUDACC__", "-include", str(dirs[0] / "cuda_runtime.h"),
+                "-D__CUDACC__", "-DOCU_OPENCL_HOST_PASS=1", "-include", str(dirs[0] / "cuda_runtime.h"),
                 "-Wno-unknown-cuda-version", *FP_CONTRACT]
         img = work / (src.stem + ".oclimg")
         fat = work / (src.stem + ".ocufat")
@@ -376,12 +376,18 @@ def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
             cuda += ["-iquote", str(src.parent), "-I", str(src.parent)]
             src = copy
         flags = [f"-I{i}" for i in args.I] + [f"-D{d}" for d in args.D]
-        flags += [p for p in pre if (p.startswith("-I") or p.startswith("-D")) and len(p) > 2]
+        for i, p in enumerate(pre):
+            if p.startswith(("-I", "-D")) and len(p) > 2:
+                flags.append(p)
+            elif p in ("-I", "-D", "-isystem", "-iquote") and i + 1 < len(pre):
+                flags.append(("-I" if p != "-D" else "-D") + pre[i + 1])
+        # the toolkit's library headers (cublas_v2.h ...) for the device pass too
+        flags += [f"-I{d}" for d in dirs[1:]]
         return [["env", "OCU_CU2OCL_EMPTY_OK=1", sys.executable,
                  str(REPO / "compiler" / "opencl" / "cu2ocl.py"), "--clang", clang, "--keep-going",
                  *flags, str(dev_src), "-o", str(img)],
                 ["<container>", str(fat), "opencl", str(img)],
-                [*cuda, "--cuda-host-only", "-Xclang", "-fcuda-include-gpubinary",
+                [*cuda, "-fPIC", "--cuda-host-only", "-Xclang", "-fcuda-include-gpubinary",
                  "-Xclang", str(fat), *common, *host, *deps, "-c", str(src), "-o", str(out)]]
     if args.target == "nvidia" and not str(out).endswith(".ptx"):
         # Whole program: device code as PTX in our container, embedded in

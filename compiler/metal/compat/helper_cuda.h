@@ -33,3 +33,4 @@ inline void ocu_check_last(const char *message, const char *file, int line) {
 #define getLastCudaError(msg) ocu_check_last((msg), __FILE__, __LINE__)
 
 #endif
+

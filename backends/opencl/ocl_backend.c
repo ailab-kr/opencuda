@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #include "ocu_backend.h"
 #include "ocu_backend_opencl.h"
+#include "ocu_ops.h"
 #include "ocl_api.h"
 
 #include <pthread.h>
@@ -43,6 +44,7 @@ struct ocu_device {
     ocl_alloc        *allocs;
     size_t            count, cap;
     uint64_t          allocated;
+    uint64_t          gen;      /* bumped when the allocation table changes */
     struct ocu_queue *queues;   /* every queue of the device (mem_free waits for them) */
 };
 
@@ -63,7 +65,9 @@ struct ocu_kernel {
     size_t            *param_sizes;
     size_t             max_threads;  /* CL_KERNEL_WORK_GROUP_SIZE */
     uint64_t           static_local; /* CL_KERNEL_LOCAL_MEM_SIZE */
-    bool               takes_glob;   /* 4 parameters: the variables block is the third */
+    bool               takes_glob;   /* the variables block is a parameter */
+    size_t             byval;        /* >0: packed arguments passed by value, this many bytes */
+    uint64_t           svm_gen;      /* allocation table generation last given to the kernel */
     pthread_mutex_t    lock;         /* argument setting + enqueue is one step */
     struct ocu_kernel *next;
 };
@@ -490,6 +494,7 @@ static bool table_add(ocu_device *d, char *ptr, size_t size, char *base)
         d->allocs[d->count].size = size;
         d->allocs[d->count].base = base;
         d->count++;
+        d->gen++;
         d->allocated += size;
     }
     pthread_mutex_unlock(&d->lock);
@@ -507,6 +512,7 @@ static char *table_remove(ocu_device *d, const char *ptr)
             d->allocated -= d->allocs[i].size;
             found = d->allocs[i].base;
             d->allocs[i] = d->allocs[--d->count];
+            d->gen++;
             break;
         }
     }
@@ -582,6 +588,7 @@ static ocu_status ocl_mem_free(ocu_device *d, void *ptr)
 }
 
 /* Run `ev`'s command to the end when the caller asked for synchronous work. */
+static int ops_enabled(ocu_device *d);
 static ocu_status finish_enqueue(ocu_queue *queue, bool sync, cl_int err, cl_event ev)
 {
     const ocl_api *a = ocl_load();
@@ -809,7 +816,13 @@ static ocu_status ocl_module_load(ocu_device *d, const void *image, size_t bytes
         free_module(m);
         return map_err(err) == OCU_OK ? OCU_ERR_INVALID_VALUE : map_err(err);
     }
-    err = a->BuildProgram(m->program, 1, &d->entry->device, options, NULL, NULL);
+    /* OCU_OPENCL_BUILD_OPTIONS: extra options for the driver's compiler (for
+       example -cl-intel-enable-auto-large-GRF-mode on Intel GPUs). */
+    char opts[1024];
+    const char *extra = getenv("OCU_OPENCL_BUILD_OPTIONS");
+    if (extra == NULL && ops_enabled(d)) extra = "-cl-intel-enable-auto-large-GRF-mode"; /* Intel GPUs */
+    snprintf(opts, sizeof(opts), "%s%s%s", options ? options : "", extra && *extra ? " " : "", extra ? extra : "");
+    err = a->BuildProgram(m->program, 1, &d->entry->device, opts, NULL, NULL);
     if (err != CL_SUCCESS) {
         if (verbose()) {
             size_t n = 0;
@@ -866,6 +879,10 @@ static void parse_params(struct ocu_kernel *k, const char *meta)
     size_t len = strlen(k->name);
     for (const char *line = meta; line != NULL && *line;
          line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL) {
+        if (strncmp(line, "byval ", 6) == 0 && strncmp(line + 6, k->name, len) == 0 && line[6 + len] == ' ') {
+            k->byval = strtoul(line + 7 + len, NULL, 10);
+            continue;
+        }
         if (strncmp(line, "param ", 6) != 0) continue;
         const char *p = line + 6;
         if (strncmp(p, k->name, len) != 0 || (p[len] != ' ' && p[len] != '\n' && p[len] != '\0')) continue;
@@ -883,7 +900,6 @@ static void parse_params(struct ocu_kernel *k, const char *meta)
         if (n && k->param_sizes == NULL) return;
         if (n) memcpy(k->param_sizes, sizes, n * sizeof(size_t));
         k->nparams = n;
-        return;
     }
 }
 
@@ -923,9 +939,9 @@ static ocu_status ocl_module_get_kernel(ocu_module *m, const char *name, ocu_ker
         k->static_local = lm;
         cl_uint nargs = 0;
         a->GetKernelInfo(ck, CL_KERNEL_NUM_ARGS, sizeof(nargs), &nargs, NULL);
-        k->takes_glob = nargs == 4;
         pthread_mutex_init(&k->lock, NULL);
         parse_params(k, m->meta);
+        k->takes_glob = k->byval ? nargs == 3 : nargs == 4;
         k->next = m->kernels;
         m->kernels = k;
         *out = k;
@@ -968,6 +984,141 @@ static size_t arg_align(size_t size)
     return a;
 }
 
+/* Every allocation may be reached through a pointer the kernel reads from
+   its arguments or from memory: the kernel gets the whole table, again only
+   when it changed since this kernel last got it. Called with k->lock held. */
+static cl_int set_svm_ptrs(ocu_kernel *k, ocu_device *d)
+{
+    const ocl_api *a = ocl_load();
+    cl_int err = CL_SUCCESS;
+    pthread_mutex_lock(&d->lock);
+    if (k->svm_gen != d->gen || d->gen == 0) {
+        size_t n = d->count;
+        void **ptrs = malloc((n ? n : 1) * sizeof(void *));
+        if (ptrs == NULL) {
+            err = CL_OUT_OF_HOST_MEMORY;
+        } else {
+            for (size_t i = 0; i < n; ++i) ptrs[i] = d->allocs[i].ptr;
+            if (n > 0) err = a->SetKernelExecInfo(k->k, CL_KERNEL_EXEC_INFO_SVM_PTRS, n * sizeof(void *), ptrs);
+            free(ptrs);
+            if (err == CL_SUCCESS) k->svm_gen = d->gen;
+        }
+    }
+    pthread_mutex_unlock(&d->lock);
+    return err;
+}
+
+/* OCU_OPENCL_TRACE=1: GPU time per kernel name, printed at exit (the queues
+   keep profiling on for markers already). */
+typedef struct { const char *name; cl_event ev; } trace_rec;
+static trace_rec *trace_v;
+static size_t trace_n, trace_cap;
+static pthread_mutex_t trace_lock = PTHREAD_MUTEX_INITIALIZER;
+static int trace_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("OCU_OPENCL_TRACE"); on = e != NULL && *e == '1'; }
+    return on;
+}
+static void trace_report(void)
+{
+    const ocl_api *a = ocl_load();
+    typedef struct { const char *name; double us; size_t n; } agg;
+    agg *g = calloc(trace_n + 1, sizeof(agg));
+    size_t ng = 0;
+    double total = 0;
+    for (size_t i = 0; i < trace_n; ++i) {
+        cl_ulong t0 = 0, t1 = 0;
+        a->WaitForEvents(1, &trace_v[i].ev);
+        a->GetEventProfilingInfo(trace_v[i].ev, CL_PROFILING_COMMAND_START, sizeof(t0), &t0, NULL);
+        a->GetEventProfilingInfo(trace_v[i].ev, CL_PROFILING_COMMAND_END, sizeof(t1), &t1, NULL);
+        double us = (t1 - t0) / 1e3;
+        total += us;
+        size_t j = 0;
+        while (j < ng && strcmp(g[j].name, trace_v[i].name) != 0) ++j;
+        if (j == ng) { g[ng].name = trace_v[i].name; ++ng; }
+        g[j].us += us;
+        g[j].n++;
+    }
+    for (size_t i = 0; i < ng; ++i)
+        for (size_t j = i + 1; j < ng; ++j)
+            if (g[j].us > g[i].us) { agg t = g[i]; g[i] = g[j]; g[j] = t; }
+    fprintf(stderr, "ocu opencl trace: %zu launches, %.1f ms of kernel time\n", trace_n, total / 1e3);
+    for (size_t i = 0; i < ng && i < 25; ++i)
+        fprintf(stderr, "  %6.2f%%  %9.1f us  %6zu x  %8.1f us/launch  %s\n", 100 * g[i].us / total, g[i].us, g[i].n,
+                g[i].us / g[i].n, g[i].name);
+    free(g);
+}
+static void trace_add_name(const char *name, cl_event ev);
+static void trace_add(ocu_kernel *k, cl_event ev) { trace_add_name(k->name, ev); }
+static void trace_add_name(const char *name, cl_event ev)
+{
+    if (ev == NULL) return;
+    pthread_mutex_lock(&trace_lock);
+    if (trace_v == NULL) atexit(trace_report);
+    if (trace_n == trace_cap) {
+        trace_cap = trace_cap ? trace_cap * 2 : 4096;
+        trace_v = realloc(trace_v, trace_cap * sizeof(trace_rec));
+    }
+    ocl_load()->RetainEvent(ev);
+    trace_v[trace_n].name = name;
+    trace_v[trace_n].ev = ev;
+    trace_n++;
+    pthread_mutex_unlock(&trace_lock);
+}
+
+static ocu_status finish_launch(ocu_queue *queue, ocu_queue *q, ocu_kernel *k, cl_int err, cl_event ev)
+{
+    if (err == CL_SUCCESS && trace_on()) trace_add(k, ev);
+    if (err != CL_SUCCESS) {
+        if (verbose()) fprintf(stderr, "ocu opencl: launch of %s failed (%d)\n", k->name, (int)err);
+        return err == CL_INVALID_WORK_GROUP_SIZE ? OCU_ERR_INVALID_VALUE
+               : (map_err(err) == OCU_ERR_UNKNOWN ? OCU_ERR_LAUNCH_FAILED : map_err(err));
+    }
+    ocu_status st = finish_enqueue(queue, q == NULL, CL_SUCCESS, ev);
+    if (q != NULL && st != OCU_OK) {
+        pthread_mutex_lock(&q->lock);
+        q->sticky = st;
+        pthread_mutex_unlock(&q->lock);
+    }
+    return st;
+}
+
+/* Arguments by value: the packed values are one kernel argument (the
+   translator fixed the offsets), no buffer per launch. */
+static ocu_status launch_byval(ocu_queue *queue, ocu_queue *q, ocu_kernel *k, const ocu_launch_params *p,
+                               size_t total)
+{
+    ocu_module *m = k->module;
+    ocu_device *d = m->dev;
+    if (total > k->byval) return OCU_ERR_INVALID_VALUE;
+    unsigned char packed[1024 + 16] __attribute__((aligned(16)));
+    if (k->byval > sizeof(packed)) return OCU_ERR_INVALID_VALUE;
+    memset(packed, 0, k->byval);
+    size_t at = 0;
+    for (uint32_t i = 0; i < p->num_args; ++i) {
+        size_t a = arg_align(p->arg_sizes[i]);
+        at = (at + a - 1) / a * a;
+        memcpy(packed + at, p->args[i], p->arg_sizes[i]);
+        at += p->arg_sizes[i];
+    }
+    const ocl_api *a = ocl_load();
+    size_t local[3] = {p->block[0], p->block[1], p->block[2]};
+    size_t global[3] = {(size_t)p->grid[0] * p->block[0], (size_t)p->grid[1] * p->block[1],
+                        (size_t)p->grid[2] * p->block[2]};
+    size_t dyn = (p->shared_memory_bytes + 15) / 16 * 16;
+    cl_event ev = NULL;
+    pthread_mutex_lock(&k->lock);
+    cl_uint idx = 0;
+    cl_int err = a->SetKernelArg(k->k, idx++, k->byval, packed);
+    if (err == CL_SUCCESS && k->takes_glob) err = a->SetKernelArgSVMPointer(k->k, idx++, m->glob);
+    if (err == CL_SUCCESS) err = a->SetKernelArg(k->k, idx++, dyn < 16 ? 16 : dyn, NULL);
+    if (err == CL_SUCCESS) err = set_svm_ptrs(k, d);
+    if (err == CL_SUCCESS) err = a->EnqueueNDRangeKernel(queue->q, k->k, 3, NULL, global, local, 0, NULL, &ev);
+    pthread_mutex_unlock(&k->lock);
+    return finish_launch(queue, q, k, err, ev);
+}
+
 static ocu_status ocl_kernel_launch(ocu_queue *q, ocu_kernel *k, const ocu_launch_params *p)
 {
     if (k == NULL) return OCU_ERR_INVALID_HANDLE;
@@ -994,6 +1145,7 @@ static ocu_status ocl_kernel_launch(ocu_queue *q, ocu_kernel *k, const ocu_launc
         total = (total + a - 1) / a * a + p->arg_sizes[i];
         if (total > OCU_MAX_ARG_BYTES) return OCU_ERR_INVALID_VALUE;
     }
+    if (k->byval) return launch_byval(queue, q, k, p, total);
     unsigned char *packed = calloc(1, total + 16);
     uint32_t *offsets = calloc(p->num_args + 1, sizeof(uint32_t));
     if (packed == NULL || offsets == NULL) {
@@ -1036,9 +1188,11 @@ static ocu_status ocl_kernel_launch(ocu_queue *q, ocu_kernel *k, const ocu_launc
     /* Every allocation may be reached through a pointer the kernel reads
        from its arguments or from memory. */
     if (err == CL_SUCCESS) {
-        pthread_mutex_lock(&d->lock);
-        size_t n = d->count;
-        void **ptrs = malloc((n ? n : 1) * sizeof(void *));
+        err = set_svm_ptrs(k, d);
+    }
+    if (0) {
+        size_t n = 0;
+        void **ptrs = NULL;
         if (ptrs == NULL) {
             err = CL_OUT_OF_HOST_MEMORY;
         } else {
@@ -1054,18 +1208,7 @@ static ocu_status ocl_kernel_launch(ocu_queue *q, ocu_kernel *k, const ocu_launc
     pthread_mutex_unlock(&k->lock);
     a->ReleaseMemObject(argbuf);
     a->ReleaseMemObject(offbuf);
-    if (err != CL_SUCCESS) {
-        if (verbose()) fprintf(stderr, "ocu opencl: launch of %s failed (%d)\n", k->name, (int)err);
-        return err == CL_INVALID_WORK_GROUP_SIZE ? OCU_ERR_INVALID_VALUE
-               : (map_err(err) == OCU_ERR_UNKNOWN ? OCU_ERR_LAUNCH_FAILED : map_err(err));
-    }
-    ocu_status st = finish_enqueue(queue, q == NULL, CL_SUCCESS, ev);
-    if (q != NULL && st != OCU_OK) {
-        pthread_mutex_lock(&q->lock);
-        q->sticky = st;
-        pthread_mutex_unlock(&q->lock);
-    }
-    return st;
+    return finish_launch(queue, q, k, err, ev);
 }
 
 /* ---- markers ---------------------------------------------------------------------------- */
@@ -1167,9 +1310,618 @@ static ocu_status ocl_marker_elapsed_ms(ocu_marker *a, ocu_marker *b, float *ms)
     return st;
 }
 
+/* ---- operator table: GEMM on Intel GPUs ----------------------------------------------
+ * libs/cublas sends GEMMs here first (gemm_by_op). F32 GEMM runs a kernel
+ * written for Intel's sub-group extensions (block reads from local memory,
+ * sub-group size 16, 256 registers per thread on Xe2): 128 x 128 tiles of C
+ * per work-group of 256, 8 x 8 results per work-item, the next tile read
+ * into registers while the current one is used. Devices without those
+ * extensions (or OCU_OPENCL_OPS=0) get no table, and the CUDA kernels run.
+ * Measured on an Arc Pro B70 (sgemm 4096^3): 10.2 to 11.8 TFLOP/s for the
+ * four transpose cases, against 3.4 for the translated CUDA kernel. */
+static const char k_sgemm_src[] =
+    "// v2: SLM tiles + sub-group block reads from SLM + register prefetch of the next tile. Sub-group 16.\n"
+    "#ifndef BM\n"
+    "#define BM 128\n"
+    "#endif\n"
+    "#ifndef BN\n"
+    "#define BN 128\n"
+    "#endif\n"
+    "#ifndef BK\n"
+    "#define BK 32\n"
+    "#endif\n"
+    "#define WX 16\n"
+    "#define WY 16\n"
+    "#define NT 256\n"
+    "#define TM (BM / WY)\n"
+    "#define TN (BN / WX)\n"
+    "#define LA (BM * BK / NT)\n"
+    "#define LB (BN * BK / NT)\n"
+    "#define A_AT(m, k) (TA ? A[(long)(k) * lda + (m)] : A[(long)(m) * lda + (k)])\n"
+    "#define B_AT(k, n) (TB ? B[(long)(n) * ldb + (k)] : B[(long)(k) * ldb + (n)])\n"
+    "#pragma OPENCL EXTENSION cl_intel_subgroups : enable\n"
+    "#pragma OPENCL EXTENSION cl_intel_subgroup_local_block_io : enable\n"
+    "\n"
+    "__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(WX, WY, 1)))\n"
+    "kernel void KNAME(int M, int N, int K, float alpha, float beta,\n"
+    "                  global const float *A0, long lda, long sa,\n"
+    "                  global const float *B0, long ldb, long sb,\n"
+    "                  global float *C0, long ldc, long sc, int S, int kc)\n"
+    "{\n"
+    "    local float As[BK][BM];\n"
+    "    local float Bs[BK][BN];\n"
+    "    const int lx = get_local_id(0), ly = get_local_id(1), tid = ly * WX + lx;\n"
+    "    const int n0 = get_group_id(0) * BN, m0 = get_group_id(1) * BM;\n"
+    "    // z = batch * S + split: split s covers k in [s*kc, min(K, (s+1)*kc)); with S > 1\n"
+    "    // the caller passes the partial-sum buffer as C (alpha 1, beta 0).\n"
+    "    const long bz = get_group_id(2) / S;\n"
+    "    const int ks = (int)(get_group_id(2) % S);\n"
+    "    const int kbeg = ks * kc, kend = min(K, kbeg + kc);\n"
+    "    const long cz = get_group_id(2);\n"
+    "    global const float *A = A0 + bz * sa;\n"
+    "    global const float *B = B0 + bz * sb;\n"
+    "    global float *C = C0 + (S > 1 ? cz : bz) * sc;\n"
+    "    float acc[TM][TN];\n"
+    "    for (int i = 0; i < TM; ++i)\n"
+    "        for (int j = 0; j < TN; ++j) acc[i][j] = 0.0f;\n"
+    "    float ra[LA], rb[LB];\n"
+    "#define FETCH(k0)                                                                         \\\n"
+    "    for (int r = 0; r < LA; ++r) {                                                        \\\n"
+    "        const int idx = tid + r * NT;                                                     \\\n"
+    "        int mm, kk;                                                                       \\\n"
+    "        if (TA) { mm = idx % BM; kk = idx / BM; } else { kk = idx % BK; mm = idx / BK; } \\\n"
+    "        const int gm = m0 + mm, gk = (k0) + kk;                                           \\\n"
+    "        ra[r] = (gm < M && gk < kend) ? A_AT(gm, gk) : 0.0f;                                 \\\n"
+    "    }                                                                                     \\\n"
+    "    for (int r = 0; r < LB; ++r) {                                                        \\\n"
+    "        const int idx = tid + r * NT;                                                     \\\n"
+    "        int nn, kk;                                                                       \\\n"
+    "        if (TB) { kk = idx % BK; nn = idx / BK; } else { nn = idx % BN; kk = idx / BN; } \\\n"
+    "        const int gn = n0 + nn, gk = (k0) + kk;                                           \\\n"
+    "        rb[r] = (gn < N && gk < kend) ? B_AT(gk, gn) : 0.0f;                                 \\\n"
+    "    }\n"
+    "    FETCH(kbeg)\n"
+    "    for (int k0 = kbeg; k0 < kend; k0 += BK) {\n"
+    "        for (int r = 0; r < LA; ++r) {\n"
+    "            const int idx = tid + r * NT;\n"
+    "            int mm, kk;\n"
+    "            if (TA) { mm = idx % BM; kk = idx / BM; } else { kk = idx % BK; mm = idx / BK; }\n"
+    "            As[kk][mm] = ra[r];\n"
+    "        }\n"
+    "        for (int r = 0; r < LB; ++r) {\n"
+    "            const int idx = tid + r * NT;\n"
+    "            int nn, kk;\n"
+    "            if (TB) { kk = idx % BK; nn = idx / BK; } else { nn = idx % BN; kk = idx / BN; }\n"
+    "            Bs[kk][nn] = rb[r];\n"
+    "        }\n"
+    "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "        if (k0 + BK < kend) { FETCH(k0 + BK) }\n"
+    "        #pragma unroll\n"
+    "        for (int kk = 0; kk < BK; ++kk) {\n"
+    "            // b[j] = Bs[kk][lx + 16 j]: one block read gives lane lx its 8 values\n"
+    "            const float8 b = as_float8(intel_sub_group_block_read8((local const uint *)&Bs[kk][0]));\n"
+    "            const float8 a = vload8(0, &As[kk][ly * TM]);  // same 8 values in the whole sub-group\n"
+    "            const float av[8] = {a.s0, a.s1, a.s2, a.s3, a.s4, a.s5, a.s6, a.s7};\n"
+    "            const float bv[8] = {b.s0, b.s1, b.s2, b.s3, b.s4, b.s5, b.s6, b.s7};\n"
+    "            #pragma unroll\n"
+    "            for (int i = 0; i < TM; ++i)\n"
+    "                #pragma unroll\n"
+    "                for (int j = 0; j < TN; ++j) acc[i][j] = fma(av[i], bv[j], acc[i][j]);\n"
+    "        }\n"
+    "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "    }\n"
+    "    for (int i = 0; i < TM; ++i) {\n"
+    "        const int gm = m0 + ly * TM + i;\n"
+    "        if (gm >= M) break;\n"
+    "        for (int j = 0; j < TN; ++j) {\n"
+    "            const int gn = n0 + lx + j * WX;\n"
+    "            if (gn < N) {\n"
+    "                global float *o = C + (long)gm * ldc + gn;\n"
+    "                float v = alpha * acc[i][j];\n"
+    "                if (beta != 0.0f) v = fma(beta, *o, v);\n"
+    "                *o = v;\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "// Split-K: C = alpha * sum_s P[s] + beta * C, the sum in split order (deterministic).\n"
+    "kernel void ocu_sgemm_reduce(int M, int N, int S, float alpha, float beta, global const float *P,\n"
+    "                         global float *C, long ldc)\n"
+    "{\n"
+    "    const int n = get_global_id(0), m = get_global_id(1);\n"
+    "    if (m >= M || n >= N) return;\n"
+    "    const long mn = (long)M * N, at = (long)m * N + n;\n"
+    "    float v = 0.0f;\n"
+    "    for (int s = 0; s < S; ++s) v += P[s * mn + at];\n"
+    "    global float *o = C + (long)m * ldc + n;\n"
+    "    v *= alpha;\n"
+    "    if (beta != 0.0f) v = fma(beta, *o, v);\n"
+    "    *o = v;\n"
+    "}\n";
+
+/* F16 / BF16 inputs: the XMX engines through cl_intel_subgroup_matrix_multiply_accumulate
+   (8x16x16 per instruction, sub-group 16), f32 accumulation, output f32 / f16 / bf16.
+   Measured on an Arc Pro B70 at 4096^3: 18 to 38 TFLOP/s by transpose case, against
+   about 3 for the translated CUDA kernel. */
+static const char k_hgemm_src[] =
+    "// XMX (DPAS) GEMM: row-major C[MxN] (f32) = alpha * op(A)[MxK] * op(B)[KxN] + beta * C, A/B f16 or bf16.\n"
+    "// TA=0: A stored [M x K]; TA=1: [K x M].  TB=0: B stored [K x N]; TB=1: [N x K].  BF16=1: bfloat16 inputs.\n"
+    "#pragma OPENCL EXTENSION cl_intel_subgroups : enable\n"
+    "#pragma OPENCL EXTENSION cl_intel_subgroups_short : enable\n"
+    "#pragma OPENCL EXTENSION cl_intel_subgroup_local_block_io : enable\n"
+    "#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable\n"
+    "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n"
+    "#ifndef OUT\n"
+    "#define OUT 0\n"
+    "#endif\n"
+    "#define BM 128\n"
+    "#define BN 128\n"
+    "#define BK 32\n"
+    "#define SGM 4                 // sub-groups along M (each 32 rows)\n"
+    "#define SGN 2                 // sub-groups along N (each 64 cols)\n"
+    "#define NT (16 * SGM * SGN)   // 128 work-items\n"
+    "#if BF16\n"
+    "#define MAD intel_sub_group_bf16_bf16_matrix_mad_k16\n"
+    "#else\n"
+    "#define MAD intel_sub_group_f16_f16_matrix_mad_k16\n"
+    "#endif\n"
+    "#define A_AT(m, k) (TA ? A[(long)(k) * lda + (m)] : A[(long)(m) * lda + (k)])\n"
+    "#define B_AT(k, n) (TB ? B[(long)(n) * ldb + (k)] : B[(long)(k) * ldb + (n)])\n"
+    "\n"
+    "__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(NT, 1, 1)))\n"
+    "kernel void KNAME(int M, int N, int K, float alpha, float beta,\n"
+    "                  global const ushort *A0, long lda, long sa,\n"
+    "                  global const ushort *B0, long ldb, long sb,\n"
+    "                  global void *C0v, long ldc, long sc)\n"
+    "{\n"
+    "    // As: [BK/16][BM][16] halves (8 rows of one k-block are one 8x16 block read)\n"
+    "    // Bv: [BN/16][BK/2][16] ints, VNNI: (B[2p][n], B[2p+1][n]) in one int\n"
+    "    local ushort As[BK / 16][BM][16];\n"
+    "    local uint Bv[BN / 16][BK / 2][16];\n"
+    "    const int tid = get_local_id(0), sg = get_sub_group_id(), lane = get_sub_group_local_id();\n"
+    "    const int sgm = sg % SGM, sgn = sg / SGM;\n"
+    "    const int n0 = get_group_id(0) * BN, m0 = get_group_id(1) * BM;\n"
+    "    const long bz = get_group_id(2);\n"
+    "    global const ushort *A = A0 + bz * sa;\n"
+    "    global const ushort *B = B0 + bz * sb;\n"
+    "    // OUT: 0 f32, 1 f16, 2 bf16 (round to nearest even)\n"
+    "#if OUT == 0\n"
+    "    global float *C = (global float *)C0v + bz * sc;\n"
+    "#else\n"
+    "    global ushort *C = (global ushort *)C0v + bz * sc;\n"
+    "#endif\n"
+    "    float8 acc[4][4];\n"
+    "    for (int i = 0; i < 4; ++i)\n"
+    "        for (int j = 0; j < 4; ++j) acc[i][j] = (float8)0.0f;\n"
+    "\n"
+    "    // Global -> registers (8 values per load, 16 bytes) -> local memory. Each work-item moves\n"
+    "    // 4 groups of 8 A values and 2 x (8 B values of two k rows) per k-step of 32.\n"
+    "    ushort8 ra[4];\n"
+    "    ushort8 rb[4];\n"
+    "#define LOAD_A(k0)                                                                              \\\n"
+    "    for (int r = 0; r < 4; ++r) {                                                               \\\n"
+    "        const int idx = tid + r * NT; /* 512 groups of 8 */                                     \\\n"
+    "        int mm, kk; /* first element; the 8 run along k (TA=0) or along m (TA=1) */             \\\n"
+    "        if (TA) { mm = (idx % (BM / 8)) * 8; kk = idx / (BM / 8); } else { kk = (idx % (BK / 8)) * 8; mm = idx / (BK / 8); } \\\n"
+    "        const int gm = m0 + mm, gk = (k0) + kk;                                                 \\\n"
+    "        global const ushort *p = TA ? A + (long)gk * lda + gm : A + (long)gm * lda + gk;        \\\n"
+    "        const bool full = TA ? (gk < K && gm + 7 < M) : (gm < M && gk + 7 < K);                 \\\n"
+    "        if (full && ((((ulong)p) & 15) == 0)) ra[r] = vload8(0, p);                             \\\n"
+    "        else {                                                                                  \\\n"
+    "            ushort t[8];                                                                        \\\n"
+    "            for (int e = 0; e < 8; ++e) {                                                       \\\n"
+    "                const int em = TA ? gm + e : gm, ek = TA ? gk : gk + e;                         \\\n"
+    "                t[e] = (em < M && ek < K) ? A_AT(em, ek) : (ushort)0;                           \\\n"
+    "            }                                                                                   \\\n"
+    "            ra[r] = (ushort8)(t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]);                  \\\n"
+    "        }                                                                                       \\\n"
+    "    }\n"
+    "#define LOAD_B(k0)                                                                              \\\n"
+    "    for (int r = 0; r < 4; ++r) {                                                               \\\n"
+    "        const int idx = tid + r * NT; /* 512 groups of 8 */                                     \\\n"
+    "        int nn, kk;                                                                             \\\n"
+    "        if (TB) { kk = (idx % (BK / 8)) * 8; nn = idx / (BK / 8); } else { nn = (idx % (BN / 8)) * 8; kk = idx / (BN / 8); } \\\n"
+    "        const int gn = n0 + nn, gk = (k0) + kk;                                                 \\\n"
+    "        global const ushort *p = TB ? B + (long)gn * ldb + gk : B + (long)gk * ldb + gn;        \\\n"
+    "        const bool full = TB ? (gn < N && gk + 7 < K) : (gk < K && gn + 7 < N);                 \\\n"
+    "        if (full && ((((ulong)p) & 15) == 0)) rb[r] = vload8(0, p);                             \\\n"
+    "        else {                                                                                  \\\n"
+    "            ushort t[8];                                                                        \\\n"
+    "            for (int e = 0; e < 8; ++e) {                                                       \\\n"
+    "                const int en = TB ? gn : gn + e, ek = TB ? gk + e : gk;                         \\\n"
+    "                t[e] = (en < N && ek < K) ? B_AT(ek, en) : (ushort)0;                           \\\n"
+    "            }                                                                                   \\\n"
+    "            rb[r] = (ushort8)(t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7]);                  \\\n"
+    "        }                                                                                       \\\n"
+    "    }\n"
+    "    LOAD_A(0)\n"
+    "    LOAD_B(0)\n"
+    "    for (int k0 = 0; k0 < K; k0 += BK) {\n"
+    "        for (int r = 0; r < 4; ++r) {\n"
+    "            const int idx = tid + r * NT;\n"
+    "            const ushort v[8] = {ra[r].s0, ra[r].s1, ra[r].s2, ra[r].s3, ra[r].s4, ra[r].s5, ra[r].s6, ra[r].s7};\n"
+    "            if (TA) {\n"
+    "                const int mm = (idx % (BM / 8)) * 8, kk = idx / (BM / 8);\n"
+    "                for (int e = 0; e < 8; ++e) As[kk / 16][mm + e][kk % 16] = v[e];\n"
+    "            } else {\n"
+    "                const int kk = (idx % (BK / 8)) * 8, mm = idx / (BK / 8);\n"
+    "                vstore8(ra[r], 0, &As[kk / 16][mm][kk % 16]);\n"
+    "            }\n"
+    "        }\n"
+    "        if (TB) {\n"
+    "            // 8 consecutive k of one column n: pairs (k, k+1) -> 4 VNNI ints of column n\n"
+    "            for (int r = 0; r < 4; ++r) {\n"
+    "                const int idx = tid + r * NT;\n"
+    "                const int kk = (idx % (BK / 8)) * 8, nn = idx / (BK / 8);\n"
+    "                const ushort v[8] = {rb[r].s0, rb[r].s1, rb[r].s2, rb[r].s3, rb[r].s4, rb[r].s5, rb[r].s6, rb[r].s7};\n"
+    "                for (int e = 0; e < 4; ++e) Bv[nn / 16][kk / 2 + e][nn % 16] = (uint)v[2 * e] | ((uint)v[2 * e + 1] << 16);\n"
+    "            }\n"
+    "        } else {\n"
+    "            // row k (even) and row k+1 come from two different groups: use local memory staging\n"
+    "            // through the half-precision tile, then pack (simple, conflict-free enough)\n"
+    "            for (int r = 0; r < 4; ++r) {\n"
+    "                const int idx = tid + r * NT;\n"
+    "                const int nn = (idx % (BN / 8)) * 8, kk = idx / (BN / 8);\n"
+    "                const ushort v[8] = {rb[r].s0, rb[r].s1, rb[r].s2, rb[r].s3, rb[r].s4, rb[r].s5, rb[r].s6, rb[r].s7};\n"
+    "                local ushort *bh = (local ushort *)&Bv[0][0][0];\n"
+    "                // ushort view: Bv[nb][kp][n16] = halves [nb][kp][n16][2]; this row's half is (kk & 1)\n"
+    "                for (int e = 0; e < 8; ++e) bh[((((nn + e) / 16) * (BK / 2) + kk / 2) * 16 + (nn + e) % 16) * 2 + (kk & 1)] = v[e];\n"
+    "            }\n"
+    "        }\n"
+    "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "        if (k0 + BK < K) { LOAD_A(k0 + BK) LOAD_B(k0 + BK) }\n"
+    "        #pragma unroll\n"
+    "        for (int kb = 0; kb < BK / 16; ++kb) {\n"
+    "            short8 a[4];\n"
+    "            int8 b[4];\n"
+    "            #pragma unroll\n"
+    "            for (int i = 0; i < 4; ++i)\n"
+    "                a[i] = as_short8(intel_sub_group_block_read_us8(&As[kb][sgm * 32 + i * 8][0]));\n"
+    "            #pragma unroll\n"
+    "            for (int j = 0; j < 4; ++j)\n"
+    "                b[j] = as_int8(intel_sub_group_block_read8(&Bv[sgn * 4 + j][kb * 8][0]));\n"
+    "            #pragma unroll\n"
+    "            for (int i = 0; i < 4; ++i)\n"
+    "                #pragma unroll\n"
+    "                for (int j = 0; j < 4; ++j) acc[i][j] = MAD(a[i], b[j], acc[i][j]);\n"
+    "        }\n"
+    "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+    "    }\n"
+    "    #pragma unroll\n"
+    "    for (int i = 0; i < 4; ++i) {\n"
+    "        #pragma unroll\n"
+    "        for (int j = 0; j < 4; ++j) {\n"
+    "            const int gn = n0 + sgn * 64 + j * 16 + lane;\n"
+    "            const float v8[8] = {acc[i][j].s0, acc[i][j].s1, acc[i][j].s2, acc[i][j].s3,\n"
+    "                                 acc[i][j].s4, acc[i][j].s5, acc[i][j].s6, acc[i][j].s7};\n"
+    "            for (int r = 0; r < 8; ++r) {\n"
+    "                const int gm = m0 + sgm * 32 + i * 8 + r;\n"
+    "                if (gm < M && gn < N) {\n"
+    "                    const long at = (long)gm * ldc + gn;\n"
+    "                    float v = alpha * v8[r];\n"
+    "#if OUT == 0\n"
+    "                    if (beta != 0.0f) v = fma(beta, C[at], v);\n"
+    "                    C[at] = v;\n"
+    "#elif OUT == 1\n"
+    "                    if (beta != 0.0f) v = fma(beta, vload_half(at, (global const half *)C), v);\n"
+    "                    vstore_half_rte(v, at, (global half *)C);\n"
+    "#else\n"
+    "                    if (beta != 0.0f) v = fma(beta, as_float((uint)C[at] << 16), v);\n"
+    "                    uint u = as_uint(v);\n"
+    "                    if ((u & 0x7f800000u) != 0x7f800000u) u += 0x7fffu + ((u >> 16) & 1u); /* RNE */\n"
+    "                    else if (u & 0x007fffffu) u |= 0x00400000u;                              /* quiet NaN */\n"
+    "                    C[at] = (ushort)(u >> 16);\n"
+    "#endif\n"
+    "                }\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "}\n";
+
+typedef struct ocu_op_plan {
+    ocu_device *dev;
+    cl_kernel   k;
+    int         M, N, K, batch;
+    long        lda, ldb, ldc, sa, sb, sc;
+    float       alpha, beta;
+    int         S, kc;      /* split-K: S slices of kc (S == 1: none) */
+    ocu_dtype   in, out;    /* input and output types */
+    void       *part;       /* S x M x N partial sums when S > 1 */
+    cl_kernel   reduce;
+    char        name[96];   /* for OCU_OPENCL_TRACE */
+} ocl_gemm_plan;
+
+static pthread_mutex_t ops_lock = PTHREAD_MUTEX_INITIALIZER;
+typedef struct { ocu_device *dev; cl_kernel k[4]; cl_kernel reduce; int state; int xmx; cl_kernel hk[2][3][4]; } ocl_ops_dev; /* state: 0 new, 1 ok, -1 no */
+static ocl_ops_dev ops_devs[16];
+
+static int ops_enabled(ocu_device *d)
+{
+    const char *e = getenv("OCU_OPENCL_OPS");
+    if (e != NULL && *e == '0') return 0;
+    char ext[16384] = {0};
+    if (ocl_load()->GetDeviceInfo(d->entry->device, CL_DEVICE_EXTENSIONS, sizeof(ext) - 1, ext, NULL) != CL_SUCCESS)
+        return 0;
+    return strstr(ext, "cl_intel_subgroups") && strstr(ext, "cl_intel_subgroup_local_block_io") &&
+           strstr(ext, "cl_intel_required_subgroup_size");
+}
+
+/* The four transpose variants, built once per device. Called with ops_lock held. */
+static ocl_ops_dev *ops_dev(ocu_device *d)
+{
+    ocl_ops_dev *o = NULL;
+    for (int i = 0; i < 16; ++i) {
+        if (ops_devs[i].dev == d) return ops_devs[i].state == 1 ? &ops_devs[i] : NULL;
+        if (o == NULL && ops_devs[i].dev == NULL) o = &ops_devs[i];
+    }
+    if (o == NULL) return NULL;
+    o->dev = d;
+    o->state = -1;
+    if (!ops_enabled(d)) return NULL;
+    const ocl_api *a = ocl_load();
+    for (int v = 0; v < 4; ++v) {
+        cl_int err = CL_SUCCESS;
+        const char *src = k_sgemm_src;
+        cl_program prog = a->CreateProgramWithSource(d->ctx, 1, &src, NULL, &err);
+        if (prog == NULL) return NULL;
+        char opts[256];
+        const char *grf[2] = {" -cl-intel-256-GRF-per-thread", ""};
+        err = CL_BUILD_PROGRAM_FAILURE;
+        for (int g = 0; g < 2 && err != CL_SUCCESS; ++g) {
+            snprintf(opts, sizeof opts, "-cl-std=CL3.0 -DTA=%d -DTB=%d -DKNAME=ocu_sgemm%s", v >> 1, v & 1, grf[g]);
+            err = a->BuildProgram(prog, 1, &d->entry->device, opts, NULL, NULL);
+        }
+        if (err != CL_SUCCESS) {
+            if (verbose()) fprintf(stderr, "ocu opencl: the GEMM kernels do not build here (%d); CUDA kernels are used\n", (int)err);
+            a->ReleaseProgram(prog);
+            return NULL;
+        }
+        o->k[v] = a->CreateKernel(prog, "ocu_sgemm", &err);
+        if (v == 0) o->reduce = a->CreateKernel(prog, "ocu_sgemm_reduce", &err);
+        a->ReleaseProgram(prog); /* the kernel keeps it */
+        if (o->k[v] == NULL || o->reduce == NULL) return NULL;
+    }
+    o->state = 1;
+    return o;
+}
+
+static int xmx_enabled(ocu_device *d)
+{
+    char ext[16384] = {0};
+    if (ocl_load()->GetDeviceInfo(d->entry->device, CL_DEVICE_EXTENSIONS, sizeof(ext) - 1, ext, NULL) != CL_SUCCESS)
+        return 0;
+    return strstr(ext, "cl_intel_subgroup_matrix_multiply_accumulate") != NULL && strstr(ext, "cl_khr_fp16") != NULL;
+}
+
+/* The XMX kernel for (input type, output type, transposes), built on first use. ops_lock held. */
+static cl_kernel xmx_kernel(ocu_device *d, ocl_ops_dev *o, int bf, int out, int v)
+{
+    if (o->hk[bf][out][v] != NULL) return o->hk[bf][out][v];
+    if (o->xmx == 0) o->xmx = xmx_enabled(d) ? 1 : -1;
+    if (o->xmx < 0) return NULL;
+    const ocl_api *a = ocl_load();
+    cl_int err = CL_SUCCESS;
+    const char *src = k_hgemm_src;
+    cl_program prog = a->CreateProgramWithSource(d->ctx, 1, &src, NULL, &err);
+    if (prog == NULL) return NULL;
+    char opts[256];
+    snprintf(opts, sizeof opts, "-cl-std=CL3.0 -DTA=%d -DTB=%d -DBF16=%d -DOUT=%d -DKNAME=ocu_hgemm -cl-intel-256-GRF-per-thread",
+             v >> 1, v & 1, bf, out);
+    err = a->BuildProgram(prog, 1, &d->entry->device, opts, NULL, NULL);
+    cl_kernel k = err == CL_SUCCESS ? a->CreateKernel(prog, "ocu_hgemm", &err) : NULL;
+    a->ReleaseProgram(prog);
+    if (k == NULL) {
+        if (verbose()) fprintf(stderr, "ocu opencl: the XMX GEMM does not build here (%d)\n", (int)err);
+        o->xmx = -1;
+        return NULL;
+    }
+    o->hk[bf][out][v] = k;
+    return k;
+}
+
+static int gemm_matrix(const ocu_tensor_desc *t, int *rows, int *cols, long *ld, long *bs, int *batch)
+{
+    if ((t->dtype != OCU_DT_F32 && t->dtype != OCU_DT_F16 && t->dtype != OCU_DT_BF16) || t->rank < 2 || t->rank > 3 ||
+        t->stride[t->rank - 1] != 1) return 0;
+    *rows = (int)t->shape[t->rank - 2];
+    *cols = (int)t->shape[t->rank - 1];
+    *ld = (long)t->stride[t->rank - 2];
+    *batch = t->rank == 3 ? (int)t->shape[0] : 1;
+    *bs = t->rank == 3 ? (long)t->stride[0] : 0;
+    return *rows >= 0 && *cols >= 0 && *ld >= (*cols > 1 ? *cols : 1);
+}
+
+static ocu_status ops_support(ocu_device *dev, ocu_op op, ocu_dtype dt, ocu_op_support *out)
+{
+    if (dev == NULL || out == NULL) return OCU_ERR_INVALID_VALUE;
+    if (op != OCU_OP_GEMM || (dt != OCU_DT_F32 && dt != OCU_DT_F16 && dt != OCU_DT_BF16)) return OCU_ERR_NOT_SUPPORTED;
+    if (dt != OCU_DT_F32 && !xmx_enabled(dev)) return OCU_ERR_NOT_SUPPORTED;
+    pthread_mutex_lock(&ops_lock);
+    ocl_ops_dev *o = ops_dev(dev);
+    pthread_mutex_unlock(&ops_lock);
+    if (o == NULL) return OCU_ERR_NOT_SUPPORTED;
+    memset(out, 0, sizeof *out);
+    out->layouts = OCU_LAYOUT_DENSE | OCU_LAYOUT_ROW_STRIDED;
+    out->max_rank = 3;
+    out->align_bytes = 4;
+    out->accum_dtype = OCU_DT_F32;
+    out->out_dtypes = dt == OCU_DT_F32 ? 1u << OCU_DT_F32
+                                       : (1u << OCU_DT_F32) | (1u << OCU_DT_F16) | (1u << OCU_DT_BF16);
+    return OCU_OK;
+}
+
+static ocu_status gemm_shape(const ocu_op_desc *d, ocl_gemm_plan *p, int *ta, int *tb)
+{
+    if (d == NULL || d->op != OCU_OP_GEMM || d->num_tensors != 3 || (d->flags & OCU_OP_FLAG_VAR_ROWS))
+        return OCU_ERR_NOT_SUPPORTED;
+    int ar, ac, br, bc, cr, cc, ab, bb, cb;
+    if (!gemm_matrix(&d->tensors[0], &ar, &ac, &p->lda, &p->sa, &ab) ||
+        !gemm_matrix(&d->tensors[1], &br, &bc, &p->ldb, &p->sb, &bb) ||
+        !gemm_matrix(&d->tensors[2], &cr, &cc, &p->ldc, &p->sc, &cb))
+        return OCU_ERR_NOT_SUPPORTED;
+    *ta = d->p.gemm.trans_a != 0;
+    *tb = d->p.gemm.trans_b != 0;
+    const int m = *ta ? ac : ar, k = *ta ? ar : ac, kb = *tb ? bc : br, n = *tb ? br : bc;
+    if (k != kb || m != cr || n != cc || ab != cb || bb != cb) return OCU_ERR_NOT_SUPPORTED;
+    if (cb > 65535 || m <= 0 || n <= 0 || k <= 0) return OCU_ERR_NOT_SUPPORTED;
+    const ocu_dtype in = d->tensors[0].dtype, cout = d->tensors[2].dtype;
+    if (d->tensors[1].dtype != in) return OCU_ERR_NOT_SUPPORTED;
+    if (in == OCU_DT_F32 && cout != OCU_DT_F32) return OCU_ERR_NOT_SUPPORTED;
+    p->in = in;
+    p->out = cout;
+    p->M = m; p->N = n; p->K = k; p->batch = cb;
+    p->alpha = d->p.gemm.alpha;
+    p->beta = d->p.gemm.beta;
+    return OCU_OK;
+}
+
+static ocu_status ops_query(ocu_device *dev, const ocu_op_desc *d, ocu_op_caps *caps)
+{
+    ocl_gemm_plan p;
+    int ta, tb;
+    ocu_op_support sup;
+    if (dev == NULL || caps == NULL) return OCU_ERR_INVALID_VALUE;
+    ocu_status st = gemm_shape(d, &p, &ta, &tb);
+    if (st != OCU_OK) return st;
+    if (ops_support(dev, OCU_OP_GEMM, p.in, &sup) != OCU_OK) return OCU_ERR_NOT_SUPPORTED;
+    memset(caps, 0, sizeof *caps);
+    caps->tol = OCU_TOL_DOT;
+    caps->accum_dtype = OCU_DT_F32;
+    caps->scratch_bytes = 2 * 32 * 128 * 4;
+    caps->tiles = (uint64_t)((p.M + 127) / 128) * ((p.N + 127) / 128) * p.batch;
+    return OCU_OK;
+}
+
+static ocu_status ops_plan(ocu_device *dev, const ocu_op_desc *d, ocu_op_plan **out)
+{
+    if (dev == NULL || out == NULL) return OCU_ERR_INVALID_VALUE;
+    ocl_gemm_plan p;
+    int ta, tb;
+    ocu_status st = gemm_shape(d, &p, &ta, &tb);
+    if (st != OCU_OK) return st;
+    pthread_mutex_lock(&ops_lock);
+    ocl_ops_dev *o = ops_dev(dev);
+    pthread_mutex_unlock(&ops_lock);
+    if (o == NULL) return OCU_ERR_NOT_SUPPORTED;
+    ocl_gemm_plan *pl = malloc(sizeof *pl);
+    if (pl == NULL) return OCU_ERR_OUT_OF_MEMORY;
+    *pl = p;
+    pl->dev = dev;
+    pl->k = o->k[ta * 2 + tb];
+    pl->reduce = o->reduce;
+    if (p.in != OCU_DT_F32) {
+        pthread_mutex_lock(&ops_lock);
+        pl->k = xmx_kernel(dev, o, p.in == OCU_DT_BF16, p.out == OCU_DT_F32 ? 0 : p.out == OCU_DT_F16 ? 1 : 2, ta * 2 + tb);
+        pthread_mutex_unlock(&ops_lock);
+        if (pl->k == NULL) { free(pl); return OCU_ERR_NOT_SUPPORTED; }
+    }
+    pl->S = 1;
+    pl->kc = pl->K;
+    pl->part = NULL;
+    /* Split-K when the C tiles cannot fill the GPU and K is long (for example
+       a 256 x 128 result over K = 50304: 2 tiles). Slices of at least 512. */
+    const long tiles = (long)((pl->M + 127) / 128) * ((pl->N + 127) / 128) * pl->batch;
+    if (p.in == OCU_DT_F32 && pl->batch == 1 && tiles < 128 && pl->K >= 2048 && getenv("OCU_OPENCL_SPLITK") == NULL) {
+        int S = (int)((256 + tiles - 1) / tiles);
+        if (S > pl->K / 512) S = pl->K / 512;
+        if (S > 1) {
+            int kc = (pl->K + S - 1) / S;
+            kc = (kc + 31) / 32 * 32;
+            S = (pl->K + kc - 1) / kc;
+            void *part = NULL;
+            if (S > 1 && ocl_mem_alloc(dev, (size_t)S * pl->M * pl->N * sizeof(float), &part) == OCU_OK) {
+                pl->S = S;
+                pl->kc = kc;
+                pl->part = part;
+            }
+        }
+    }
+    snprintf(pl->name, sizeof pl->name, "%s %c%c M%d N%d K%d x%d split %d",
+             p.in == OCU_DT_F32 ? "ocu_sgemm" : p.in == OCU_DT_F16 ? "ocu_hgemm(xmx f16)" : "ocu_hgemm(xmx bf16)",
+             ta ? 'T' : 'N', tb ? 'T' : 'N', pl->M, pl->N, pl->K, pl->batch, pl->S);
+    *out = pl;
+    return OCU_OK;
+}
+
+static ocu_status ops_execute(ocu_op_plan *pl, ocu_queue *q, const ocu_tensor *t, uint32_t n)
+{
+    if (pl == NULL || t == NULL || n != 3) return OCU_ERR_INVALID_VALUE;
+    ocu_device *d = pl->dev;
+    if (q != NULL && q->dev != d) return OCU_ERR_INVALID_HANDLE;
+    /* only memory this backend allocated (SVM pointers) */
+    if (!table_has(d, t[0].data, 2) || !table_has(d, t[1].data, 2) || !table_has(d, t[2].data, 2))
+        return OCU_ERR_NOT_SUPPORTED;
+    ocu_queue *queue = q != NULL ? q : d->sync_q;
+    const ocl_api *a = ocl_load();
+    const int xmx = pl->in != OCU_DT_F32;
+    size_t lws[3] = {xmx ? 128 : 16, xmx ? 1 : 16, 1};
+    size_t gws[3] = {(size_t)((pl->N + 127) / 128) * (xmx ? 128 : 16), (size_t)((pl->M + 127) / 128) * (xmx ? 1 : 16),
+                     (size_t)pl->batch * pl->S};
+    const int split = pl->S > 1;
+    const float one = 1.0f, zero = 0.0f;
+    const long ldp = pl->N, sp = (long)pl->M * pl->N;
+    cl_event ev = NULL;
+    pthread_mutex_lock(&ops_lock);
+    cl_uint i = 0;
+    cl_int err = a->SetKernelArg(pl->k, i++, sizeof(int), &pl->M);
+    err |= a->SetKernelArg(pl->k, i++, sizeof(int), &pl->N);
+    err |= a->SetKernelArg(pl->k, i++, sizeof(int), &pl->K);
+    err |= a->SetKernelArg(pl->k, i++, sizeof(float), split ? &one : &pl->alpha);
+    err |= a->SetKernelArg(pl->k, i++, sizeof(float), split ? &zero : &pl->beta);
+    err |= a->SetKernelArgSVMPointer(pl->k, i++, t[0].data);
+    err |= a->SetKernelArg(pl->k, i++, sizeof(long), &pl->lda);
+    err |= a->SetKernelArg(pl->k, i++, sizeof(long), &pl->sa);
+    err |= a->SetKernelArgSVMPointer(pl->k, i++, t[1].data);
+    err |= a->SetKernelArg(pl->k, i++, sizeof(long), &pl->ldb);
+    err |= a->SetKernelArg(pl->k, i++, sizeof(long), &pl->sb);
+    err |= a->SetKernelArgSVMPointer(pl->k, i++, split ? pl->part : t[2].data);
+    err |= a->SetKernelArg(pl->k, i++, sizeof(long), split ? &ldp : &pl->ldc);
+    err |= a->SetKernelArg(pl->k, i++, sizeof(long), split ? &sp : &pl->sc);
+    if (!xmx) {
+        err |= a->SetKernelArg(pl->k, i++, sizeof(int), &pl->S);
+        err |= a->SetKernelArg(pl->k, i++, sizeof(int), &pl->kc);
+    }
+    if (err == CL_SUCCESS) err = a->EnqueueNDRangeKernel(queue->q, pl->k, 3, NULL, gws, lws, 0, NULL, split ? NULL : &ev);
+    if (err == CL_SUCCESS && split) {
+        cl_uint r = 0;
+        err = a->SetKernelArg(pl->reduce, r++, sizeof(int), &pl->M);
+        err |= a->SetKernelArg(pl->reduce, r++, sizeof(int), &pl->N);
+        err |= a->SetKernelArg(pl->reduce, r++, sizeof(int), &pl->S);
+        err |= a->SetKernelArg(pl->reduce, r++, sizeof(float), &pl->alpha);
+        err |= a->SetKernelArg(pl->reduce, r++, sizeof(float), &pl->beta);
+        err |= a->SetKernelArgSVMPointer(pl->reduce, r++, pl->part);
+        err |= a->SetKernelArgSVMPointer(pl->reduce, r++, t[2].data);
+        err |= a->SetKernelArg(pl->reduce, r++, sizeof(long), &pl->ldc);
+        size_t rl[3] = {16, 16, 1}, rg[3] = {(size_t)(pl->N + 15) / 16 * 16, (size_t)(pl->M + 15) / 16 * 16, 1};
+        if (err == CL_SUCCESS) err = a->EnqueueNDRangeKernel(queue->q, pl->reduce, 3, NULL, rg, rl, 0, NULL, &ev);
+    }
+    pthread_mutex_unlock(&ops_lock);
+    if (err == CL_SUCCESS && trace_on()) trace_add_name(pl->name, ev);
+    return finish_enqueue(queue, q == NULL, err, ev);
+}
+
+static ocu_status ops_destroy(ocu_op_plan *pl)
+{
+    if (pl != NULL && pl->part != NULL) ocl_mem_free(pl->dev, pl->part); /* waits for queued work */
+    free(pl);
+    return OCU_OK;
+}
+
+static const ocu_op_table ocl_ops = {
+    .version = OCU_OPS_VERSION,
+    .struct_size = sizeof(ocu_op_table),
+    .support = ops_support,
+    .query = ops_query,
+    .plan = ops_plan,
+    .execute = ops_execute,
+    .destroy = ops_destroy,
+    .stats = NULL,
+};
+
 static const void *ocl_get_provider(const char *library)
 {
-    (void)library;
+    if (library != NULL && strcmp(library, OCU_OPS_PROVIDER) == 0) return &ocl_ops;
     return NULL;
 }
 

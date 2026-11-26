@@ -108,6 +108,7 @@ typedef struct _cl_event         *cl_event;
 #define CL_EVENT_COMMAND_EXECUTION_STATUS 0x11D3
 #define CL_COMPLETE  0x0
 #define CL_PROFILING_COMMAND_END 0x1283
+#define CL_PROFILING_COMMAND_START 0x1282
 
 #define OCL_CALL /* default calling convention on the supported hosts */
 

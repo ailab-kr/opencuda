@@ -41,7 +41,11 @@ struct ocu_context {
     uint3 tid, bid, bdim, gdim;
     threadgroup uchar *dyn; // the launch's dynamic local memory
     device uchar *glob;     // the module's __device__/__constant__ variables
+    threadgroup uchar *sh;  // __shared__ variables of device functions (kernel-scope buffer)
 };
+#define OCU_SH_ALIGN(n) ((((ulong)(n)) + 15) & ~(ulong)15)
+// ?: with class-typed operands in different address spaces: both sides as values
+template <typename T> T ocu_rv(T v) { return v; }
 #define OCU_U3(f) ((uint3)((uint)f(0), (uint)f(1), (uint)f(2)))
 #define threadIdx ocu_ctx.tid
 #define blockIdx ocu_ctx.bid
@@ -74,6 +78,32 @@ template <typename P> P ocu_ptr(constant uchar *a, constant uint *o, uint i)
 {
     return ocu_arg<P>(a, o, i);
 }
+// Arguments passed by value (the backend sets one argument of N bytes): the
+// same reads from the kernel's private copy, with offsets fixed at translation.
+template <typename T> T ocu_arg(const uchar *a, const uint *o, uint i)
+{
+    T v;
+    uchar *d = (uchar *)&v;
+    const uchar *s = a + o[i];
+    for (uint k = 0; k < sizeof(T); ++k) d[k] = s[k];
+    return v;
+}
+template <typename V, typename S> V ocu_arg3(const uchar *a, const uint *o, uint i)
+{
+    S s[3];
+    uchar *d = (uchar *)s;
+    const uchar *p = a + o[i];
+    for (uint k = 0; k < 3 * sizeof(S); ++k) d[k] = p[k];
+    V v;
+    v.x = s[0];
+    v.y = s[1];
+    v.z = s[2];
+    return v;
+}
+template <typename P> P ocu_ptr(const uchar *a, const uint *o, uint i)
+{
+    return ocu_arg<P>(a, o, i);
+}
 
 // ---- qualifiers that have no OpenCL spelling -------------------------------------
 #define __device__
@@ -83,7 +113,20 @@ template <typename P> P ocu_ptr(constant uchar *a, constant uint *o, uint i)
 #define __restrict__
 #define __launch_bounds__(...)
 
+// assert() in device code: checked; a failure is printed (OpenCL has no device-side abort)
+#undef assert
+#define assert(e) ((e) ? (void)0 : (void)printf("ocu: device assert failed: %s (line %d) block (%u,%u,%u) thread (%u,%u,%u)\n", #e, __LINE__, \
+    (uint)get_group_id(0), (uint)get_group_id(1), (uint)get_group_id(2), (uint)get_local_id(0), (uint)get_local_id(1), (uint)get_local_id(2)))
 template <typename T> T __ldg(const device T *p) { return *p; }
+template <typename T> T __ldcg(const device T *p) { return *p; }
+template <typename T> T __ldca(const device T *p) { return *p; }
+template <typename T> T __ldcs(const device T *p) { return *p; }
+template <typename T> T __ldlu(const device T *p) { return *p; }
+template <typename T> T __ldcv(const device T *p) { return *(const volatile device T *)p; }
+template <typename T> void __stcg(device T *p, T v) { *p = v; }
+template <typename T> void __stcs(device T *p, T v) { *p = v; }
+template <typename T> void __stwb(device T *p, T v) { *p = v; }
+template <typename T> void __stwt(device T *p, T v) { *p = v; }
 
 // ---- synchronisation ----------------------------------------------------------------
 #define __syncthreads() barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE)
@@ -258,6 +301,58 @@ inline uint __ballot_sync(uint, int p) { return sub_group_ballot(p != 0).x; }
 inline int __any_sync(uint, int p) { return sub_group_any(p != 0); }
 inline int __all_sync(uint, int p) { return sub_group_all(p != 0); }
 #define __syncwarp(...) sub_group_barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE)
+#endif
+#if defined(OCU_SUBGROUP_32) && defined(cl_khr_subgroup_shuffle) && defined(cl_khr_subgroup_ballot)
+// ---- cooperative_groups on 32-wide sub-groups ----------------------------------------------
+// Only with OCU_SUBGROUP_32: every kernel then runs with 32-wide sub-groups
+// (intel_reqd_sub_group_size(32)), which are formed from consecutive
+// linear work-item ids, so a sub-group is exactly a CUDA warp and
+// thread_block_tile<32> maps onto it. Smaller tiles split a sub-group.
+namespace cooperative_groups {
+namespace detail {
+inline uint linear_tid() { return (uint)(get_local_id(0) + get_local_size(0) * (get_local_id(1) + get_local_size(1) * get_local_id(2))); }
+inline uint block_threads() { return (uint)(get_local_size(0) * get_local_size(1) * get_local_size(2)); }
+}
+struct thread_block {
+    void sync() const { barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE); }
+    ulong size() const { return detail::block_threads(); }
+    ulong num_threads() const { return detail::block_threads(); }
+    ulong thread_rank() const { return detail::linear_tid(); }
+    static bool is_valid() { return true; }
+};
+inline thread_block this_thread_block() { return thread_block(); }
+inline void sync(const thread_block &g) { g.sync(); }
+template <uint N> struct thread_block_tile {
+    static_assert(N == 1 || N == 2 || N == 4 || N == 8 || N == 16 || N == 32, "tile size: a power of two up to 32");
+    ulong thread_rank() const { return detail::linear_tid() & (N - 1); }
+    ulong size() const { return N; }
+    ulong num_threads() const { return N; }
+    ulong meta_group_rank() const { return detail::linear_tid() / N; }
+    ulong meta_group_size() const { return (detail::block_threads() + N - 1) / N; }
+    void sync() const { sub_group_barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE); }
+    template <typename T> T shfl(T v, int src) const { return __shfl_sync(0xffffffffu, v, src, (int)N); }
+    template <typename T> T shfl_xor(T v, uint m) const { return __shfl_xor_sync(0xffffffffu, v, (int)m, (int)N); }
+    template <typename T> T shfl_up(T v, uint d) const { return __shfl_up_sync(0xffffffffu, v, d, (int)N); }
+    template <typename T> T shfl_down(T v, uint d) const { return __shfl_down_sync(0xffffffffu, v, d, (int)N); }
+    int any(int p) const { return __any_sync(0xffffffffu, p); }
+    int all(int p) const { return __all_sync(0xffffffffu, p); }
+    static bool is_valid() { return true; }
+};
+template <uint N, class P> thread_block_tile<N> tiled_partition(const P &) { return thread_block_tile<N>(); }
+template <class T> struct plus { T operator()(T a, T b) const { return a + b; } };
+template <class T> struct less { T operator()(T a, T b) const { return a < b ? a : b; } };
+template <class T> struct greater { T operator()(T a, T b) const { return a < b ? b : a; } };
+template <class T> struct bit_and { T operator()(T a, T b) const { return a & b; } };
+template <class T> struct bit_or { T operator()(T a, T b) const { return a | b; } };
+template <class T> struct bit_xor { T operator()(T a, T b) const { return a ^ b; } };
+// a butterfly over the tile: every lane ends with the result, as in CUDA
+template <uint N, class T, class Op> T reduce(const thread_block_tile<N> &g, T v, Op op)
+{
+    for (uint off = N / 2; off > 0; off /= 2)
+        v = op(v, g.shfl_xor(v, off));
+    return v;
+}
+} // namespace cooperative_groups
 #endif
 
 // ---- vector constructors -------------------------------------------------------------------

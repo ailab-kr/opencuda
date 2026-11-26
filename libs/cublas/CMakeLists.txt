@@ -27,8 +27,21 @@ if(OCU_BACKEND_NVIDIA)
   endif()
 endif()
 
+if(OCU_BACKEND_OPENCL)
+  # Device code goes through compiler/opencl/cu2ocl.py: C++ for OpenCL,
+  # SPIR-V when llvm-spirv is found (OCU_LLVM_SPIRV).
+  find_program(OCU_CUBLAS_SPIRV NAMES llvm-spirv llvm-spirv-20 llvm-spirv-19 llvm-spirv-18)
+  if(OCU_CUBLAS_SPIRV OR OCU_LLVM_SPIRV)
+    list(APPEND OCU_CUBLAS_VARIANTS opencl)
+  endif()
+endif()
 foreach(kind IN LISTS OCU_CUBLAS_VARIANTS)
-  ocu_add_cu_library(ocu_cublas_${kind} ${kind} SOURCES cublas.cu INCLUDES ${OCU_CUBLAS_INCLUDE})
+  set(_ocu_cublas_inc ${OCU_CUBLAS_INCLUDE})
+  if(kind STREQUAL "opencl")
+    # the OpenCL path's device pass sees only the include folders given here
+    list(APPEND _ocu_cublas_inc ${PROJECT_SOURCE_DIR}/backends/interface)
+  endif()
+  ocu_add_cu_library(ocu_cublas_${kind} ${kind} SOURCES cublas.cu INCLUDES ${_ocu_cublas_inc})
   target_include_directories(ocu_cublas_${kind} PUBLIC
     $<BUILD_INTERFACE:${OCU_CUBLAS_INCLUDE}>
     $<INSTALL_INTERFACE:${OCU_INSTALL_INCLUDEDIR}>)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ocu-nvcc: a CUDA compiler driver with nvcc's documented command line.
 
-    ocu-nvcc [--ocu-target=cpu|nvidia] [nvcc options] inputs...
+    ocu-nvcc [--ocu-target=cpu|nvidia|opencl|intel] [nvcc options] inputs...
 
 Build systems call it where they would call nvcc: compile (-c), preprocess
 (-E), dependencies (-M, -MD, -MF, -MT), link (default), shared libraries
@@ -450,8 +450,15 @@ def parse(argv: list[str]) -> SimpleNamespace:
             raise UsageError(f"internal: unhandled option {a}")
         i += 1
 
-    if o.target not in ("cpu", "nvidia"):
-        raise UsageError(f"--ocu-target={o.target}: expected cpu or nvidia")
+    if o.target == "intel":
+        # The OpenCL path tuned for Intel GPUs: kernels with warp-wide
+        # operations run 32-wide sub-groups (a CUDA warp), the others 16-wide
+        # (twice the registers per work-item). Same backend: OCU_BACKEND=opencl.
+        os.environ.setdefault("OCU_OPENCL_SUBGROUP", "32")
+        os.environ.setdefault("OCU_OPENCL_SUBGROUP_OTHER", "16")
+        o.target = "opencl"
+    if o.target not in ("cpu", "nvidia", "opencl"):
+        raise UsageError(f"--ocu-target={o.target}: expected cpu, nvidia, opencl or intel")
     for item in o.inputs:   # nvcc: -x applies to every input
         if item[1] is None:
             item[1] = lang_global

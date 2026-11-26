@@ -67,4 +67,13 @@ static inline cudaError_t cudaLaunchKernelEx(const cudaLaunchConfig_t *config,
 }
 #endif
 
+/* OpenCL path (compiler/opencl): device code may call assert(); the C
+   library's expansion calls the host function __assert_fail, so both Clang
+   passes get a device-side declaration (the generated OpenCL source checks
+   assert() with its prelude's macro). */
+#if defined(__cplusplus) && defined(__CUDA__) && (defined(OCU_OPENCL_PATH) || defined(OCU_OPENCL_HOST_PASS)) && \
+    !defined(OCU_OPENCL_ASSERT_DECL)
+#define OCU_OPENCL_ASSERT_DECL 1
+__device__ static inline void __assert_fail(const char *, const char *, unsigned int, const char *) {}
+#endif
 #endif /* OCU_CUDA_RUNTIME_H */
