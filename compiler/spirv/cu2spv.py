@@ -303,6 +303,58 @@ def _div_helper(op: str) -> str:
             f"l:\n  %q2 = {op} i64 %a, %b\n  ret i64 %q2\n}}\n")
 
 
+# Intrinsics LLVM's SPIR-V back end (23) does not legalize, written with
+# ones it does (LLVM LangRef semantics kept):
+#   llvm.lrint / llvm.llrint  -> llvm.rint, then fptosi (result undefined on overflow either way)
+#   llvm.lround / llvm.llround -> llvm.round, then fptosi
+#   llvm.{u,s}{min,max}.i1    -> and / or (i1: unsigned 1 > 0; signed true = -1 < 0)
+TO_INT = re.compile(r"^(\s*)(%[\w.]+) = (?:tail |notail |musttail )?call (?:[\w()]+ )*(i\d+) "
+                    r"@llvm\.(l?lrint|l?lround)\.i\d+\.(f32|f64)\((float|double)(?: noundef)? ([^)]+)\)(.*)$", re.M)
+#   select i1 a, i1 b, i1 false -> and i1 a, b;  select i1 a, i1 true, i1 b -> or i1 a, b
+#     (LLVM's logical and / or; llc's own combiner turns them into G_UMIN / G_UMAX
+#     on s1, which it cannot legalize; the plain and / or differ only in how
+#     poison spreads, which code generation does not depend on)
+LOGIC_I1 = re.compile(r"^(\s*)(%[\w.]+) = select i1 ([^,]+), i1 ([^,]+), i1 ([^,]+?)(,\s*!.*)?$", re.M)
+MINMAX_I1 = re.compile(r"^(\s*)(%[\w.]+) = (?:tail |notail )?call (?:[\w()]+ )*i1 "
+                       r"@llvm\.([us])(min|max)\.i1\(i1(?: noundef)? ([^,]+), i1(?: noundef)? ([^)]+)\)(.*)$", re.M)
+
+
+def legalize_intrinsics(ll: str) -> str:
+    need = set()
+    # run before and after opt: new names start after those already there
+    count = [max([int(n) for n in re.findall(r"%ocu_(?:rint|round)\.(\d+)\b", ll)] or [0])]
+
+    def to_int(m):
+        ind, dst, ity, op, fty_s, fty, val = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5), m.group(6), m.group(7)
+        base = "rint" if op.endswith("rint") else "round"
+        need.add((base, fty_s, fty))
+        # a named value: a suffix on a numbered one (%24.x) is not valid IR
+        count[0] += 1
+        tmp = f"%ocu_{base}.{count[0]}"
+        return f"{ind}{tmp} = call {fty} @llvm.{base}.{fty_s}({fty} {val})\n{ind}{dst} = fptosi {fty} {tmp} to {ity}"
+    ll = TO_INT.sub(to_int, ll)
+
+    def minmax(m):
+        ind, dst, sign, kind, a, b = m.groups()[:6]
+        op = "and" if (sign == "u") == (kind == "min") else "or"
+        return f"{ind}{dst} = {op} i1 {a}, {b}"
+    ll = MINMAX_I1.sub(minmax, ll)
+
+    def logic(m):
+        ind, dst, c, t, f, md = m.groups()
+        if f.strip() == "false":
+            return f"{ind}{dst} = and i1 {c}, {t}"
+        if t.strip() == "true":
+            return f"{ind}{dst} = or i1 {c}, {f}"
+        return m.group(0)
+    ll = LOGIC_I1.sub(logic, ll)
+    for base, fty_s, fty in sorted(need):
+        decl = f"declare {fty} @llvm.{base}.{fty_s}({fty})"
+        if not re.search(rf"^declare .*@llvm\.{base}\.{fty_s}\(", ll, re.M):
+            ll += "\n" + decl + "\n"
+    return ll
+
+
 def bypass_div64(ll: str) -> str:
     used = set()
 
@@ -376,6 +428,7 @@ def main(argv):
         div = infer and os.environ.get("OCU_SPV_DIV64", "1") != "0"
         if div:
             text = bypass_div64(text)
+        text = legalize_intrinsics(text)
         # Program-scope variables that can change (written by kernels, or by the
         # host: externally_initialized): the back end then builds the module
         # once, since a second build (another register file) would hold copies.
@@ -389,8 +442,14 @@ def main(argv):
         ll2.write_text(text)
         opt = os.environ.get("OCU_SPV_OPT") or str(Path(llc).with_name("opt"))
         if infer and Path(opt).exists():
-            r = subprocess.run([opt, "-passes=always-inline,infer-address-spaces,instcombine<no-verify-fixpoint>,simplifycfg", str(ll2), "-o", str(bc)],
+            # textual output, so that the rewrites the back end needs also see what
+            # instcombine made (it forms llvm.umin.i1 and the like from selects)
+            ll3 = t / "dev3.ll"
+            r = subprocess.run([opt, "-passes=always-inline,infer-address-spaces,instcombine<no-verify-fixpoint>,simplifycfg", "-S", str(ll2), "-o", str(ll3)],
                                capture_output=True, text=True)
+            if r.returncode == 0:
+                ll3.write_text(legalize_intrinsics(ll3.read_text()))
+                r = subprocess.run([llvm_as, str(ll3), "-o", str(bc)], capture_output=True, text=True)
         else:
             r = subprocess.run([llvm_as, str(ll2), "-o", str(bc)], capture_output=True, text=True)
         if r.returncode:
