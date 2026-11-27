@@ -63,6 +63,11 @@ typedef struct ocu_dev_info {
     uint32_t max_grid_dim[3];
     uint64_t max_shared_memory_per_block;
     uint32_t supports_unified_memory; /* 0 or 1 */
+    /* Units the device runs blocks on, as a CUDA multiprocessor count
+       (an NVIDIA SM, an Intel Xe core = sub-slice, ...); 0 = not known.
+       Programs size grids by it (llama.cpp's FlashAttention KV split,
+       stream-k matrix products). */
+    uint32_t multiprocessor_count;
 } ocu_dev_info;
 
 typedef enum ocu_copy_dir {

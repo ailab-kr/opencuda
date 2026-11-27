@@ -80,6 +80,9 @@ typedef struct _cl_event         *cl_event;
 #define CL_DEVICE_SVM_CAPABILITIES        0x1053
 #define CL_DEVICE_IL_VERSION              0x105B
 #define CL_DEVICE_GENERIC_ADDRESS_SPACE_SUPPORT 0x1069
+/* cl_intel_device_attribute_query */
+#define CL_DEVICE_NUM_SLICES_INTEL        0x4252
+#define CL_DEVICE_NUM_SUB_SLICES_PER_SLICE_INTEL 0x4253
 
 #define CL_DEVICE_SVM_COARSE_GRAIN_BUFFER (1u << 0)
 #define CL_DEVICE_SVM_FINE_GRAIN_BUFFER   (1u << 1)

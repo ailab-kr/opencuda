@@ -357,7 +357,14 @@ cudaError_t cudaGetDeviceProperties(struct cudaDeviceProp *prop, int device)
     prop->textureAlignment = 512;
     prop->deviceOverlap = 1;
     prop->asyncEngineCount = 1;
-    prop->multiProcessorCount = 1;
+    /* The backend's count (SMs, Intel Xe cores, ...), 1 where it is not
+       known; OCU_MULTIPROCESSOR_COUNT=N overrides it (for measurements). */
+    prop->multiProcessorCount = info.multiprocessor_count > 0 ? (int)info.multiprocessor_count : 1;
+    {
+        const char *mp = getenv("OCU_MULTIPROCESSOR_COUNT");
+        int n;
+        if (mp != NULL && sscanf(mp, "%d", &n) == 1 && n >= 1 && n <= 65536) prop->multiProcessorCount = n;
+    }
     prop->concurrentKernels = 1;
     prop->unifiedAddressing = info.supports_unified_memory ? 1 : 0;
     prop->integrated = info.supports_unified_memory ? 1 : 0;

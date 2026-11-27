@@ -234,6 +234,20 @@ static void enumerate_once(void)
             /* The host may not touch coarse-grained SVM directly. */
             info->supports_unified_memory = 0;
             info->warp_size = 0; /* measured on first dev_info (probe_warp) */
+            /* Multiprocessors: on Intel GPUs a sub-slice (Xe core) is the unit a
+               work-group runs on, as an SM is for a CUDA block
+               (cl_intel_device_attribute_query: slices x sub-slices per slice).
+               Elsewhere CL_DEVICE_MAX_COMPUTE_UNITS, the OpenCL compute unit. */
+            cl_uint cu = 0, slices = 0, subs = 0;
+            a->GetDeviceInfo(d, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(cu), &cu, NULL);
+            if (has_word(ext, "cl_intel_device_attribute_query") &&
+                a->GetDeviceInfo(d, CL_DEVICE_NUM_SLICES_INTEL, sizeof(slices), &slices, NULL) == CL_SUCCESS &&
+                a->GetDeviceInfo(d, CL_DEVICE_NUM_SUB_SLICES_PER_SLICE_INTEL, sizeof(subs), &subs, NULL) == CL_SUCCESS &&
+                slices > 0 && subs > 0) {
+                info->multiprocessor_count = slices * subs;
+            } else {
+                info->multiprocessor_count = cu;
+            }
         }
     }
 }
