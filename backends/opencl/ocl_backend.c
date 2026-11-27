@@ -37,6 +37,7 @@ typedef struct ocl_alloc {
     char  *ptr;   /* SVM address: the same for host-side calls and kernels */
     size_t size;
     char  *base;  /* what clSVMAlloc returned (ptr is aligned up from it) */
+    bool   usm;   /* a USM shared allocation (cl_intel_unified_shared_memory) */
 } ocl_alloc;
 
 typedef struct ocl_dev_entry {
@@ -46,6 +47,10 @@ typedef struct ocl_dev_entry {
     bool           il;          /* takes SPIR-V (clCreateProgramWithIL) */
     bool           cxx;         /* compiles C++ for OpenCL source */
     bool           fine_buffer; /* fine-grained SVM buffers (mem_alloc_shared) */
+    /* else USM shared allocations (mem_alloc_shared): host and device at one
+       address, migrated by the driver */
+    ocl_shared_mem_alloc_intel  usm_alloc;
+    ocl_mem_blocking_free_intel usm_free;
     pthread_once_t warp_once;
 } ocl_dev_entry;
 
@@ -211,6 +216,16 @@ static void enumerate_once(void)
             e->il = can_il;
             e->cxx = can_cxx;
             e->fine_buffer = (svm & CL_DEVICE_SVM_FINE_GRAIN_BUFFER) != 0;
+            if (!e->fine_buffer && has_word(ext, "cl_intel_unified_shared_memory") &&
+                a->GetExtensionFunctionAddressForPlatform != NULL) {
+                cl_ulong caps = 0;
+                if (a->GetDeviceInfo(d, CL_DEVICE_SINGLE_DEVICE_SHARED_MEM_CAPABILITIES_INTEL, sizeof(caps), &caps, NULL) == CL_SUCCESS &&
+                    (caps & CL_UNIFIED_SHARED_MEMORY_ACCESS_INTEL)) {
+                    *(void **)&e->usm_alloc = a->GetExtensionFunctionAddressForPlatform(plats[p], "clSharedMemAllocINTEL");
+                    *(void **)&e->usm_free = a->GetExtensionFunctionAddressForPlatform(plats[p], "clMemBlockingFreeINTEL");
+                    if (e->usm_alloc == NULL || e->usm_free == NULL) e->usm_alloc = NULL, e->usm_free = NULL;
+                }
+            }
             pthread_once_t once = PTHREAD_ONCE_INIT;
             e->warp_once = once;
             ocu_dev_info *info = &e->info;
@@ -410,7 +425,10 @@ static ocu_status ocl_dev_close(ocu_device *d)
     const ocl_api *a = ocl_load();
     finish_all(d);
     ocu_status st = ocl_queue_destroy(d->sync_q);
-    for (size_t i = 0; i < d->count; ++i) a->SVMFree(d->ctx, d->allocs[i].base);
+    for (size_t i = 0; i < d->count; ++i) {
+        if (d->allocs[i].usm) d->entry->usm_free(d->ctx, d->allocs[i].base);
+        else a->SVMFree(d->ctx, d->allocs[i].base);
+    }
     free(d->allocs);
     a->ReleaseContext(d->ctx);
     pthread_mutex_destroy(&d->lock);
@@ -538,7 +556,7 @@ static ocu_status ocl_queue_destroy(ocu_queue *q)
 
 /* ---- allocation table ------------------------------------------------------------ */
 
-static bool table_add(ocu_device *d, char *ptr, size_t size, char *base)
+static bool table_add(ocu_device *d, char *ptr, size_t size, char *base, bool usm)
 {
     pthread_mutex_lock(&d->lock);
     bool ok = true;
@@ -556,6 +574,7 @@ static bool table_add(ocu_device *d, char *ptr, size_t size, char *base)
         d->allocs[d->count].ptr = ptr;
         d->allocs[d->count].size = size;
         d->allocs[d->count].base = base;
+        d->allocs[d->count].usm = usm;
         d->count++;
         d->gen++;
         d->allocated += size;
@@ -565,15 +584,17 @@ static bool table_add(ocu_device *d, char *ptr, size_t size, char *base)
 }
 
 /* Remove the allocation that starts at ptr; its SVM base, or NULL if there
-   is none. */
-static char *table_remove(ocu_device *d, const char *ptr)
+   is none (*usm: whether it is a USM shared allocation). */
+static char *table_remove(ocu_device *d, const char *ptr, bool *usm)
 {
     char *found = NULL;
+    *usm = false;
     pthread_mutex_lock(&d->lock);
     for (size_t i = 0; i < d->count; ++i) {
         if (d->allocs[i].ptr == ptr) {
             d->allocated -= d->allocs[i].size;
             found = d->allocs[i].base;
+            *usm = d->allocs[i].usm;
             d->allocs[i] = d->allocs[--d->count];
             d->gen++;
             break;
@@ -618,7 +639,7 @@ static ocu_status alloc_svm(ocu_device *d, size_t bytes, cl_svm_mem_flags flags,
     char *base = a->SVMAlloc(d->ctx, CL_MEM_READ_WRITE | flags, bytes + 256, 0);
     if (base == NULL) return OCU_ERR_OUT_OF_MEMORY;
     char *p = base + ((256 - ((uintptr_t)base & 255)) & 255);
-    if (!table_add(d, p, bytes, base)) {
+    if (!table_add(d, p, bytes, base, false)) {
         a->SVMFree(d->ctx, base);
         return OCU_ERR_OUT_OF_MEMORY;
     }
@@ -631,12 +652,30 @@ static ocu_status ocl_mem_alloc_impl(ocu_device *d, size_t bytes, void **ptr)
     return alloc_svm(d, bytes, 0, ptr);
 }
 
-/* Host and device at the same address: fine-grained SVM buffers. */
+/* Host and device at the same address: fine-grained SVM buffers, or else
+   USM shared allocations (cl_intel_unified_shared_memory: the host reads and
+   writes them directly, the driver migrates the pages), 256-byte aligned as
+   CUDA allocations are. Kernels reach them like SVM (the backend already
+   sets the indirect-access flags of that extension). */
 static ocu_status ocl_mem_alloc_shared(ocu_device *d, size_t bytes, void **ptr)
 {
     if (d == NULL) return OCU_ERR_INVALID_HANDLE;
-    if (!d->entry->fine_buffer) return OCU_ERR_NOT_SUPPORTED;
-    return alloc_svm(d, bytes, CL_MEM_SVM_FINE_GRAIN_BUFFER, ptr);
+    if (d->entry->fine_buffer) return alloc_svm(d, bytes, CL_MEM_SVM_FINE_GRAIN_BUFFER, ptr);
+    if (d->entry->usm_alloc == NULL) return OCU_ERR_NOT_SUPPORTED;
+    if (ptr == NULL) return OCU_ERR_INVALID_VALUE;
+    if (bytes == 0) {
+        *ptr = NULL;
+        return OCU_OK;
+    }
+    cl_int err = CL_SUCCESS;
+    char *p = d->entry->usm_alloc(d->ctx, d->entry->device, NULL, bytes, 256, &err);
+    if (p == NULL || err != CL_SUCCESS) return OCU_ERR_OUT_OF_MEMORY;
+    if (!table_add(d, p, bytes, p, true)) {
+        d->entry->usm_free(d->ctx, p);
+        return OCU_ERR_OUT_OF_MEMORY;
+    }
+    *ptr = p;
+    return OCU_OK;
 }
 
 static ocu_status ocl_mem_free_impl(ocu_device *d, void *ptr)
@@ -644,9 +683,11 @@ static ocu_status ocl_mem_free_impl(ocu_device *d, void *ptr)
     if (d == NULL) return OCU_ERR_INVALID_HANDLE;
     if (ptr == NULL) return OCU_OK;
     finish_all(d);
-    char *base = table_remove(d, ptr);
+    bool usm;
+    char *base = table_remove(d, ptr, &usm);
     if (base == NULL) return OCU_ERR_INVALID_VALUE;
-    ocl_load()->SVMFree(d->ctx, base);
+    if (usm) d->entry->usm_free(d->ctx, base);
+    else ocl_load()->SVMFree(d->ctx, base);
     return OCU_OK;
 }
 

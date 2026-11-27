@@ -67,6 +67,7 @@ static void load_once(void)
     CL_SYM(ReleaseEvent);
 #undef CL_SYM
     *(void **)&a.CreateProgramWithIL = dlsym(lib, "clCreateProgramWithIL");
+    *(void **)&a.GetExtensionFunctionAddressForPlatform = dlsym(lib, "clGetExtensionFunctionAddressForPlatform");
     if (!ok) {
         dlclose(lib);
         return;
