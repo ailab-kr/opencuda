@@ -325,5 +325,88 @@ class GlobalsBlock(unittest.TestCase):
         self.assertIs(ll, src)
 
 
+BYVAL = MODULE.split("define spir_kernel")[0] + """%struct.Big = type { [3 x [48 x ptr]], [48 x i64], [320 x i8], [320 x i32], i32 }
+%struct.Small = type { i32, i32 }
+
+define protected spir_kernel void @k(i32 noundef %0, ptr nofree noundef readonly byval(%struct.Big) align 8 captures(none) %1, ptr addrspace(1) noundef %2) {
+  %4 = getelementptr inbounds nuw i8, ptr %1, i64 1536
+  %5 = load i8, ptr %4, align 1
+  %6 = zext i8 %5 to i32
+  %7 = add i32 %6, %0
+  %8 = sitofp i32 %7 to float
+  store float %8, ptr addrspace(1) %2, align 4
+  ret void
+}
+
+define protected spir_kernel void @small(ptr noundef byval(%struct.Small) align 4 %0, ptr addrspace(1) noundef %1) {
+  %3 = load i32, ptr %0, align 4
+  store i32 %3, ptr addrspace(1) %1, align 4
+  ret void
+}
+"""
+
+
+class ByvalBuffers(unittest.TestCase):
+    """kernel arguments over ARG_LIMIT bytes: the largest byval parameters
+    come through a global pointer ("b<size>") and are copied at entry"""
+
+    def setUp(self):
+        self.ll, self.meta = cu2spv.byval_buffers(BYVAL, ["sparam k v4 v3144 p8", "sparam small v8 p8"])
+
+    def test_meta(self):
+        self.assertEqual(self.meta, ["sparam k v4 b3144 p8", "sparam small v8 p8"])
+
+    def test_kernel(self):
+        o = self.ll
+        self.assertIn("define protected spir_kernel void @k(i32 noundef %0, ptr addrspace(1) noalias noundef readonly align 8 %1, ptr addrspace(1) noundef %2) {", o)
+        self.assertIn("  %ocu_bv.1 = alloca [3144 x i8], align 8", o)
+        self.assertIn("call void @llvm.memcpy.p0.p1.i64(ptr align 8 %ocu_bv.1, ptr addrspace(1) align 8 %1, i64 3144, i1 false)", o)
+        self.assertIn("%4 = getelementptr inbounds nuw i8, ptr %ocu_bv.1, i64 1536", o)
+        self.assertEqual(o.count("declare void @llvm.memcpy.p0.p1.i64("), 1)
+        self.assertIn("define protected spir_kernel void @small(ptr noundef byval(%struct.Small) align 4 %0", o)  # fits: untouched
+
+    def test_limit(self):
+        ll, meta = cu2spv.byval_buffers(BYVAL, ["sparam k v4 v1000 p8"])  # 1012 bytes: fits
+        self.assertEqual(ll, BYVAL)
+        self.assertEqual(meta, ["sparam k v4 v1000 p8"])
+
+    def test_direct_reads(self):
+        # after opt: only addressed and read, so the buffer is read in place
+        o = cu2spv.byval_direct(self.ll)
+        self.assertNotIn("alloca", o)
+        self.assertNotIn("call void @llvm.memcpy", o)
+        self.assertIn("%4 = getelementptr inbounds nuw i8, ptr addrspace(1) %1, i64 1536", o)
+        self.assertIn("%5 = load i8, ptr addrspace(1) %4, align 1", o)
+
+    def test_direct_keeps_copy_for_other_uses(self):
+        src = self.ll.replace("  %5 = load i8, ptr %4, align 1",
+                              "  call void @sink(ptr %4)\n  %5 = load i8, ptr %4, align 1") + "declare void @sink(ptr)\n"
+        o = cu2spv.byval_direct(src)
+        self.assertIn("%ocu_bv.1 = alloca [3144 x i8], align 8", o)
+        self.assertIn("call void @sink(ptr %4)", o)
+
+    @unittest.skipUnless(LLC and LLVM_AS, "OCU_SPV_LLC / OCU_SPV_LLVM_AS not set")
+    def test_llc_takes_direct(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ll, bc, spv = (Path(tmp) / f"d{e}" for e in (".ll", ".bc", ".spv"))
+            ll.write_text(cu2spv.byval_direct(self.ll))
+            r = subprocess.run([LLVM_AS, str(ll), "-o", str(bc)], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            r = subprocess.run([LLC, "-mtriple=spirv64-unknown-unknown", "-O2", "-filetype=obj", str(bc), "-o", str(spv)],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+
+    @unittest.skipUnless(LLC and LLVM_AS, "OCU_SPV_LLC / OCU_SPV_LLVM_AS not set")
+    def test_llc_takes_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ll, bc, spv = (Path(tmp) / f"b{e}" for e in (".ll", ".bc", ".spv"))
+            ll.write_text(self.ll)
+            r = subprocess.run([LLVM_AS, str(ll), "-o", str(bc)], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            r = subprocess.run([LLC, "-mtriple=spirv64-unknown-unknown", "-O2", "-filetype=obj", str(bc), "-o", str(spv)],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+
+
 if __name__ == "__main__":
     unittest.main()
