@@ -154,7 +154,12 @@ __device__ unsigned long get_local_id(unsigned);
 __device__ unsigned long get_group_id(unsigned);
 __device__ unsigned long get_local_size(unsigned);
 __device__ unsigned long get_num_groups(unsigned);
-__device__ unsigned get_sub_group_local_id(void);
+/* The same value for a work-item for the whole kernel: const, and not
+   convergent (Clang makes every device call convergent in HIP mode, and LLVM
+   merges no convergent calls), so the calls each shuffle makes are merged
+   and hoisted out of loops */
+__device__ __attribute__((const, noconvergent)) unsigned get_sub_group_local_id(void);
+__device__ __attribute__((const, noconvergent)) unsigned get_sub_group_size(void);
 __device__ void barrier(unsigned);
 __device__ void sub_group_barrier(unsigned);
 __device__ int sub_group_shuffle(int, unsigned);
@@ -375,25 +380,44 @@ OCU_D int __ocu_shfl_src(int kind, int arg, int w)
     }
 }
 
+/* A lane past the end of a short last warp (a block size that is not a
+   multiple of 32) does not exist: the sub-group has fewer work-items there,
+   and a shuffle from one gave garbage on an Arc Pro B70 (the Guide calls the
+   read undefined). The caller then gets its own value, as on the other
+   paths. The shuffle itself keeps the plain lane expression (lane ^ c, lane
+   + c), which the GPU compiler turns into its fast register moves; only the
+   result is replaced. Cost on an Arc Pro B70, llama.cpp qwen3-0.6B Q4_K
+   tg128: 245 against 251 t/s without the check (OCU_SPV_SHFL_ANY_LANE
+   leaves it out; 238 before the sub-group queries were made
+   non-convergent). */
+OCU_D bool __ocu_lane_missing(int src)
+{
+#if defined(OCU_SPV_DEVICE) && !defined(OCU_SPV_SHFL_ANY_LANE)
+    return (unsigned)src >= get_sub_group_size();
+#else
+    return false;
+#endif
+}
+
 template <typename T>
 OCU_D T __ocu_shfl(int kind, T v, int arg, int w)
 {
     static_assert(sizeof(T) <= 4 || sizeof(T) == 8, "shuffles move values of at most 8 bytes");
     int src = __ocu_shfl_src(kind, arg, w);
+    T r;
     if constexpr (sizeof(T) == 4) {
-        return __builtin_bit_cast(T, __ocu_permute(src, __builtin_bit_cast(int, v)));
+        r = __builtin_bit_cast(T, __ocu_permute(src, __builtin_bit_cast(int, v)));
     } else if constexpr (sizeof(T) < 4) {
         int x = 0;
         __builtin_memcpy(&x, &v, sizeof(T));
         x = __ocu_permute(src, x);
-        T r;
         __builtin_memcpy(&r, &x, sizeof(T));
-        return r;
     } else {
         long long x = __builtin_bit_cast(long long, v);
         int lo = __ocu_permute(src, (int)(x & 0xffffffff)), hi = __ocu_permute(src, (int)(x >> 32));
-        return __builtin_bit_cast(T, ((long long)hi << 32) | (unsigned)lo);
+        r = __builtin_bit_cast(T, ((long long)hi << 32) | (unsigned)lo);
     }
+    return __ocu_lane_missing(src) ? v : r;
 }
 template <typename T>
 OCU_D T __shfl_sync(unsigned, T v, int src, int width = 32) { return __ocu_shfl(0, v, src, width); }

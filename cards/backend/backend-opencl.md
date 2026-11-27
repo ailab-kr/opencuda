@@ -25,6 +25,8 @@ cost: { hours: 3, ai_usage: 0 }
 - 고정 호스트 메모리(`host_alloc_pinned`, `cudaMallocHost`·`cudaHostAlloc`): 장치가 USM 호스트 할당 접근을 알리면(`CL_DEVICE_HOST_MEM_CAPABILITIES_INTEL`) `clHostMemAllocINTEL`(4096바이트 정렬). 커널이 같은 주소로 바로 읽고 쓴다(`pinned_is_mapped` = 1). 할당 표에 들어가 복사·채우기가 받지만 장치 메모리 사용량에는 안 센다. `cudaFree`로는 안 풀린다. 없으면(또는 `OCU_OPENCL_PINNED_USM=0`) 예전처럼 `posix_memalign`, 복사만.
 - 모듈 변수(SPIR-V 경로): cu2spv가 `__device__`·`__constant__` 변수(addrspace(1)에서 바뀔 수 있거나 호스트가 쓰는 것)를 모듈 블록 하나로 옮긴다. 이미지 줄 `global <이름> <위치> <크기>`(cu2ocl 이미지와 같은 줄)로 `module_get_global`이 주소를 준다. 쓰는 커널은 `sparam` 줄 끝의 `glob` 표시: 블록 주소가 마지막(동적 공유 메모리 다음) 인자. 초기값은 원래 변수에 남고, 모듈을 올릴 때 `ginit <커널> <위치> <크기>` 커널이 블록으로 복사한다. 함수 주소를 쓰는 모듈처럼 다루지 못하는 꼴이거나 바꾼 IR이 맞지 않으면 그대로 둔다(그때 기호 복사는 예전처럼 "기호 없음"). `OCU_SPV_GLOBALS_BLOCK=0`이면 끈다.
 - 기다리는 반복(SPIR-V 경로): 분기를 정하는 전역·일반 주소의 volatile 정수 읽기는 seq_cst 원자 읽기로 바꾼다(cu2spv `spin_loads`, `OCU_SPV_SPIN_LOADS=0`이면 끔). Arc Pro B70에서 호스트가 고정 메모리 깃발을 바꿔도 volatile 읽기·relaxed/acquire 원자 읽기·seq_cst 울타리·더하기 0 원자 연산은 30초 동안 옛 값을 봤고, seq_cst 원자 읽기만 바로 봤다(한 번에 약 1µs). 연산에 쓰는 volatile 읽기와 공유 메모리 읽기는 그대로.
+  - 한계(아직 풀지 못함): 이것으로 깃발 하나를 한 번 기다리는 경우(시험 프로그램, `rt_api` 첫 단계)는 되지만 믿을 만하지 않다. 한 프로세스에서 두 번 기다리면(같은 깃발, 새로 할당한 깃발, 다른 커널, 루프 안 시스템 울타리 모두) 두 번째가 끝나지 않았고, 같은 프로그램의 첫 번째도 실행에 따라 끝나지 않았다(15초 제한). 원인은 모른다. 호스트 고정 메모리로 실행 중인 커널과 주고받는 프로그램은 이 경로에서 멈출 수 있다.
+- 워프 셔플(SPIR-V 경로): 짧은 마지막 워프(블록 크기가 32의 배수가 아님)에서 없는 레인을 읽으면 자기 값(다른 경로와 같은 규칙; Arc Pro B70은 쓰레기 값을 줬다). 셔플은 원래 레인 식 그대로 하고 결과만 바꾼다. 하위 묶음 질의(`get_sub_group_local_id`·`get_sub_group_size`)는 `const, noconvergent`로 선언해 셔플마다 다시 묻지 않는다(HIP 모드 Clang은 장치 호출을 모두 convergent로 만들고 LLVM은 convergent 호출을 합치지 않는다). 비용: llama.cpp qwen3-0.6B Q4_K tg128 245 t/s, 확인 없이 251(`OCU_SPV_SHFL_ANY_LANE`), noconvergent 전에는 238. `threadIdx` 등 색인 질의에도 붙여 봤지만 차이가 없어 두지 않았다.
 
 ## 경계 조건
 
@@ -44,7 +46,7 @@ cost: { hours: 3, ai_usage: 0 }
 - [x] 전체 프로그램: `tests/probe/main_saxpy.cu` + `probe_kernel.cu`를 `--target opencl`로: `main_saxpy: ok (0 bad)`
 - [x] Rodinia 18개(`OCU_TARGET=opencl conformance/external/rodinia/run.sh`): `POCL_WORK_GROUP_METHOD=cbs`에서 17개 빌드, 14개 기준과 같음. PoCL 기본 방식에서는 17개 빌드, 12개 같음(pathfinder·hotspot 다름, 위 경계 조건). 실패: huffman(프로그램이 32비트 값을 32만큼 민다: CPU 경로와 같은 실패, OpenCL은 민 양을 폭으로 나눈 나머지로 정의), kmeans(빌드: Clang에 `omp.h` 없음)
 
-- [x] Arc Pro B70(2026-11-28, SPIR-V 경로): `rt_symbols` 32/32(상수 표·오프셋·비동기 기호 복사, 구조체, 초기값, 원자 카운터, 커널 사이 변수, 장치 함수를 거친 접근, `cudaGetSymbolAddress`·크기, 범위 밖 오류), `rt_pinned_mapped` 21/21, `rt_mem` 49/49(전에는 GPU에서 멈춤), `rt_managed` 45/45. `rt_api`는 호스트가 고정 메모리 깃발로 커널을 푸는 첫 단계를 지나고, 두 번째 단계(예전 기본 스트림 복사가 막는 스트림을 기다림)에서 아직 멈춘다.
+- [x] Arc Pro B70(2026-11-28, SPIR-V 경로): `rt_symbols` 32/32(상수 표·오프셋·비동기 기호 복사, 구조체, 초기값, 원자 카운터, 커널 사이 변수, 장치 함수를 거친 접근, `cudaGetSymbolAddress`·크기, 범위 밖 오류), `rt_pinned_mapped` 21/21, `rt_mem` 49/49(전에는 GPU에서 멈춤), `rt_managed` 45/45. `rt_api`는 호스트가 고정 메모리 깃발로 커널을 푸는 첫 단계를 지나고, 두 번째 단계(예전 기본 스트림 복사가 막는 스트림을 기다림)에서 아직 멈춘다(위 한계). `rt_warp_lang` 346/346(전에는 짧은 마지막 워프 9건 실패). llama.cpp `test-backend-ops` SOFT_MAX 215·RMS_NORM 121·SUM_ROWS 11·ARGMAX 7·MUL_MAT 2724·FLASH_ATTN_EXT(hsk=128) 859 모두 통과.
 - [x] `spirv_cu2spv_host`: 19/19(변수 블록 4건, 기다리는 반복 6건 포함, llc·llvm-as로 바꾼 IR 확인)
 
 ## 메모
