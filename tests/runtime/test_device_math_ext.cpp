@@ -4,8 +4,9 @@
 //     library, bit for bit;
 //   - the rounding-mode arithmetic (__fadd_rd ... __dsqrt_ru: add, sub, mul,
 //     div, rcp, sqrt, fma for float; add, mul, div, rcp, sqrt for double)
-//     and the 64-bit integer conversions against the host FPU in that
-//     rounding mode (fesetround), bit for bit;
+//     and the 64-bit integer conversions, int / unsigned / double to float
+//     and double to unsigned against the host FPU in that rounding mode
+//     (fesetround), bit for bit;
 //   - __frsqrt_rn on every positive float against 1/sqrtl, bit for bit
 //     (OCU_MATH_EXT_FULL=1; otherwise every 61st);
 //   - sinpi, cospi, acosh, asinh, atanh, rcbrt, rhypot, norm3d, norm4d,
@@ -134,6 +135,33 @@ static void test_rounding_modes()
             CHECK(samef(ocu_dm::dd_to_float(ocu_dm::u64_dd(u), m), f2), "__ull2float_%s(%llu)", MNAME[m], u);
             CHECK(same(ocu_dm::dd_to_double(ocu_dm::i64_dd(v), m), d1), "__ll2double_%s(%lld)", MNAME[m], v);
             CHECK(same(ocu_dm::dd_to_double(ocu_dm::u64_dd(u), m), d2), "__ull2double_%s(%llu)", MNAME[m], u);
+        }
+        // 32-bit integers and doubles to float (__int2float_r*, __uint2float_r*, __double2float_r*)
+        for (int i = 0; i < 400000; ++i) {
+            int v = (int)(rng() >> (32 + rng() % 32));
+            if (rng() & 1) v = -v;
+            unsigned u = (unsigned)(rng() >> (32 + rng() % 32));
+            double x = rand_double();
+            if (i % 3 == 0) x = (double)rand_float() * (1 + 0x1p-30 * (double)(rng() % 9)); // near floats, ties
+            volatile int vv = v; volatile unsigned vu = u; volatile double vx = x;
+            std::fesetround(MODES[m]);
+            float f1 = (float)vv, f2 = (float)vu, f3 = (float)vx;
+            std::fesetround(FE_TONEAREST);
+            CHECK(samef(ocu_dm::to_float((double)v, 0, m), f1), "__int2float_%s(%d)", MNAME[m], v);
+            CHECK(samef(ocu_dm::to_float((double)u, 0, m), f2), "__uint2float_%s(%u)", MNAME[m], u);
+            CHECK(samef(ocu_dm::to_float(x, 0, m), f3), "__double2float_%s(%a) = %a want %a", MNAME[m], x, ocu_dm::to_float(x, 0, m), f3);
+        }
+    }
+    // double to unsigned (__double2uint_r*): saturating, NaN -> 0
+    for (int i = 0; i < 400000; ++i) {
+        double x = rand_double();
+        if (i % 2) x = std::ldexp((double)(long long)rng(), -(int)(rng() % 40) - 24);
+        long double r[4] = {std::rint((long double)x), std::trunc((long double)x), std::ceil((long double)x), std::floor((long double)x)};
+        double fns[4] = {ocu_dm::rint(x), ocu_dm::trunc(x), ocu_dm::ceil(x), ocu_dm::floor(x)};
+        for (int m = 0; m < 4; ++m) {
+            long double w = r[m];
+            unsigned want = std::isnan(x) || w <= 0 ? 0u : (w >= 0x1p32L ? UINT_MAX : (unsigned)w);
+            CHECK(ocu_dm::sat_u32(fns[m]) == want, "__double2uint_%s(%a)", MNAME[m], x);
         }
     }
     // float / double to 64-bit integers: floor / ceil / trunc / rint, saturating, NaN -> 0
