@@ -388,4 +388,7 @@ OCU_F16_FN __half2 &operator*=(__half2 &a, __half2 b) { return a = __hmul2(a, b)
 
 #undef OCU_F16_FN
 
+/* atomicAdd(__half *), atomicAdd(__half2 *) when cuda_runtime.h came first */
+#include "ocu_half_atomics.h"
+
 #endif /* OCU_CUDA_FP16_H */

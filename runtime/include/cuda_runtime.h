@@ -24,6 +24,9 @@
 #elif defined(__HIP__)
 #include "ocu_cuda_lang_amdgcn.h"
 #endif
+#if defined(OCU_CPU_PATH) || defined(OCU_SPIRV_PATH) || defined(__CUDA__) || defined(__HIP__)
+#define OCU_CUDA_LANG_READY 1 /* the path's device language (atomicCAS ...) is declared */
+#endif
 
 /*
  * cudaLaunchKernelEx(config, kernel, args...): the C++ form described in
@@ -90,4 +93,7 @@ static inline cudaError_t cudaLaunchKernelEx(const cudaLaunchConfig_t *config,
 #define OCU_OPENCL_ASSERT_DECL 1
 __device__ static inline void __assert_fail(const char *, const char *, unsigned int, const char *) {}
 #endif
+
+/* atomicAdd for __half / __nv_bfloat16 when cuda_fp16.h / cuda_bf16.h came first */
+#include "ocu_half_atomics.h"
 #endif /* OCU_CUDA_RUNTIME_H */

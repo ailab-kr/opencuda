@@ -394,4 +394,7 @@ OCU_BF16_FN __nv_bfloat162 &operator*=(__nv_bfloat162 &a, __nv_bfloat162 b) { re
 
 #undef OCU_BF16_FN
 
+/* atomicAdd(__nv_bfloat16 *), atomicAdd(__nv_bfloat162 *) when cuda_runtime.h came first */
+#include "ocu_half_atomics.h"
+
 #endif /* OCU_CUDA_BF16_H */
