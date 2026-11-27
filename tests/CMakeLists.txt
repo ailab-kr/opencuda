@@ -1083,3 +1083,10 @@ if(OCU_BACKEND_CPU AND OCU_CPU_LOOPS_PLUGIN)
     endif()
   endif()
 endif()
+
+# ---- compiler/spirv/cu2spv.py IR rewrites, host only (card compiler-driver) ----
+if(Python3_FOUND)
+  add_test(NAME spirv_cu2spv_host
+    COMMAND ${Python3_EXECUTABLE} -m unittest test_cu2spv
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/opencl)
+endif()
