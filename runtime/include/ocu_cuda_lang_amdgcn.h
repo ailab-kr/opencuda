@@ -661,4 +661,9 @@ static inline cudaError_t cudaLaunchKernel(void (*func)(P...), dim3 grid, dim3 b
 #include "ocu_texture_fetch.h"
 #endif
 
+/* more of the CUDA Math API (ocu_cuda_math_ext.h) */
+#define OCU_MX_Q OCU_D
+#define OCU_MX_STD 1
+#include "ocu_cuda_math_ext.h"
+
 #endif /* OCU_CUDA_LANG_AMDGCN_H */

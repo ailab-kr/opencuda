@@ -746,4 +746,11 @@ inline unsigned __activemask()
 }
 inline void __syncwarp(unsigned m = 0xffffffffu) { ocu_cpu_warp_sync_masked(m); }
 
+/* CUDA's own math functions the C library lacks (ocu_cuda_math_ext.h) */
+#define OCU_MX_Q inline
+#define OCU_MX_HAS_FSUB_RN 1
+#define OCU_MX_HAS_FMAF_RM 1
+#define OCU_MX_NEED_DSQRT_RN 1
+#include "ocu_cuda_math_ext.h"
+
 #endif /* OCU_CUDA_LANG_CPU_H */
