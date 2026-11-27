@@ -1023,6 +1023,17 @@ static inline cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t e
 /* Kernel function pointers, as in the C++ overloads of the documented API
    (variadic: C++11 and later; older host code uses the const void * form). */
 #if __cplusplus >= 201103L
+#if defined(OCU_SPIRV_PATH) && defined(__HIP_DEVICE_COMPILE__)
+/* SPIR-V device pass: kernels carry the device_kernel calling convention in
+   their type there (see cudaLaunchKernel in ocu_cuda_lang_spirv.h) */
+template <typename F>
+static inline cudaError_t cudaLaunchCooperativeKernel(F *func, dim3 grid, dim3 block, void **args,
+                                                      size_t shared_mem = 0, cudaStream_t stream = 0)
+{
+    return cudaLaunchCooperativeKernel(reinterpret_cast<const void *>(func), grid, block, args,
+                                       shared_mem, stream);
+}
+#else
 template <typename... P>
 static inline cudaError_t cudaLaunchCooperativeKernel(void (*func)(P...), dim3 grid, dim3 block,
                                                       void **args, size_t shared_mem = 0,
@@ -1031,6 +1042,7 @@ static inline cudaError_t cudaLaunchCooperativeKernel(void (*func)(P...), dim3 g
     return cudaLaunchCooperativeKernel(reinterpret_cast<const void *>(func), grid, block, args,
                                        shared_mem, stream);
 }
+#endif
 #endif
 
 /* Texture references, channel descriptors and the C++ texture overloads. */

@@ -663,13 +663,27 @@ OCU_D bool isnan(double x) { return __builtin_isnan(x); }
 OCU_D bool isinf(double x) { return __builtin_isinf(x); }
 OCU_D bool isfinite(double x) { return __builtin_isfinite(x); }
 
-/* cudaLaunchKernel(kernel, ...) with a kernel name, as in user code. */
+/* cudaLaunchKernel(kernel, ...) with a kernel name, as in user code. In the
+   device pass Clang (HIP mode, spirv64) gives a kernel the device_kernel
+   calling convention in its type, so `void (*)(P...)` does not deduce
+   there; any function is taken (the call is host code, parsed but not
+   generated in that pass). compiler/spirv/clang-hipspv-kernel-address.patch
+   removes the convention from the type. */
+#if defined(__HIP_DEVICE_COMPILE__)
+template <typename F>
+static inline cudaError_t cudaLaunchKernel(F *func, dim3 grid, dim3 block, void **args,
+                                           size_t shared = 0, cudaStream_t stream = nullptr)
+{
+    return cudaLaunchKernel(reinterpret_cast<const void *>(func), grid, block, args, shared, stream);
+}
+#else
 template <typename... P>
 static inline cudaError_t cudaLaunchKernel(void (*func)(P...), dim3 grid, dim3 block, void **args,
                                            size_t shared = 0, cudaStream_t stream = nullptr)
 {
     return cudaLaunchKernel(reinterpret_cast<const void *>(func), grid, block, args, shared, stream);
 }
+#endif
 
 #include "ocu_cuda_lang_scoped.h"
 
