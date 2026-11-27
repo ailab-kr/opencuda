@@ -508,7 +508,44 @@ MINMAX_I1 = re.compile(r"^(\s*)(%[\w.]+) = (?:tail |notail )?call (?:[\w()]+ )*i
                        r"@llvm\.([us])(min|max)\.i1\(i1(?: noundef)? ([^,]+), i1(?: noundef)? ([^)]+)\)(.*)$", re.M)
 
 
+# Spin-waits on memory another agent writes (the host writing page-locked
+# memory): CUDA promises that volatile reads see such writes. Measured on an
+# Arc Pro B70 (kernel polling a cudaMallocHost flag the host sets after
+# 300 ms, no iteration limit): a volatile load, relaxed or acquire atomic
+# loads, a seq_cst fence before the load, and atomic add-0 never saw the
+# write (30 s); a seq_cst atomic load at system scope saw it at once
+# (about 1 us per poll). So a volatile integer load from global or generic
+# memory whose value decides a branch -- the shape of a wait loop -- becomes
+# `load atomic volatile ... seq_cst`; volatile loads that feed arithmetic
+# (the volatile shared-memory reductions of older code, addrspace(3)) stay
+# plain loads. OCU_SPV_SPIN_LOADS=0 turns it off.
+# (i32 and i64 only: 8- and 16-bit atomics need SPV_INTEL_16bit_atomics, which
+# HeCBench logan-cuda then failed to build without)
+SPIN_LOAD = re.compile(r"^(\s*)(%[\w.]+) = load volatile (i32|i64), ptr( addrspace\((?:1|4)\))? ([%@][\w.\"]+), align (\d+)(.*)$", re.M)
+
+
+def spin_loads(ll: str) -> str:
+    if os.environ.get("OCU_SPV_SPIN_LOADS", "1") == "0" or "load volatile" not in ll:
+        return ll
+    parts = re.split(r"(?=^define )", ll, flags=re.M)
+    for n, f in enumerate(parts):
+        if not f.startswith("define ") or "load volatile" not in f:
+            continue
+
+        def repl(m):
+            ind, dst, ty, asp, ptr, align, rest = m.groups()
+            d = re.escape(dst)
+            tests = re.findall(rf"^\s*(%[\w.]+) = icmp \w+ {ty} (?:{d}, [^,\n]+|[^,\n]+, {d})\s*(?:,.*)?$", f, re.M)
+            if not any(re.search(rf"\bbr i1 {re.escape(c)},", f) for c in tests):
+                return m.group(0)
+            md = re.sub(r",\s*!(?:tbaa|range|noundef|nonnull)\b[^,]*", "", rest)
+            return f"{ind}{dst} = load atomic volatile {ty}, ptr{asp or ''} {ptr} seq_cst, align {align}{md}"
+        parts[n] = SPIN_LOAD.sub(repl, f)
+    return "".join(parts)
+
+
 def legalize_intrinsics(ll: str) -> str:
+    ll = spin_loads(ll)
     need = set()
     # run before and after opt: new names start after those already there
     count = [max([int(n) for n in re.findall(r"%ocu_(?:rint|round)\.(\d+)\b", ll)] or [0])]

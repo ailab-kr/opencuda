@@ -22,6 +22,9 @@ cost: { hours: 3, ai_usage: 0 }
 - 전체 프로그램: `ocu_cc.py --target opencl`, `OCU_BACKEND=opencl`로 실행 API가 그대로 OpenCL에서 돈다.
 
 - 공유 할당(`mem_alloc_shared`, `cudaMallocManaged`): 고운 단위 SVM 버퍼가 있으면 그것, 없고 `cl_intel_unified_shared_memory`의 단일 장치 공유 메모리 접근이 되면 USM 공유 할당(`clSharedMemAllocINTEL`, 256바이트 정렬, 해제는 `clMemBlockingFreeINTEL`). 호스트가 직접 읽고 쓰고 드라이버가 페이지를 옮긴다. 커널은 이미 켠 간접 접근 플래그로 닿는다. 둘 다 없으면 "지원 안 함". Arc Pro B70은 고운 단위 SVM이 없어 USM.
+- 고정 호스트 메모리(`host_alloc_pinned`, `cudaMallocHost`·`cudaHostAlloc`): 장치가 USM 호스트 할당 접근을 알리면(`CL_DEVICE_HOST_MEM_CAPABILITIES_INTEL`) `clHostMemAllocINTEL`(4096바이트 정렬). 커널이 같은 주소로 바로 읽고 쓴다(`pinned_is_mapped` = 1). 할당 표에 들어가 복사·채우기가 받지만 장치 메모리 사용량에는 안 센다. `cudaFree`로는 안 풀린다. 없으면(또는 `OCU_OPENCL_PINNED_USM=0`) 예전처럼 `posix_memalign`, 복사만.
+- 모듈 변수(SPIR-V 경로): cu2spv가 `__device__`·`__constant__` 변수(addrspace(1)에서 바뀔 수 있거나 호스트가 쓰는 것)를 모듈 블록 하나로 옮긴다. 이미지 줄 `global <이름> <위치> <크기>`(cu2ocl 이미지와 같은 줄)로 `module_get_global`이 주소를 준다. 쓰는 커널은 `sparam` 줄 끝의 `glob` 표시: 블록 주소가 마지막(동적 공유 메모리 다음) 인자. 초기값은 원래 변수에 남고, 모듈을 올릴 때 `ginit <커널> <위치> <크기>` 커널이 블록으로 복사한다. 함수 주소를 쓰는 모듈처럼 다루지 못하는 꼴이거나 바꾼 IR이 맞지 않으면 그대로 둔다(그때 기호 복사는 예전처럼 "기호 없음"). `OCU_SPV_GLOBALS_BLOCK=0`이면 끈다.
+- 기다리는 반복(SPIR-V 경로): 분기를 정하는 전역·일반 주소의 volatile 정수 읽기는 seq_cst 원자 읽기로 바꾼다(cu2spv `spin_loads`, `OCU_SPV_SPIN_LOADS=0`이면 끔). Arc Pro B70에서 호스트가 고정 메모리 깃발을 바꿔도 volatile 읽기·relaxed/acquire 원자 읽기·seq_cst 울타리·더하기 0 원자 연산은 30초 동안 옛 값을 봤고, seq_cst 원자 읽기만 바로 봤다(한 번에 약 1µs). 연산에 쓰는 volatile 읽기와 공유 메모리 읽기는 그대로.
 
 ## 경계 조건
 
@@ -40,6 +43,9 @@ cost: { hours: 3, ai_usage: 0 }
 - [x] `opencl_cu2ocl_host`: 변환기 9건(double, float3 인자, 이미지 모양, SPIR-V 매직, long long, 안쪽 블록 공유 메모리, 거부 3건)
 - [x] 전체 프로그램: `tests/probe/main_saxpy.cu` + `probe_kernel.cu`를 `--target opencl`로: `main_saxpy: ok (0 bad)`
 - [x] Rodinia 18개(`OCU_TARGET=opencl conformance/external/rodinia/run.sh`): `POCL_WORK_GROUP_METHOD=cbs`에서 17개 빌드, 14개 기준과 같음. PoCL 기본 방식에서는 17개 빌드, 12개 같음(pathfinder·hotspot 다름, 위 경계 조건). 실패: huffman(프로그램이 32비트 값을 32만큼 민다: CPU 경로와 같은 실패, OpenCL은 민 양을 폭으로 나눈 나머지로 정의), kmeans(빌드: Clang에 `omp.h` 없음)
+
+- [x] Arc Pro B70(2026-11-28, SPIR-V 경로): `rt_symbols` 32/32(상수 표·오프셋·비동기 기호 복사, 구조체, 초기값, 원자 카운터, 커널 사이 변수, 장치 함수를 거친 접근, `cudaGetSymbolAddress`·크기, 범위 밖 오류), `rt_pinned_mapped` 21/21, `rt_mem` 49/49(전에는 GPU에서 멈춤), `rt_managed` 45/45. `rt_api`는 호스트가 고정 메모리 깃발로 커널을 푸는 첫 단계를 지나고, 두 번째 단계(예전 기본 스트림 복사가 막는 스트림을 기다림)에서 아직 멈춘다.
+- [x] `spirv_cu2spv_host`: 19/19(변수 블록 4건, 기다리는 반복 6건 포함, llc·llvm-as로 바꾼 IR 확인)
 
 ## 메모
 
