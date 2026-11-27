@@ -480,7 +480,9 @@ enum cudaDeviceAttr {
     cudaDevAttrPciDeviceId = 34,
     cudaDevAttrPciDomainId = 50,
     cudaDevAttrCooperativeLaunch = 95,            /* always 0: no co-residency guarantee */
-    cudaDevAttrCooperativeMultiDeviceLaunch = 96  /* always 0 */
+    cudaDevAttrCooperativeMultiDeviceLaunch = 96, /* always 0 */
+    cudaDevAttrMemoryPoolsSupported = 115,        /* 1: cudaMallocAsync and memory pools */
+    cudaDevAttrMemoryPoolSupportedHandleTypes = 119 /* 0: no shareable handles */
 };
 
 /* cudaHostRegister flags. */
@@ -751,6 +753,59 @@ cudaError_t cudaMemPrefetchAsync_v2(const void *ptr, size_t count, struct cudaMe
                                     unsigned int flags, cudaStream_t stream);
 cudaError_t cudaMemAdvise_v2(const void *ptr, size_t count, enum cudaMemoryAdvise advice,
                              struct cudaMemLocation location);
+
+/* Stream-ordered allocation (cudaMallocAsync, cudaFreeAsync, memory pools).
+   An allocation is made when the call is made (valid from that point in
+   stream order, as documented); a free waits in the pool, with a marker in
+   its stream, and its memory is reused by a later allocation on the same
+   stream at once, or on any stream once the marker has completed. Memory
+   the pool holds above its release threshold (cudaMemPoolAttrReleaseThreshold,
+   default 0) goes back at cudaDeviceSynchronize and cudaMemPoolTrimTo, or
+   when an allocation finds no memory. */
+typedef struct ocu_rt_mempool *cudaMemPool_t;
+enum cudaMemPoolAttr {
+    cudaMemPoolReuseFollowEventDependencies = 1,
+    cudaMemPoolReuseAllowOpportunistic = 2,
+    cudaMemPoolReuseAllowInternalDependencies = 3,
+    cudaMemPoolAttrReleaseThreshold = 4,
+    cudaMemPoolAttrReservedMemCurrent = 5,
+    cudaMemPoolAttrReservedMemHigh = 6,
+    cudaMemPoolAttrUsedMemCurrent = 7,
+    cudaMemPoolAttrUsedMemHigh = 8
+};
+enum cudaMemAllocationType {
+    cudaMemAllocationTypeInvalid = 0,
+    cudaMemAllocationTypePinned = 1,
+    cudaMemAllocationTypeMax = 0x7FFFFFFF
+};
+enum cudaMemAllocationHandleType {
+    cudaMemHandleTypeNone = 0,
+    cudaMemHandleTypePosixFileDescriptor = 1,
+    cudaMemHandleTypeWin32 = 2,
+    cudaMemHandleTypeWin32Kmt = 4,
+    cudaMemHandleTypeFabric = 8
+};
+struct cudaMemPoolProps {
+    enum cudaMemAllocationType allocType;
+    enum cudaMemAllocationHandleType handleTypes;
+    struct cudaMemLocation location;
+    void *win32SecurityAttributes;
+    size_t maxSize;
+    unsigned short usage;
+    unsigned char reserved[54];
+};
+cudaError_t cudaMallocAsync(void **devPtr, size_t size, cudaStream_t stream);
+cudaError_t cudaFreeAsync(void *devPtr, cudaStream_t stream);
+cudaError_t cudaMallocFromPoolAsync(void **ptr, size_t size, cudaMemPool_t memPool, cudaStream_t stream);
+cudaError_t cudaDeviceGetDefaultMemPool(cudaMemPool_t *memPool, int device);
+cudaError_t cudaDeviceGetMemPool(cudaMemPool_t *memPool, int device);
+cudaError_t cudaDeviceSetMemPool(int device, cudaMemPool_t memPool);
+cudaError_t cudaMemPoolCreate(cudaMemPool_t *memPool, const struct cudaMemPoolProps *poolProps);
+cudaError_t cudaMemPoolDestroy(cudaMemPool_t memPool);
+cudaError_t cudaMemPoolSetAttribute(cudaMemPool_t memPool, enum cudaMemPoolAttr attr, void *value);
+cudaError_t cudaMemPoolGetAttribute(cudaMemPool_t memPool, enum cudaMemPoolAttr attr, void *value);
+cudaError_t cudaMemPoolTrimTo(cudaMemPool_t memPool, size_t minBytesToKeep);
+
 cudaError_t cudaHostRegister(void *ptr, size_t size, unsigned int flags);
 cudaError_t cudaHostUnregister(void *ptr);
 cudaError_t cudaHostGetDevicePointer(void **dptr, void *hptr, unsigned int flags);
@@ -963,6 +1018,25 @@ template <class T>
 static inline cudaError_t cudaMallocHost(T **ptr, size_t size)
 {
     return cudaMallocHost(reinterpret_cast<void **>(ptr), size);
+}
+
+template <class T>
+static inline cudaError_t cudaMallocAsync(T **ptr, size_t size, cudaStream_t stream)
+{
+    return cudaMallocAsync(reinterpret_cast<void **>(ptr), size, stream);
+}
+
+template <class T>
+static inline cudaError_t cudaMallocFromPoolAsync(T **ptr, size_t size, cudaMemPool_t pool, cudaStream_t stream)
+{
+    return cudaMallocFromPoolAsync(reinterpret_cast<void **>(ptr), size, pool, stream);
+}
+
+/* CUDA's C++ form taking the pool before the stream */
+template <class T>
+static inline cudaError_t cudaMallocAsync(T **ptr, size_t size, cudaMemPool_t pool, cudaStream_t stream)
+{
+    return cudaMallocFromPoolAsync(reinterpret_cast<void **>(ptr), size, pool, stream);
 }
 
 template <class T>

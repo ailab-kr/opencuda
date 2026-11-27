@@ -559,6 +559,8 @@ cudaError_t cudaDeviceGetAttribute(int *value, enum cudaDeviceAttr attr, int dev
     case cudaDevAttrPciDomainId:                 *value = p.pciDomainID; break;
     case cudaDevAttrCooperativeLaunch:           *value = 0; break;
     case cudaDevAttrCooperativeMultiDeviceLaunch: *value = 0; break;
+    case cudaDevAttrMemoryPoolsSupported:        *value = 1; break;
+    case cudaDevAttrMemoryPoolSupportedHandleTypes: *value = 0; break;
     default:
         return set_error(cudaErrorInvalidValue);
     }
@@ -597,6 +599,8 @@ static cudaError_t sync_device(rt_device *d)
     return dev_result(d, first);
 }
 
+static void pools_release_device(int device, bool all);
+
 cudaError_t cudaDeviceSynchronize(void)
 {
     rt_device *d;
@@ -604,7 +608,10 @@ cudaError_t cudaDeviceSynchronize(void)
     if (e != cudaSuccess) {
         return set_error(e);
     }
-    return set_error(sync_device(d));
+    e = sync_device(d);
+    /* memory pools give back what they hold above their release threshold */
+    pools_release_device(tl_device, false);
+    return set_error(e);
 }
 
 cudaError_t cudaThreadSynchronize(void) { return cudaDeviceSynchronize(); }
@@ -617,8 +624,10 @@ cudaError_t cudaDeviceReset(void)
         return set_error(e);
     }
     /* Finish all work; streams and events the program still holds stay
-       valid (their queues keep working). */
+       valid (their queues keep working). Memory pools give back their
+       cached memory. */
     (void)sync_device(d);
+    pools_release_device(tl_device, true);
     atomic_store(&d->sticky, 0);
     tl_last_error = cudaSuccess;
     return cudaSuccess;
@@ -817,11 +826,10 @@ cudaError_t cudaMallocManaged(void **ptr, size_t size, unsigned int flags)
     return device_alloc(ptr, size, cudaMemoryTypeManaged);
 }
 
-cudaError_t cudaFree(void *ptr)
+static void pools_forget(int device, void *ptr);
+
+static cudaError_t free_device_memory(rt_device *d, void *ptr)
 {
-    rt_device *d;
-    cudaError_t e = current(&d);
-    if (e != cudaSuccess) return set_error(e);
     /* Forget the range first: once freed, another thread may get the same
        address. Put it back if the backend refuses the free. */
     mem_range r;
@@ -831,6 +839,421 @@ cudaError_t cudaFree(void *ptr)
     ocu_status st = g_backend->mem_free(d->dev, ptr); /* waits for queued work */
     if (st != OCU_OK && known) (void)range_add(d, r.base, r.size, r.type);
     return from(st);
+}
+
+cudaError_t cudaFree(void *ptr)
+{
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    pools_forget(tl_device, ptr); /* cudaFree of a stream-ordered allocation */
+    return free_device_memory(d, ptr);
+}
+
+/* ---- stream-ordered allocation (cudaMallocAsync, memory pools) ----------------
+ * An allocation is made at the call (valid from that point in stream order).
+ * cudaFreeAsync keeps the block in its pool with a marker recorded in the
+ * stream: a later allocation of a similar size reuses it at once on the same
+ * stream (stream order makes that safe), or on any stream once the marker has
+ * completed. Cached memory above the pool's release threshold goes back at
+ * cudaDeviceSynchronize, cudaMemPoolTrimTo, cudaMemPoolDestroy, or when an
+ * allocation finds no memory (after a device synchronize). */
+
+typedef struct pool_block {
+    void       *ptr;
+    size_t      size;
+    ocu_queue  *queue;  /* cached: the stream that freed it */
+    ocu_marker *marker; /* cached: completes when that stream reaches the free */
+} pool_block;
+
+struct ocu_rt_mempool {
+    int             device;
+    bool            is_default, destroyed;
+    pthread_mutex_t lock;
+    uint64_t        release_threshold;
+    int             reuse[3]; /* the three reuse switches, recorded */
+    pool_block     *cached, *live;
+    size_t          ncached, cap_cached, nlive, cap_live;
+    uint64_t        reserved, reserved_high, used, used_high;
+    struct ocu_rt_mempool *next; /* pools of all devices (created ones) */
+};
+
+static struct ocu_rt_mempool g_default_pool[MAX_DEVICES];
+static struct ocu_rt_mempool *g_current_pool[MAX_DEVICES];
+static struct ocu_rt_mempool *g_created_pools;
+static pthread_mutex_t g_pools_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t g_pools_once = PTHREAD_ONCE_INIT;
+
+static void pools_init(void)
+{
+    for (int i = 0; i < MAX_DEVICES; ++i) {
+        struct ocu_rt_mempool *p = &g_default_pool[i];
+        memset(p, 0, sizeof(*p));
+        p->device = i;
+        p->is_default = true;
+        p->reuse[0] = p->reuse[1] = p->reuse[2] = 1;
+        pthread_mutex_init(&p->lock, NULL);
+        g_current_pool[i] = p;
+    }
+}
+
+static bool block_push(pool_block **arr, size_t *n, size_t *cap, pool_block b)
+{
+    if (*n == *cap) {
+        size_t c = *cap ? *cap * 2 : 16;
+        pool_block *a = realloc(*arr, c * sizeof(*a));
+        if (a == NULL) return false;
+        *arr = a;
+        *cap = c;
+    }
+    (*arr)[(*n)++] = b;
+    return true;
+}
+
+/* Release cached blocks (oldest first) while the pool holds more than
+   `keep` bytes; `wait`: wait for a block's marker, else only completed ones. */
+static void pool_release(struct ocu_rt_mempool *p, uint64_t keep, bool wait)
+{
+    rt_device *d;
+    if (device_at(p->device, &d) != cudaSuccess) return;
+    pthread_mutex_lock(&p->lock);
+    size_t i = 0;
+    while (i < p->ncached && p->reserved > keep) {
+        pool_block b = p->cached[i];
+        if (!wait && b.marker != NULL && g_backend->marker_query(b.marker) != OCU_OK) {
+            ++i;
+            continue;
+        }
+        memmove(&p->cached[i], &p->cached[i + 1], (p->ncached - i - 1) * sizeof(pool_block));
+        p->ncached--;
+        p->reserved -= b.size;
+        pthread_mutex_unlock(&p->lock);
+        if (b.marker != NULL) {
+            (void)g_backend->marker_wait(b.marker);
+            (void)g_backend->marker_destroy(b.marker);
+        }
+        (void)free_device_memory(d, b.ptr);
+        pthread_mutex_lock(&p->lock);
+    }
+    pthread_mutex_unlock(&p->lock);
+}
+
+static void pools_release_device(int device, bool all)
+{
+    pthread_once(&g_pools_once, pools_init);
+    struct ocu_rt_mempool *p = &g_default_pool[device];
+    pool_release(p, all ? 0 : p->release_threshold, true);
+    pthread_mutex_lock(&g_pools_lock);
+    for (struct ocu_rt_mempool *q = g_created_pools; q != NULL; q = q->next) {
+        if (q->device != device || q->destroyed) continue;
+        pthread_mutex_unlock(&g_pools_lock);
+        pool_release(q, all ? 0 : q->release_threshold, true);
+        pthread_mutex_lock(&g_pools_lock);
+    }
+    pthread_mutex_unlock(&g_pools_lock);
+}
+
+/* The pool a stream-ordered allocation came from (and its size), or NULL. */
+static struct ocu_rt_mempool *pool_of(int device, void *ptr, size_t *size, bool remove)
+{
+    pthread_once(&g_pools_once, pools_init);
+    struct ocu_rt_mempool *cand[64];
+    int nc = 0;
+    cand[nc++] = &g_default_pool[device];
+    pthread_mutex_lock(&g_pools_lock);
+    for (struct ocu_rt_mempool *q = g_created_pools; q != NULL && nc < 64; q = q->next)
+        if (q->device == device) cand[nc++] = q;
+    pthread_mutex_unlock(&g_pools_lock);
+    for (int c = 0; c < nc; ++c) {
+        struct ocu_rt_mempool *p = cand[c];
+        pthread_mutex_lock(&p->lock);
+        for (size_t i = 0; i < p->nlive; ++i) {
+            if (p->live[i].ptr != ptr) continue;
+            *size = p->live[i].size;
+            if (remove) {
+                p->live[i] = p->live[--p->nlive];
+                p->used -= *size;
+            }
+            pthread_mutex_unlock(&p->lock);
+            return p;
+        }
+        pthread_mutex_unlock(&p->lock);
+    }
+    return NULL;
+}
+
+/* A stream is going away: the blocks it freed wait for its work now and no
+   longer name its queue (a new stream may get the same queue address). */
+static void pools_stream_gone(int device, ocu_queue *q)
+{
+    pthread_once(&g_pools_once, pools_init);
+    struct ocu_rt_mempool *cand[64];
+    int nc = 0;
+    cand[nc++] = &g_default_pool[device];
+    pthread_mutex_lock(&g_pools_lock);
+    for (struct ocu_rt_mempool *p = g_created_pools; p != NULL && nc < 64; p = p->next)
+        if (p->device == device) cand[nc++] = p;
+    pthread_mutex_unlock(&g_pools_lock);
+    for (int c = 0; c < nc; ++c) {
+        struct ocu_rt_mempool *p = cand[c];
+        pthread_mutex_lock(&p->lock);
+        for (size_t i = 0; i < p->ncached; ++i) {
+            pool_block *b = &p->cached[i];
+            if (b->queue != q) continue;
+            if (b->marker != NULL) {
+                (void)g_backend->marker_wait(b->marker);
+                (void)g_backend->marker_destroy(b->marker);
+                b->marker = NULL;
+            }
+            b->queue = NULL;
+        }
+        pthread_mutex_unlock(&p->lock);
+    }
+}
+
+static void pools_forget(int device, void *ptr)
+{
+    size_t size = 0;
+    if (ptr == NULL) return;
+    struct ocu_rt_mempool *p = pool_of(device, ptr, &size, true);
+    if (p != NULL) {
+        pthread_mutex_lock(&p->lock);
+        p->reserved -= size;
+        pthread_mutex_unlock(&p->lock);
+    }
+}
+
+cudaError_t cudaMallocFromPoolAsync(void **ptr, size_t size, cudaMemPool_t pool, cudaStream_t stream)
+{
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    if (ptr == NULL || pool == NULL || pool->destroyed) return set_error(cudaErrorInvalidValue);
+    if (pool->device != tl_device) return set_error(cudaErrorInvalidValue);
+    if (size == 0) {
+        *ptr = NULL;
+        return cudaSuccess;
+    }
+    ocu_queue *q = queue_of(d, stream);
+    /* a cached block of a similar size: freed on this stream, or done */
+    pthread_mutex_lock(&pool->lock);
+    size_t best = (size_t)-1;
+    for (size_t i = 0; i < pool->ncached; ++i) {
+        pool_block *b = &pool->cached[i];
+        if (b->size < size || b->size > 2 * size + 4096) continue;
+        if (best != (size_t)-1 && b->size >= pool->cached[best].size) continue;
+        if (b->queue == q || b->marker == NULL || g_backend->marker_query(b->marker) == OCU_OK) best = i;
+    }
+    if (best != (size_t)-1) {
+        pool_block b = pool->cached[best];
+        memmove(&pool->cached[best], &pool->cached[best + 1], (pool->ncached - best - 1) * sizeof(pool_block));
+        pool->ncached--;
+        if (b.marker != NULL) (void)g_backend->marker_destroy(b.marker);
+        b.queue = NULL;
+        b.marker = NULL;
+        if (!block_push(&pool->live, &pool->nlive, &pool->cap_live, b)) {
+            pool->reserved -= b.size;
+            pthread_mutex_unlock(&pool->lock);
+            (void)free_device_memory(d, b.ptr);
+            return set_error(cudaErrorMemoryAllocation);
+        }
+        pool->used += b.size;
+        if (pool->used > pool->used_high) pool->used_high = pool->used;
+        pthread_mutex_unlock(&pool->lock);
+        *ptr = b.ptr;
+        return cudaSuccess;
+    }
+    pthread_mutex_unlock(&pool->lock);
+    e = device_alloc(ptr, size, cudaMemoryTypeDevice);
+    if (e == cudaErrorMemoryAllocation) { /* give back what the pools hold, then once more */
+        (void)cudaGetLastError();
+        (void)sync_device(d);
+        pools_release_device(tl_device, true);
+        e = device_alloc(ptr, size, cudaMemoryTypeDevice);
+    }
+    if (e != cudaSuccess) return e;
+    pool_block b = {*ptr, size, NULL, NULL};
+    pthread_mutex_lock(&pool->lock);
+    bool ok = block_push(&pool->live, &pool->nlive, &pool->cap_live, b);
+    if (ok) {
+        pool->reserved += size;
+        pool->used += size;
+        if (pool->reserved > pool->reserved_high) pool->reserved_high = pool->reserved;
+        if (pool->used > pool->used_high) pool->used_high = pool->used;
+    }
+    pthread_mutex_unlock(&pool->lock);
+    if (!ok) {
+        (void)free_device_memory(d, *ptr);
+        *ptr = NULL;
+        return set_error(cudaErrorMemoryAllocation);
+    }
+    return cudaSuccess;
+}
+
+cudaError_t cudaMallocAsync(void **ptr, size_t size, cudaStream_t stream)
+{
+    pthread_once(&g_pools_once, pools_init);
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    return cudaMallocFromPoolAsync(ptr, size, g_current_pool[tl_device], stream);
+}
+
+cudaError_t cudaFreeAsync(void *ptr, cudaStream_t stream)
+{
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    if (ptr == NULL) return cudaSuccess;
+    size_t size = 0;
+    struct ocu_rt_mempool *p = pool_of(tl_device, ptr, &size, true);
+    if (p == NULL) {
+        /* memory from cudaMalloc: it joins the default pool */
+        mem_range r;
+        if (!range_find(d, ptr, 1, &r) || r.base != (char *)ptr || r.type != cudaMemoryTypeDevice)
+            return set_error(cudaErrorInvalidValue);
+        p = &g_default_pool[tl_device];
+        size = r.size;
+        pthread_mutex_lock(&p->lock);
+        p->reserved += size;
+        if (p->reserved > p->reserved_high) p->reserved_high = p->reserved;
+        pthread_mutex_unlock(&p->lock);
+    }
+    ocu_marker *m = NULL;
+    ocu_status st = g_backend->marker_create(d->dev, &m);
+    if (st == OCU_OK) st = g_backend->marker_record(m, queue_of(d, stream));
+    pool_block b = {ptr, size, queue_of(d, stream), m};
+    pthread_mutex_lock(&p->lock);
+    bool ok = st == OCU_OK && block_push(&p->cached, &p->ncached, &p->cap_cached, b);
+    if (!ok) p->reserved -= size;
+    pthread_mutex_unlock(&p->lock);
+    if (!ok) { /* no marker or no room: free in stream order the slow way */
+        if (m != NULL) (void)g_backend->marker_destroy(m);
+        ocu_status qs = g_backend->queue_sync(queue_of(d, stream));
+        if (qs != OCU_OK) return from(qs);
+        return free_device_memory(d, ptr);
+    }
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceGetDefaultMemPool(cudaMemPool_t *pool, int device)
+{
+    pthread_once(&g_pools_once, pools_init);
+    rt_device *d;
+    if (pool == NULL) return set_error(cudaErrorInvalidValue);
+    cudaError_t e = device_at(device, &d);
+    if (e != cudaSuccess) return set_error(cudaErrorInvalidDevice);
+    *pool = &g_default_pool[device];
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceGetMemPool(cudaMemPool_t *pool, int device)
+{
+    pthread_once(&g_pools_once, pools_init);
+    rt_device *d;
+    if (pool == NULL) return set_error(cudaErrorInvalidValue);
+    if (device_at(device, &d) != cudaSuccess) return set_error(cudaErrorInvalidDevice);
+    *pool = g_current_pool[device];
+    return cudaSuccess;
+}
+
+cudaError_t cudaDeviceSetMemPool(int device, cudaMemPool_t pool)
+{
+    pthread_once(&g_pools_once, pools_init);
+    rt_device *d;
+    if (device_at(device, &d) != cudaSuccess) return set_error(cudaErrorInvalidDevice);
+    if (pool == NULL || pool->destroyed || pool->device != device) return set_error(cudaErrorInvalidValue);
+    g_current_pool[device] = pool;
+    return cudaSuccess;
+}
+
+cudaError_t cudaMemPoolCreate(cudaMemPool_t *pool, const struct cudaMemPoolProps *props)
+{
+    pthread_once(&g_pools_once, pools_init);
+    if (pool == NULL || props == NULL) return set_error(cudaErrorInvalidValue);
+    if (props->allocType != cudaMemAllocationTypePinned || props->location.type != cudaMemLocationTypeDevice)
+        return set_error(cudaErrorInvalidValue);
+    rt_device *d;
+    if (device_at(props->location.id, &d) != cudaSuccess) return set_error(cudaErrorInvalidDevice);
+    if (props->handleTypes != cudaMemHandleTypeNone) return set_error(cudaErrorNotSupported);
+    struct ocu_rt_mempool *p = calloc(1, sizeof(*p));
+    if (p == NULL) return set_error(cudaErrorMemoryAllocation);
+    p->device = props->location.id;
+    p->reuse[0] = p->reuse[1] = p->reuse[2] = 1;
+    pthread_mutex_init(&p->lock, NULL);
+    pthread_mutex_lock(&g_pools_lock);
+    p->next = g_created_pools;
+    g_created_pools = p;
+    pthread_mutex_unlock(&g_pools_lock);
+    *pool = p;
+    return cudaSuccess;
+}
+
+/* Cached memory goes back; the pool stays known while allocations from it
+   are live (they can still be freed), then is dropped from use. */
+cudaError_t cudaMemPoolDestroy(cudaMemPool_t pool)
+{
+    pthread_once(&g_pools_once, pools_init);
+    if (pool == NULL || pool->destroyed || pool->is_default) return set_error(cudaErrorInvalidValue);
+    pool_release(pool, 0, true);
+    pool->destroyed = true;
+    if (g_current_pool[pool->device] == pool) g_current_pool[pool->device] = &g_default_pool[pool->device];
+    return cudaSuccess;
+}
+
+cudaError_t cudaMemPoolSetAttribute(cudaMemPool_t pool, enum cudaMemPoolAttr attr, void *value)
+{
+    if (pool == NULL || value == NULL || pool->destroyed) return set_error(cudaErrorInvalidValue);
+    pthread_mutex_lock(&pool->lock);
+    cudaError_t e = cudaSuccess;
+    switch (attr) {
+    case cudaMemPoolReuseFollowEventDependencies:
+    case cudaMemPoolReuseAllowOpportunistic:
+    case cudaMemPoolReuseAllowInternalDependencies:
+        pool->reuse[attr - 1] = *(int *)value;
+        break;
+    case cudaMemPoolAttrReleaseThreshold: pool->release_threshold = *(uint64_t *)value; break;
+    case cudaMemPoolAttrReservedMemHigh: /* only 0: reset to the current value */
+        if (*(uint64_t *)value != 0) e = cudaErrorInvalidValue;
+        else pool->reserved_high = pool->reserved;
+        break;
+    case cudaMemPoolAttrUsedMemHigh:
+        if (*(uint64_t *)value != 0) e = cudaErrorInvalidValue;
+        else pool->used_high = pool->used;
+        break;
+    default: e = cudaErrorInvalidValue;
+    }
+    pthread_mutex_unlock(&pool->lock);
+    return set_error(e);
+}
+
+cudaError_t cudaMemPoolGetAttribute(cudaMemPool_t pool, enum cudaMemPoolAttr attr, void *value)
+{
+    if (pool == NULL || value == NULL || pool->destroyed) return set_error(cudaErrorInvalidValue);
+    pthread_mutex_lock(&pool->lock);
+    cudaError_t e = cudaSuccess;
+    switch (attr) {
+    case cudaMemPoolReuseFollowEventDependencies:
+    case cudaMemPoolReuseAllowOpportunistic:
+    case cudaMemPoolReuseAllowInternalDependencies:
+        *(int *)value = pool->reuse[attr - 1];
+        break;
+    case cudaMemPoolAttrReleaseThreshold: *(uint64_t *)value = pool->release_threshold; break;
+    case cudaMemPoolAttrReservedMemCurrent: *(uint64_t *)value = pool->reserved; break;
+    case cudaMemPoolAttrReservedMemHigh: *(uint64_t *)value = pool->reserved_high; break;
+    case cudaMemPoolAttrUsedMemCurrent: *(uint64_t *)value = pool->used; break;
+    case cudaMemPoolAttrUsedMemHigh: *(uint64_t *)value = pool->used_high; break;
+    default: e = cudaErrorInvalidValue;
+    }
+    pthread_mutex_unlock(&pool->lock);
+    return set_error(e);
+}
+
+cudaError_t cudaMemPoolTrimTo(cudaMemPool_t pool, size_t keep)
+{
+    if (pool == NULL || pool->destroyed) return set_error(cudaErrorInvalidValue);
+    pool_release(pool, keep, false); /* only blocks whose free has been reached */
+    return cudaSuccess;
 }
 
 /*
@@ -1790,6 +2213,7 @@ cudaError_t cudaStreamDestroy(cudaStream_t stream)
     }
     pthread_mutex_unlock(&d->lock);
     if (!found) return set_error(cudaErrorInvalidResourceHandle);
+    pools_stream_gone(stream->device, stream->queue);
     ocu_status st = g_backend->queue_destroy(stream->queue); /* finishes queued work */
     free(stream);
     return from(st);

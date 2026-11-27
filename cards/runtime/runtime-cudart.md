@@ -35,6 +35,7 @@ cost: { hours: 5.0, ai_usage: 0 }
 - 컴파일 경로: `.cu`는 전처리 뒤 바꾸기 때문에 포함한 파일·매크로 안의 실행 구문도 처리. 띄어 쓴 `<< <`·`>> >`, 인자의 리터럴 `0`·`NULL`도 처리.
 
 - 고정 안 된(일반) 호스트 메모리와의 비동기 복사는 돌아오기 전에 끝난다(문서 동작: 원본을 그 자리에서 읽고, 장치→호스트는 돌아올 때 완료). `cudaMallocHost`·`cudaHostAlloc` 메모리만 나중에 읽힌다.
+- 스트림 순서 할당(`cudaMallocAsync`·`cudaFreeAsync`·`cudaMallocFromPoolAsync`, 기본 풀과 만든 풀, `cudaDeviceGet/SetMemPool`, `cudaMemPoolSet/GetAttribute`·`TrimTo`·`Create`·`Destroy`, `cudaDevAttrMemoryPoolsSupported` = 1): 할당은 부를 때 한다(그 스트림 순서부터 유효, 문서대로). 해제는 블록을 풀에 두고 그 스트림에 표시를 기록한다. 비슷한 크기(요청 이상, 두 배 + 4KB 이하) 할당이 같은 스트림이면 바로, 다른 스트림이면 표시가 끝난 뒤 다시 쓴다. 풀이 방출 임계값(기본 0) 넘게 쥔 메모리는 `cudaDeviceSynchronize`·`cudaMemPoolTrimTo`·`Destroy`·`cudaDeviceReset`에서, 할당이 메모리를 못 얻으면 장치 동기화 뒤에 돌려준다. `cudaMalloc` 메모리의 `cudaFreeAsync`(기본 풀로 감)와 스트림 순서 메모리의 `cudaFree`도 된다. 스트림을 없애면 그 스트림이 해제한 블록은 그 작업을 기다린 뒤 아무 스트림에나 쓰일 수 있다. 공유 핸들 풀은 "지원 안 함". 재사용 스위치 셋은 기록만 한다.
 - 고정 호스트 메모리를 커널이 바로 쓰기(zero-copy): 백엔드가 `pinned_is_mapped`를 알리면(OpenCL: Intel USM 호스트 할당) `cudaHostGetDevicePointer`가 같은 주소를 주고, 호스트 포인터를 그대로 커널 인자로 써도 된다. 아니면 그 호출은 "지원 안 함"이고 복사만 된다.
 - 기호(`__constant__`·`__device__`) 복사·주소·크기는 백엔드의 `module_get_global`로. SPIR-V 경로는 cu2spv가 변수를 모듈 블록 하나로 옮겨 이름·위치를 알린다(백엔드 카드).
 - 커널 실패는 장치에 남는다: 이후의 동기화·제출 호출이 같은 오류를 내고, `cudaDeviceReset`이 지운다.
