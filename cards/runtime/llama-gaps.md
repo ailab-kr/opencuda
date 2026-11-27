@@ -27,6 +27,7 @@ llama.cpp의 CUDA 백엔드가 요구하는 이름 중 우리 헤더와 실행 A
 - `library_types.h`(`cuda_runtime_api.h`가 포함): `cudaDataType_t`/`cudaDataType`과 문서의 `CUDA_R_*`/`CUDA_C_*` 값(`CUDA_R_32F`=0, `CUDA_R_16F`=2, `CUDA_R_16BF`=14, `CUDA_R_8F_E4M3`=28 등).
 - 장치 속성 정책(`cudaGetDeviceProperties`): 계산 능력 5.0(환경변수 `OCU_COMPUTE_CAPABILITY=M.m`으로 바꿀 수 있음), `warpSize`는 백엔드 값, `sharedMemPerBlockOptin`은 CPU·엔비디아에서 48 KiB 이상, `cudaFuncGetAttributes().ptxVersion` = 10·major+minor(< 90), PCI 번호는 합성값(아래).
 - 속성 열거: `cudaDevAttrCooperativeLaunch`(95)와 `cudaDevAttrCooperativeMultiDeviceLaunch`(96)는 늘 0. `cudaDevAttrPciBusId`(33)·`PciDeviceId`(34)·`PciDomainId`(50)는 속성 구조체와 같은 값.
+- SIMD 내장 함수 전부(2026-11-27): 반워드·바이트 단위 abs·absdiff·add·sub(감김·포화)·평균·cmp·set·max·min·neg·sad, 32비트·16x2의 `__vimax3_*`·`__vimin3_*`·`__viaddmax_*`·`__viaddmin_*`·`__vibmax_*`·`__vibmin_*`·`_relu`. 문서가 정하지 않은 곳은 이렇게 읽었다: 포화는 레인의 표현 범위, `__vsads`/`__vsadu`는 레인별 |a-b|의 합 하나, 16x2 술어는 pred_hi가 위쪽 반워드, add-then-max/min의 a+b는 레인 안에서 감김. 시험은 `tests/runtime/rt_simd.cu`.
 - 장치 쪽 내장 함수(CPU 경로·NVPTX 경로 모두): `__vsub4`, `__vcmpne4`, `__isnanf`, `__isinff`, `__ldg`(템플릿, 평범한 읽기). `make_half2`는 `cuda_fp16.h`. 공통 정의는 `ocu_cuda_lang_common.h`.
 - CPU 경로에 추가(NVPTX에는 이미 있었음): `__byte_perm`, `__umulhi`, `__mulhi`, `__float2int_{rn,rz,rd,ru}`, `__double2int_{rn,rz,rd,ru}`, `__syncthreads_{count,and,or}`, `__trap`.
 - `__trap`: CPU 경로에서는 stdout·stderr를 비우고 스레드 위치가 든 메시지를 찍은 뒤 `abort()`. 두 경로 모두 `[[noreturn]]`.
