@@ -719,6 +719,38 @@ cudaError_t cudaMalloc(void **ptr, size_t size);
 cudaError_t cudaFree(void *ptr);
 cudaError_t cudaMallocManaged(void **ptr, size_t size, unsigned int flags);
 cudaError_t cudaPointerGetAttributes(struct cudaPointerAttributes *attr, const void *ptr);
+
+/* Managed memory hints (the documented values). Prefetching and advice are
+   hints: the calls check their arguments (the range must lie in one managed
+   allocation, the device must exist or be cudaCpuDeviceId) and return;
+   pages move when they are touched. */
+#define cudaCpuDeviceId ((int)-1)
+#define cudaInvalidDeviceId ((int)-2)
+enum cudaMemoryAdvise {
+    cudaMemAdviseSetReadMostly = 1,
+    cudaMemAdviseUnsetReadMostly = 2,
+    cudaMemAdviseSetPreferredLocation = 3,
+    cudaMemAdviseUnsetPreferredLocation = 4,
+    cudaMemAdviseSetAccessedBy = 5,
+    cudaMemAdviseUnsetAccessedBy = 6
+};
+enum cudaMemLocationType {
+    cudaMemLocationTypeInvalid = 0,
+    cudaMemLocationTypeDevice = 1,
+    cudaMemLocationTypeHost = 2,
+    cudaMemLocationTypeHostNuma = 3,
+    cudaMemLocationTypeHostNumaCurrent = 4
+};
+struct cudaMemLocation {
+    enum cudaMemLocationType type;
+    int id;
+};
+cudaError_t cudaMemPrefetchAsync(const void *ptr, size_t count, int dstDevice, cudaStream_t stream);
+cudaError_t cudaMemAdvise(const void *ptr, size_t count, enum cudaMemoryAdvise advice, int device);
+cudaError_t cudaMemPrefetchAsync_v2(const void *ptr, size_t count, struct cudaMemLocation location,
+                                    unsigned int flags, cudaStream_t stream);
+cudaError_t cudaMemAdvise_v2(const void *ptr, size_t count, enum cudaMemoryAdvise advice,
+                             struct cudaMemLocation location);
 cudaError_t cudaHostRegister(void *ptr, size_t size, unsigned int flags);
 cudaError_t cudaHostUnregister(void *ptr);
 cudaError_t cudaHostGetDevicePointer(void **dptr, void *hptr, unsigned int flags);
@@ -952,6 +984,19 @@ static inline cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int *blo
 {
     return cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         blocks, reinterpret_cast<const void *>(func), block_size, dynamic_smem);
+}
+
+/* CUDA 13's forms of the managed-memory hints take a cudaMemLocation (the
+   _v2 functions of 12.x) */
+static inline cudaError_t cudaMemPrefetchAsync(const void *ptr, size_t count, struct cudaMemLocation location,
+                                               unsigned int flags, cudaStream_t stream = 0)
+{
+    return cudaMemPrefetchAsync_v2(ptr, count, location, flags, stream);
+}
+static inline cudaError_t cudaMemAdvise(const void *ptr, size_t count, enum cudaMemoryAdvise advice,
+                                        struct cudaMemLocation location)
+{
+    return cudaMemAdvise_v2(ptr, count, advice, location);
 }
 
 template <class T>

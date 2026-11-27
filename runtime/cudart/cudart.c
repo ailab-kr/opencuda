@@ -943,6 +943,65 @@ cudaError_t cudaPointerGetAttributes(struct cudaPointerAttributes *attr, const v
     return cudaSuccess;
 }
 
+/* Managed memory hints: the range must lie in one managed allocation and
+   the device be one that exists or the host (cudaCpuDeviceId). The pages
+   move when they are touched (USM shared allocations, fine-grained SVM, or
+   host memory itself on the CPU path), so there is nothing to do. */
+static cudaError_t managed_hint(const void *ptr, size_t count, int device, bool host_ok)
+{
+    rt_device *d;
+    cudaError_t e = current(&d);
+    if (e != cudaSuccess) return set_error(e);
+    mem_range r;
+    if (ptr == NULL || count == 0 || !range_find(d, ptr, count, &r) || r.type != cudaMemoryTypeManaged) {
+        return set_error(cudaErrorInvalidValue);
+    }
+    int n = 0;
+    e = cudaGetDeviceCount(&n);
+    if (e != cudaSuccess) return e;
+    if (!(device >= 0 && device < n) && !(host_ok && device == cudaCpuDeviceId)) {
+        return set_error(cudaErrorInvalidDevice);
+    }
+    return cudaSuccess;
+}
+
+cudaError_t cudaMemPrefetchAsync(const void *ptr, size_t count, int dstDevice, cudaStream_t stream)
+{
+    (void)stream;
+    return managed_hint(ptr, count, dstDevice, true);
+}
+
+cudaError_t cudaMemAdvise(const void *ptr, size_t count, enum cudaMemoryAdvise advice, int device)
+{
+    if (advice < cudaMemAdviseSetReadMostly || advice > cudaMemAdviseUnsetAccessedBy) {
+        return set_error(cudaErrorInvalidValue);
+    }
+    /* ReadMostly ignores the device; the location advices take a device or the host */
+    bool any_dev = advice == cudaMemAdviseSetReadMostly || advice == cudaMemAdviseUnsetReadMostly;
+    return managed_hint(ptr, count, any_dev ? 0 : device, true);
+}
+
+static int location_device(struct cudaMemLocation loc)
+{
+    if (loc.type == cudaMemLocationTypeDevice) return loc.id;
+    if (loc.type == cudaMemLocationTypeHost || loc.type == cudaMemLocationTypeHostNuma ||
+        loc.type == cudaMemLocationTypeHostNumaCurrent) return cudaCpuDeviceId;
+    return cudaInvalidDeviceId;
+}
+
+cudaError_t cudaMemPrefetchAsync_v2(const void *ptr, size_t count, struct cudaMemLocation location,
+                                    unsigned int flags, cudaStream_t stream)
+{
+    if (flags != 0) return set_error(cudaErrorInvalidValue);
+    return cudaMemPrefetchAsync(ptr, count, location_device(location), stream);
+}
+
+cudaError_t cudaMemAdvise_v2(const void *ptr, size_t count, enum cudaMemoryAdvise advice,
+                             struct cudaMemLocation location)
+{
+    return cudaMemAdvise(ptr, count, advice, location_device(location));
+}
+
 static bool range_add(rt_device *d, void *p, size_t size, enum cudaMemoryType type)
 {
     pthread_mutex_lock(&d->lock);
