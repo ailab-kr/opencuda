@@ -462,6 +462,12 @@ def parse(argv: list[str]) -> SimpleNamespace:
     for item in o.inputs:   # nvcc: -x applies to every input
         if item[1] is None:
             item[1] = lang_global
+    # CMake identifies a CUDA compiler by compiling CMakeCUDACompilerId.cu:
+    # "NVIDIA" when __NVCC__ is defined. ocu-nvcc is Clang-based and CMake
+    # must use its Clang rules, so that one file does not get the __NVCC__
+    # that every other CUDA compile gets (cuda_runtime.h).
+    if any(os.path.basename(p).startswith("CMakeCUDACompilerId") for p, _ in o.inputs):
+        o.pre += ["-D", "OCU_NO_NVCC_MACRO"]
     return o
 
 
