@@ -87,6 +87,17 @@ struct ocu_kernel {
     char              *ptr_param;    /* direct: per parameter, 1 = global pointer (set as SVM pointer) */
     pthread_mutex_t    lock;         /* argument setting + enqueue is one step */
     struct ocu_kernel *next;
+    /* Register file chosen by measurement (module grf_split, a kernel that
+       spills with the default register file): `alt` is the other build; the
+       first launches alternate between the two and the faster per work-item
+       is kept. k->k is always the build in use (swapped with alt). */
+    cl_kernel          alt;
+    int                tune;         /* 0 nothing to choose, 1 measuring, 2 decided */
+    int                cur;          /* build in k->k: 0 default register file, 1 large */
+    unsigned           tune_i;
+    int                tn[2];
+    cl_event           tev[2][6];
+    double             titems[2][6];
 };
 
 typedef struct ocl_global {
@@ -105,6 +116,17 @@ struct ocu_module {
     pthread_mutex_t    lock;
     struct ocu_kernel *kernels;
     bool               direct;    /* "OCUSPV1": compiled SPIR-V (compiler/spirv), CUDA parameters as they are */
+    /* Register file per kernel (Intel GPUs, no OCU_OPENCL_BUILD_OPTIONS): the
+       program is built with the driver's default register file; a kernel that
+       spills there comes from a second build with the large one (built on
+       first need from the kept input). */
+    bool               grf_split;
+    int                big_state;  /* 0 not built, 1 built, -1 failed */
+    cl_program         big;
+    char              *in;         /* the program input (SPIR-V or source), kept for the second build */
+    size_t             in_len;
+    bool               in_il;
+    const char        *in_opts;    /* the base build options */
 };
 
 struct ocu_marker {
@@ -725,6 +747,7 @@ static void free_module(ocu_module *m)
     for (size_t i = 0; i < m->nglobals; ++i) free(m->globals[i].name);
     free(m->globals);
     free(m->meta);
+    free(m->in);
     free(m);
 }
 
@@ -776,6 +799,31 @@ static ocu_status load_globals(ocu_module *m)
     return st;
 }
 
+#define OCU_LARGE_GRF "-cl-intel-enable-auto-large-GRF-mode"
+
+static int indirect_flags(cl_kernel k);
+
+/* The module's second program, with the large register file (m->lock held). */
+static cl_program big_program(ocu_module *m)
+{
+    if (m->big_state != 0) return m->big_state > 0 ? m->big : NULL;
+    const ocl_api *a = ocl_load();
+    cl_int err = CL_SUCCESS;
+    const char *in = m->in;
+    size_t len = m->in_len;
+    cl_program p = m->in_il ? a->CreateProgramWithIL(m->dev->ctx, in, len, &err)
+                            : a->CreateProgramWithSource(m->dev->ctx, 1, &in, &len, &err);
+    char opts[256];
+    snprintf(opts, sizeof(opts), "%s%s%s", m->in_opts ? m->in_opts : "", m->in_opts && *m->in_opts ? " " : "", OCU_LARGE_GRF);
+    if (p != NULL && a->BuildProgram(p, 1, &m->dev->entry->device, opts, NULL, NULL) != CL_SUCCESS) {
+        a->ReleaseProgram(p);
+        p = NULL;
+    }
+    m->big = p;
+    m->big_state = p != NULL ? 1 : -1;
+    return p;
+}
+
 static ocu_status ocl_module_load(ocu_device *d, const void *image, size_t bytes, ocu_module **out)
 {
     if (d == NULL) return OCU_ERR_INVALID_HANDLE;
@@ -823,17 +871,22 @@ static ocu_status ocl_module_load(ocu_device *d, const void *image, size_t bytes
     const ocl_api *a = ocl_load();
     cl_int err = CL_SUCCESS;
     const char *options = "";
+    const char *in = NULL;
+    size_t in_len = 0;
     if (d->entry->il && spv_len > 0) {
-        m->program = a->CreateProgramWithIL(d->ctx, body + src_len, spv_len, &err);
+        in = body + src_len;
+        in_len = spv_len;
+        m->in_il = true;
+        m->program = a->CreateProgramWithIL(d->ctx, in, in_len, &err);
     } else if (d->entry->cxx && src_len > 0) {
-        const char *src = body;
-        size_t len = src_len;
-        m->program = a->CreateProgramWithSource(d->ctx, 1, &src, &len, &err);
+        in = body;
+        in_len = src_len;
+        m->program = a->CreateProgramWithSource(d->ctx, 1, &in, &in_len, &err);
         options = "-cl-std=CLC++2021";
     } else if (clc_len > 0) {
-        const char *src = body + src_len + spv_len;
-        size_t len = clc_len;
-        m->program = a->CreateProgramWithSource(d->ctx, 1, &src, &len, &err);
+        in = body + src_len + spv_len;
+        in_len = clc_len;
+        m->program = a->CreateProgramWithSource(d->ctx, 1, &in, &in_len, &err);
     } else {
         if (verbose()) {
             fprintf(stderr, "ocu opencl: the image has no form this device takes (%s)\n",
@@ -847,12 +900,53 @@ static ocu_status ocl_module_load(ocu_device *d, const void *image, size_t bytes
         return map_err(err) == OCU_OK ? OCU_ERR_INVALID_VALUE : map_err(err);
     }
     /* OCU_OPENCL_BUILD_OPTIONS: extra options for the driver's compiler (for
-       example -cl-intel-enable-auto-large-GRF-mode on Intel GPUs). */
+       example -cl-intel-enable-auto-large-GRF-mode on Intel GPUs); when it is
+       set, every kernel is built with them and nothing is split. Otherwise on
+       Intel GPUs the register file is chosen per kernel (grf_split): the
+       default one keeps more threads per core in flight, which bandwidth-bound
+       kernels need; kernels that would spill take the large one. */
     char opts[1024];
     const char *extra = getenv("OCU_OPENCL_BUILD_OPTIONS");
-    if (extra == NULL && ops_enabled(d)) extra = "-cl-intel-enable-auto-large-GRF-mode"; /* Intel GPUs */
+    if (extra == NULL && ops_enabled(d)) {
+        m->in = malloc(in_len ? in_len : 1);
+        if (m->in != NULL) {
+            memcpy(m->in, in, in_len);
+            m->in_len = in_len;
+            m->in_opts = options;
+            m->grf_split = true;
+        } else {
+            extra = OCU_LARGE_GRF;
+        }
+    }
     snprintf(opts, sizeof(opts), "%s%s%s", options ? options : "", extra && *extra ? " " : "", extra ? extra : "");
     err = a->BuildProgram(m->program, 1, &d->entry->device, opts, NULL, NULL);
+    if (err == CL_SUCCESS && m->grf_split) {
+        /* Program-scope variables would exist once per program: a module with
+           variables that can change is built once, with the large register file
+           chosen by the compiler as before. cu2spv lists those in the image
+           ("mutable_globals"), so its modules with constant tables only still
+           split; for other images any program-scope variable counts. */
+        size_t gv = 0;
+        const bool mutable_vars = strstr(m->meta, "mutable_globals ") != NULL;
+        if (mutable_vars ||
+            (!m->direct && (a->GetProgramBuildInfo(m->program, d->entry->device, CL_PROGRAM_BUILD_GLOBAL_VARIABLE_TOTAL_SIZE,
+                                                   sizeof(gv), &gv, NULL) != CL_SUCCESS || gv > 0))) {
+            if (verbose())
+                fprintf(stderr, "ocu opencl: module has program-scope variables that can change (%zu bytes); one build, large register file\n", gv);
+            m->grf_split = false;
+            free(m->in);
+            m->in = NULL;
+            a->ReleaseProgram(m->program);
+            m->program = m->in_il ? a->CreateProgramWithIL(d->ctx, in, in_len, &err)
+                                  : a->CreateProgramWithSource(d->ctx, 1, &in, &in_len, &err);
+            if (m->program == NULL) {
+                free_module(m);
+                return map_err(err) == OCU_OK ? OCU_ERR_INVALID_VALUE : map_err(err);
+            }
+            snprintf(opts, sizeof(opts), "%s%s%s", options ? options : "", *options ? " " : "", OCU_LARGE_GRF);
+            err = a->BuildProgram(m->program, 1, &d->entry->device, opts, NULL, NULL);
+        }
+    }
     if (err != CL_SUCCESS) {
         if (verbose()) {
             size_t n = 0;
@@ -891,6 +985,10 @@ static ocu_status ocl_module_unload(ocu_module *m)
     for (struct ocu_kernel *k = m->kernels; k != NULL;) {
         struct ocu_kernel *next = k->next;
         a->ReleaseKernel(k->k);
+        if (k->alt != NULL) a->ReleaseKernel(k->alt);
+        if (k->tune == 1)
+            for (int v = 0; v < 2; ++v)
+                for (int i = 0; i < k->tn[v]; ++i) a->ReleaseEvent(k->tev[v][i]);
         pthread_mutex_destroy(&k->lock);
         free(k->name);
         free(k->param_sizes);
@@ -899,6 +997,7 @@ static ocu_status ocl_module_unload(ocu_module *m)
     }
     if (m->glob != NULL) ocl_mem_free(m->dev, m->glob);
     a->ReleaseProgram(m->program);
+    if (m->big != NULL) a->ReleaseProgram(m->big);
     pthread_mutex_destroy(&m->lock);
     free_module(m);
     return st;
@@ -982,12 +1081,26 @@ static ocu_status ocl_module_get_kernel(ocu_module *m, const char *name, ocu_ker
     ocu_status st = OCU_OK;
     cl_int err = CL_SUCCESS;
     cl_kernel ck = a->CreateKernel(m->program, name, &err);
+    cl_kernel alt = NULL;
+    if (ck != NULL && m->grf_split) {
+        cl_ulong spill = 0;
+        if (a->GetKernelWorkGroupInfo(ck, m->dev->entry->device, CL_KERNEL_SPILL_MEM_SIZE_INTEL, sizeof(spill), &spill,
+                                      NULL) == CL_SUCCESS && spill > 0) {
+            cl_program bp = big_program(m);
+            cl_int e2 = CL_SUCCESS;
+            alt = bp ? a->CreateKernel(bp, name, &e2) : NULL;
+            if (verbose())
+                fprintf(stderr, "ocu opencl: %s spills %llu bytes per thread with the default register file; %s\n",
+                        name, (unsigned long long)spill, alt ? "timing it against the large one" : "the large build failed, keeping it");
+        }
+    }
     struct ocu_kernel *k = ck ? calloc(1, sizeof(*k)) : NULL;
     char *copy = k ? strdup(name) : NULL;
     if (ck == NULL) {
         st = err == CL_INVALID_KERNEL_NAME ? OCU_ERR_NOT_FOUND : map_err(err);
         if (st == OCU_OK) st = OCU_ERR_NOT_FOUND;
     } else if (k == NULL || copy == NULL) {
+        if (alt != NULL) a->ReleaseKernel(alt);
         a->ReleaseKernel(ck);
         free(k);
         st = OCU_ERR_OUT_OF_MEMORY;
@@ -1005,6 +1118,13 @@ static ocu_status ocl_module_get_kernel(ocu_module *m, const char *name, ocu_ker
         pthread_mutex_init(&k->lock, NULL);
         if (m->direct) parse_sparams(k, m->meta); else parse_params(k, m->meta);
         k->takes_glob = !k->direct && (k->byval ? nargs == 3 : nargs == 4);
+        if (alt != NULL) {
+            k->alt = alt;
+            k->tune = 1;
+            /* both builds need the same access flags (or the SVM list, resent on a swap) */
+            const int f0 = indirect_flags(ck), f1 = indirect_flags(alt);
+            k->indirect = f0 && f1 ? 1 : -1;
+        }
         k->next = m->kernels;
         m->kernels = k;
         *out = k;
@@ -1157,6 +1277,58 @@ static void trace_add_name(const char *name, cl_event ev)
     pthread_mutex_unlock(&trace_lock);
 }
 
+/* k->lock held. Put the build this launch uses into k->k. */
+static void tune_use(ocu_kernel *k, int v)
+{
+    if (k->cur == v) return;
+    cl_kernel t = k->k;
+    k->k = k->alt;
+    k->alt = t;
+    k->cur = v;
+    k->svm_gen = 0;
+}
+
+static void tune_before(ocu_kernel *k)
+{
+    if (k->tune != 1) return;
+    const ocl_api *a = ocl_load();
+    if (k->tn[0] >= 6 && k->tn[1] >= 6) {
+        double t[2] = {0, 0}, n[2] = {0, 0};
+        for (int v = 0; v < 2; ++v)
+            for (int i = 0; i < 6; ++i) {
+                cl_int status = 1;
+                a->GetEventInfo(k->tev[v][i], CL_EVENT_COMMAND_EXECUTION_STATUS, sizeof status, &status, NULL);
+                if (status > CL_COMPLETE) return; /* not finished yet: decide at a later launch */
+                cl_ulong t0 = 0, t1 = 0;
+                a->GetEventProfilingInfo(k->tev[v][i], CL_PROFILING_COMMAND_START, sizeof t0, &t0, NULL);
+                a->GetEventProfilingInfo(k->tev[v][i], CL_PROFILING_COMMAND_END, sizeof t1, &t1, NULL);
+                t[v] += t1 > t0 ? (double)(t1 - t0) : 0.0;
+                n[v] += k->titems[v][i];
+            }
+        for (int v = 0; v < 2; ++v)
+            for (int i = 0; i < 6; ++i) a->ReleaseEvent(k->tev[v][i]);
+        const int pick = t[1] / (n[1] > 0 ? n[1] : 1) < t[0] / (n[0] > 0 ? n[0] : 1) ? 1 : 0;
+        if (verbose())
+            fprintf(stderr, "ocu opencl: %s: %.3f ns per work-item with the default register file, %.3f with the large one; keeping the %s\n",
+                    k->name, t[0] / (n[0] > 0 ? n[0] : 1), t[1] / (n[1] > 0 ? n[1] : 1), pick ? "large one" : "default");
+        k->tune = 2;
+        tune_use(k, pick);
+        return;
+    }
+    int want = (int)(k->tune_i++ & 1u);
+    if (k->tn[want] >= 6) want ^= 1;
+    tune_use(k, want);
+}
+
+static void tune_after(ocu_kernel *k, cl_int err, cl_event ev, const size_t global[3])
+{
+    if (k->tune != 1 || err != CL_SUCCESS || ev == NULL || k->tn[k->cur] >= 6) return;
+    ocl_load()->RetainEvent(ev);
+    k->tev[k->cur][k->tn[k->cur]] = ev;
+    k->titems[k->cur][k->tn[k->cur]] = (double)global[0] * (double)global[1] * (double)global[2];
+    k->tn[k->cur]++;
+}
+
 static ocu_status finish_launch(ocu_queue *queue, ocu_queue *q, ocu_kernel *k, cl_int err, cl_event ev)
 {
     if (err == CL_SUCCESS && trace_on()) trace_add(k, ev);
@@ -1189,6 +1361,7 @@ static ocu_status launch_direct(ocu_queue *queue, ocu_queue *q, ocu_kernel *k, c
     cl_event ev = NULL;
     cl_int err = CL_SUCCESS;
     pthread_mutex_lock(&k->lock);
+    tune_before(k);
     HP_B(HP_ARGS);
     for (uint32_t i = 0; i < p->num_args && err == CL_SUCCESS; ++i) {
         if (k->ptr_param[i]) {
@@ -1204,6 +1377,7 @@ static ocu_status launch_direct(ocu_queue *queue, ocu_queue *q, ocu_kernel *k, c
     if (err == CL_SUCCESS) err = set_svm_ptrs(k, d);
     HP_E(HP_SVM); HP_B(HP_ENQ);
     if (err == CL_SUCCESS) err = a->EnqueueNDRangeKernel(queue->q, k->k, 3, NULL, global, local, 0, NULL, &ev);
+    tune_after(k, err, ev, global);
     HP_E(HP_ENQ);
     pthread_mutex_unlock(&k->lock);
     HP_B(HP_FIN);
@@ -1237,12 +1411,14 @@ static ocu_status launch_byval(ocu_queue *queue, ocu_queue *q, ocu_kernel *k, co
     size_t dyn = (p->shared_memory_bytes + 15) / 16 * 16;
     cl_event ev = NULL;
     pthread_mutex_lock(&k->lock);
+    tune_before(k);
     cl_uint idx = 0;
     cl_int err = a->SetKernelArg(k->k, idx++, k->byval, packed);
     if (err == CL_SUCCESS && k->takes_glob) err = a->SetKernelArgSVMPointer(k->k, idx++, m->glob);
     if (err == CL_SUCCESS) err = a->SetKernelArg(k->k, idx++, dyn < 16 ? 16 : dyn, NULL);
     if (err == CL_SUCCESS) err = set_svm_ptrs(k, d);
     if (err == CL_SUCCESS) err = a->EnqueueNDRangeKernel(queue->q, k->k, 3, NULL, global, local, 0, NULL, &ev);
+    tune_after(k, err, ev, global);
     pthread_mutex_unlock(&k->lock);
     return finish_launch(queue, q, k, err, ev);
 }
@@ -1309,6 +1485,7 @@ static ocu_status ocl_kernel_launch_impl(ocu_queue *q, ocu_kernel *k, const ocu_
     size_t dyn = (p->shared_memory_bytes + 15) / 16 * 16;
     cl_event ev = NULL;
     pthread_mutex_lock(&k->lock);
+    tune_before(k);
     cl_uint idx = 0;
     err = a->SetKernelArg(k->k, idx++, sizeof(cl_mem), &argbuf);
     if (err == CL_SUCCESS) err = a->SetKernelArg(k->k, idx++, sizeof(cl_mem), &offbuf);
@@ -1333,6 +1510,7 @@ static ocu_status ocl_kernel_launch_impl(ocu_queue *q, ocu_kernel *k, const ocu_
     }
     if (err == CL_SUCCESS) {
         err = a->EnqueueNDRangeKernel(queue->q, k->k, 3, NULL, global, local, 0, NULL, &ev);
+        tune_after(k, err, ev, global);
     }
     pthread_mutex_unlock(&k->lock);
     a->ReleaseMemObject(argbuf);

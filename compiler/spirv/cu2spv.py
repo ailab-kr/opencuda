@@ -361,6 +361,16 @@ def main(argv):
         div = infer and os.environ.get("OCU_SPV_DIV64", "1") != "0"
         if div:
             text = bypass_div64(text)
+        # Program-scope variables that can change (written by kernels, or by the
+        # host: externally_initialized): the back end then builds the module
+        # once, since a second build (another register file) would hold copies.
+        # Constant tables, Clang's __hip_cuid_ markers and @llvm.* are not counted.
+        mutable = [l for l in text.splitlines()
+                   if re.match(r'^@(?!llvm\.|__hip_cuid_)[\w.$"]+ = ', l)
+                   and "addrspace(3)" not in l.split("=", 1)[1].split(",")[0]
+                   and (re.search(r"\bglobal\b", l.split("=", 1)[1].split("[", 1)[0].split(" i8 ")[0]) or "externally_initialized" in l)]
+        if mutable:
+            meta.append(f"mutable_globals {len(mutable)}")
         ll2.write_text(text)
         opt = os.environ.get("OCU_SPV_OPT") or str(Path(llc).with_name("opt"))
         if infer and Path(opt).exists():

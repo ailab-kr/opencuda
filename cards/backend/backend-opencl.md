@@ -41,6 +41,8 @@ cost: { hours: 3, ai_usage: 0 }
 
 ## 메모
 
+- 레지스터 파일(2026-11-27, Arc Pro B70): `OCU_OPENCL_BUILD_OPTIONS`가 없으면 모듈은 드라이버 기본 레지스터 파일로 빌드된다. 기본에서 스필하는 커널만 큰 레지스터 파일(`-cl-intel-enable-auto-large-GRF-mode`)로 한 번 더 만들어(두 번째 프로그램은 필요할 때 빌드), 처음 12번 실행을 번갈아 돌리고 작업 항목당 GPU 시간이 짧은 쪽을 남긴다. 스필이 있어도 기본 쪽이 빠른 커널이 있어서(llama.cpp의 mul_mat_vec_q) 스필 여부만으로 고르지 않는다. 바뀔 수 있는 프로그램 범위 변수가 있는 모듈(cu2spv가 `mutable_globals`로 알림, 그 밖의 이미지는 `CL_PROGRAM_BUILD_GLOBAL_VARIABLE_TOTAL_SIZE` > 0)은 변수가 두 벌이 되므로 예전처럼 한 번 빌드한다. 측정: llama.cpp qwen3-0.6B Q4_K tg128 220.3/219.7 → 235.4/234.8 t/s(번갈아 두 번), pp512 같음, 27B QLoRA 학습기 1.98 → 1.99 s/step(이 모듈은 한 번 빌드).
+
 시험과 구현을 같은 세션이 썼다. 실제 GPU 드라이버(인텔·AMD·Mali)에서는 아직 돌리지 않았다. 시험 장치 PoCL과 SPIR-V 번역기는 공개 소스에서 사용자 폴더에 빌드했다(각 1분 안팎, 설치 크기 12MB·22MB).
 
 ## 다음

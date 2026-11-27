@@ -99,9 +99,11 @@ typedef struct _cl_event         *cl_event;
 
 /* programs and kernels */
 #define CL_PROGRAM_BUILD_LOG           0x1183
+#define CL_PROGRAM_BUILD_GLOBAL_VARIABLE_TOTAL_SIZE 0x1185
 #define CL_KERNEL_NUM_ARGS             0x1191
 #define CL_KERNEL_WORK_GROUP_SIZE      0x11B0
 #define CL_KERNEL_LOCAL_MEM_SIZE       0x11B2
+#define CL_KERNEL_SPILL_MEM_SIZE_INTEL 0x4109 /* cl_intel_required_subgroup_size */
 #define CL_KERNEL_EXEC_INFO_SVM_PTRS   0x11B6
 
 /* events */
