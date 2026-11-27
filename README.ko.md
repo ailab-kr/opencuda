@@ -407,3 +407,4 @@ Apache-2.0에는 특허 사용 허가와 특허 소송 시 허가가 끝나는 �
 | [(주)퀀텀아이](https://quantumai.kr) | 기술 지원 |
 | [H3Lab](https://h3lab.kr) | 하드웨어 지원 |
 | [메사쿠어컴퍼니](https://www.metsakuur.com/) | 시큐리티 리서치 |
+| [삼양리빙랩 (SPACE.i.LAB)](https://sites.google.com/view/spaceilab/%ED%99%88) | 공간 지원 |

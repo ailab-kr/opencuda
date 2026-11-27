@@ -428,3 +428,4 @@ and their legal teams can adopt and contribute with a well-understood set of ter
 | [QuantumAI Inc. ((주)퀀텀아이)](https://quantumai.kr) | Engineering |
 | [H3Lab](https://h3lab.kr) | Hardware |
 | [Metsakuur Company (메사쿠어컴퍼니)](https://www.metsakuur.com/) | Security research |
+| [Samyang Living Lab (SPACE.i.LAB, 삼양리빙랩)](https://sites.google.com/view/spaceilab/%ED%99%88) | Space |
