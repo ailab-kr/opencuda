@@ -225,6 +225,12 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   endforeach()
   ocu_add_cpu_cu_executable(rt_mem runtime/rt_mem.cu)
   add_test(NAME runtime_memory COMMAND rt_mem)
+  # also run on the B70 (SPIR-V path) by hand: device variables, mapped pinned
+  # memory, __half2 comparisons, large kernel arguments, memory pools
+  foreach(t rt_symbols rt_pinned_mapped rt_half2_cmp rt_big_args rt_mempool)
+    ocu_add_cpu_cu_executable(${t} runtime/${t}.cu)
+    add_test(NAME runtime_${t} COMMAND ${t})
+  endforeach()
   ocu_add_cpu_cu_executable(rt_misc runtime/rt_misc.cu)
   add_test(NAME runtime_misc COMMAND rt_misc)
   ocu_add_cpu_cu_executable(rt_apps_gaps runtime/rt_apps_gaps.cu)
