@@ -808,6 +808,9 @@ if(TARGET ocu_cublas_cpu)
     ENVIRONMENT "OCU_CUBLAS_TILE=64;OCU_CPU_ORDER=random;OCU_CPU_SEED=9")
   add_test(NAME cublas_cpu_tile128 COMMAND cublas_accuracy)
   set_tests_properties(cublas_cpu_tile128 PROPERTIES ENVIRONMENT "OCU_CUBLAS_TILE=128")
+  # cublasLtMatmul (layouts, transposes, batches, epilogues) against a double reference
+  ocu_add_cpu_cu_executable(cublaslt_matmul libs/cublaslt_matmul.cu LIBRARIES ocu_cublas_cpu)
+  add_test(NAME cublaslt_cpu COMMAND cublaslt_matmul)
 endif()
 # The reference BLAS cases (conformance/oracle) through the library, for
 # the functions it offers.
