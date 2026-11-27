@@ -334,8 +334,39 @@ static void test_accuracy(bool full)
     report("norm3df", n3f, FB); report("norm4df", n4f, FB); report("rnorm3df", rn3f, FB); report("rnorm4df", rn4f, FB);
 }
 
+/* double erf / erfc against long double, within the CUDA Math API maxima
+   (erf 2 ulp, erfc 5 ulp): dense in [-6, 6] (where both change), erfc over
+   its whole range up to its underflow near 27.3, tiny and negative x */
+static void test_erf(bool full)
+{
+    worst we, wc;
+    const int N = full ? 20000000 : 2000000;
+    for (int i = 0; i < N; ++i) {
+        double x;
+        switch (i % 6) {
+        case 0: x = ((double)(rng() >> 11) * 0x1p-53) * 12.0 - 6.0; break;       // [-6, 6]
+        case 1: x = ((double)(rng() >> 11) * 0x1p-53) * 28.0; break;             // erfc's range
+        case 2: x = std::ldexp((double)(rng() >> 11), -(int)(rng() % 1100) - 53); break; // tiny, subnormal
+        case 3: x = 1.5 + ((double)(rng() >> 11) * 0x1p-53 - 0.5) * 1e-6; break;  // the switch at 1.5
+        case 4: x = -((double)(rng() >> 11) * 0x1p-53) * 6.0; break;            // negative
+        default: x = rand_double(); break;
+        }
+        if (!std::isfinite(x)) continue;
+        note(we, err_d(ocu_dm::erf(x), std::erf((long double)x)), x);
+        long double rc = std::erfc((long double)x);
+        if (rc >= 0x1p-1074L || rc == 0) note(wc, err_d(ocu_dm::erfc(x), rc), x);
+    }
+    report("erf", we, 2.0);
+    report("erfc", wc, 5.0);
+}
+
 static void test_special()
 {
+    CHECK(same(ocu_dm::erf(0.0), 0.0) && same(ocu_dm::erf(-0.0), -0.0), "erf(+-0) = +-0");
+    CHECK(ocu_dm::erf(INFINITY) == 1.0 && ocu_dm::erf(-INFINITY) == -1.0 && std::isnan(ocu_dm::erf(NAN)), "erf(+-inf), erf(NaN)");
+    CHECK(ocu_dm::erfc(INFINITY) == 0.0 && ocu_dm::erfc(-INFINITY) == 2.0 && std::isnan(ocu_dm::erfc(NAN)) && ocu_dm::erfc(0.0) == 1.0,
+          "erfc(+-inf), erfc(NaN), erfc(0)");
+    CHECK(ocu_dm::erfc(30.0) == 0.0 && ocu_dm::erfc(-30.0) == 2.0 && ocu_dm::erf(7.0) == 1.0, "erfc / erf far out");
     CHECK(samef(ocu_dm::acoshf(1.0f), 0.0f) && !std::signbit(ocu_dm::acoshf(1.0f)), "acoshf(1) = +0");
     CHECK(std::isnan(ocu_dm::acoshf(0.5f)) && std::isnan(ocu_dm::acoshf(-INFINITY)), "acoshf below 1 is NaN");
     CHECK(samef(ocu_dm::asinhf(-0.0f), -0.0f) && ocu_dm::asinhf(-INFINITY) == -INFINITY, "asinhf(-0), asinhf(-inf)");
@@ -388,6 +419,7 @@ int main()
     test_rounding_modes();
     test_frsqrt(full);
     test_accuracy(full);
+    test_erf(full);
     std::printf("%s: %lld checks, %d failed\n", g_fail ? "FAIL" : "PASS", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }
