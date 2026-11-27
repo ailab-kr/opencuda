@@ -704,7 +704,8 @@ static void test_api_rules()
     // Combinations not computed here: "not supported", never a result.
     const cublasStatus_t NS = CUBLAS_STATUS_NOT_SUPPORTED;
     BLAS_IS(cublasGemmEx(h2, CUBLAS_OP_N, CUBLAS_OP_N, 1, 1, 1, &one, a, CUDA_C_32F, 1, a, CUDA_C_32F, 1, &zero, c, CUDA_C_32F, 1, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), NS);
-    BLAS_IS(cublasGemmEx(h2, CUBLAS_OP_N, CUBLAS_OP_N, 1, 1, 1, &one, a, CUDA_R_8I, 1, a, CUDA_R_8I, 1, &zero, c, CUDA_R_32I, 1, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT), NS);
+    // 8-bit integers into 32-bit ones: computed (test_gemm_i8); other integer outputs are not
+    BLAS_IS(cublasGemmEx(h2, CUBLAS_OP_N, CUBLAS_OP_N, 1, 1, 1, &one, a, CUDA_R_8I, 1, a, CUDA_R_8I, 1, &zero, c, CUDA_R_32F, 1, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT), NS);
     BLAS_IS(cublasGemmEx(h2, CUBLAS_OP_N, CUBLAS_OP_N, 1, 1, 1, &one, a, CUDA_R_16F, 1, a, CUDA_R_16F, 1, &zero, c, CUDA_R_16F, 1, CUBLAS_COMPUTE_16F_PEDANTIC, CUBLAS_GEMM_DEFAULT), NS);
     BLAS_IS(cublasGemmEx(h2, CUBLAS_OP_N, CUBLAS_OP_N, 1, 1, 1, &one, a, CUDA_R_16F, 1, a, CUDA_R_32F, 1, &zero, c, CUDA_R_32F, 1, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), NS);
     BLAS_IS(cublasGemmEx(h2, CUBLAS_OP_N, CUBLAS_OP_N, 1, 1, 1, &one, a, CUDA_R_32F, 1, a, CUDA_R_32F, 1, &zero, c, CUDA_R_16F, 1, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), NS);
@@ -1101,10 +1102,113 @@ static void test_set_get()
     cudaFree(d);
 }
 
+// ---- 8-bit integer GEMM ---------------------------------------------------
+// cublasGemmEx with A, B CUDA_R_8I, C CUDA_R_32I, CUBLAS_COMPUTE_32I (and the
+// older CUDA_R_32I compute value): int32 alpha and beta, exact int32 sums.
+// Exact comparison with a host reference in int64 (inputs and k keep every
+// value inside int32). Shapes off the tile sizes, the four transposes, beta
+// 0 (C holds garbage and must not be read) and not, alpha 0 (A and B are not
+// needed), padded leading dimensions (the padding must stay untouched),
+// device pointer mode, and a strided batch.
+static void test_gemm_i8()
+{
+    std::mt19937 rng(77);
+    const int shapes[][3] = {{1, 1, 1}, {7, 5, 3}, {64, 64, 16}, {65, 130, 33}, {129, 63, 257}, {200, 17, 1000}, {3, 300, 64}};
+    const char tr[][2] = {{'N', 'N'}, {'T', 'N'}, {'N', 'T'}, {'T', 'T'}};
+    int32_t *dscal = nullptr;
+    CUDA_OK(cudaMalloc(&dscal, 2 * sizeof(int32_t)));
+    long long bad_total = 0, n_total = 0;
+    for (auto &sh : shapes)
+        for (auto &t : tr)
+            for (int variant = 0; variant < 4; ++variant) {
+                const int m = sh[0], n = sh[1], k = sh[2];
+                const bool ta = t[0] == 'T', tb = t[1] == 'T';
+                const int arows = ta ? k : m, acols = ta ? m : k, brows = tb ? n : k, bcols = tb ? k : n;
+                const int lda = arows + 3, ldb = brows + 1, ldc = m + 2;
+                const int32_t alpha = variant == 2 ? 0 : (variant == 3 ? -3 : 2), beta = variant == 0 ? 0 : 5;
+                const int compute = variant == 1 ? (int)CUDA_R_32I : (int)CUBLAS_COMPUTE_32I;
+                std::vector<int8_t> A((size_t)lda * acols), B((size_t)ldb * bcols);
+                std::vector<int32_t> C((size_t)ldc * n), C0;
+                for (auto &v : A) v = (int8_t)((int)(rng() % 256) - 128);
+                for (auto &v : B) v = (int8_t)((int)(rng() % 256) - 128);
+                for (auto &v : C) v = (int32_t)(rng() % 2001) - 1000;
+                if (beta == 0) for (auto &v : C) v = (int32_t)0x7f7f7f7f; // garbage that must not be read
+                C0 = C;
+                int8_t *dA, *dB; int32_t *dC;
+                CUDA_OK(cudaMalloc(&dA, A.size())); CUDA_OK(cudaMalloc(&dB, B.size())); CUDA_OK(cudaMalloc(&dC, C.size() * 4));
+                CUDA_OK(cudaMemcpy(dA, A.data(), A.size(), cudaMemcpyHostToDevice));
+                CUDA_OK(cudaMemcpy(dB, B.data(), B.size(), cudaMemcpyHostToDevice));
+                CUDA_OK(cudaMemcpy(dC, C.data(), C.size() * 4, cudaMemcpyHostToDevice));
+                const bool devmode = (variant == 3);
+                if (devmode) {
+                    int32_t s[2] = {alpha, beta};
+                    CUDA_OK(cudaMemcpy(dscal, s, sizeof s, cudaMemcpyHostToDevice));
+                    BLAS_OK(cublasSetPointerMode(H, CUBLAS_POINTER_MODE_DEVICE));
+                }
+                BLAS_OK(cublasGemmEx(H, ta ? CUBLAS_OP_T : CUBLAS_OP_N, tb ? CUBLAS_OP_T : CUBLAS_OP_N, m, n, k,
+                                     devmode ? (const void *)dscal : (const void *)&alpha, dA, CUDA_R_8I, lda, dB, CUDA_R_8I, ldb,
+                                     devmode ? (const void *)(dscal + 1) : (const void *)&beta, dC, CUDA_R_32I, ldc,
+                                     (cublasComputeType_t)compute, CUBLAS_GEMM_DEFAULT));
+                if (devmode) BLAS_OK(cublasSetPointerMode(H, CUBLAS_POINTER_MODE_HOST));
+                CUDA_OK(cudaMemcpy(C.data(), dC, C.size() * 4, cudaMemcpyDeviceToHost));
+                long long bad = 0;
+                for (int j = 0; j < n; ++j) {
+                    for (int i = 0; i < m; ++i) {
+                        long long s = 0;
+                        for (int p = 0; p < k; ++p) {
+                            int a = ta ? A[(size_t)p + (size_t)i * lda] : A[(size_t)i + (size_t)p * lda];
+                            int b = tb ? B[(size_t)j + (size_t)p * ldb] : B[(size_t)p + (size_t)j * ldb];
+                            s += (long long)a * b;
+                        }
+                        long long want = (long long)alpha * s + (beta ? (long long)beta * C0[(size_t)i + (size_t)j * ldc] : 0);
+                        bad += C[(size_t)i + (size_t)j * ldc] != (int32_t)want;
+                    }
+                    for (int i = m; i < ldc; ++i) bad += C[(size_t)i + (size_t)j * ldc] != C0[(size_t)i + (size_t)j * ldc]; // padding
+                }
+                ++g_checks;
+                n_total += (long long)m * n;
+                if (bad) { ++g_fail; std::printf("FAIL gemm i8 %dx%dx%d %c%c variant %d: %lld wrong\n", m, n, k, t[0], t[1], variant, bad); }
+                bad_total += bad;
+                CUDA_OK(cudaFree(dA)); CUDA_OK(cudaFree(dB)); CUDA_OK(cudaFree(dC));
+            }
+    // a strided batch of 5, B shared (stride 0)
+    {
+        const int m = 33, n = 20, k = 70, batch = 5;
+        const long long sa = (long long)m * k + 11, sc = (long long)m * n + 7;
+        std::vector<int8_t> A((size_t)sa * batch), B((size_t)k * n);
+        std::vector<int32_t> C((size_t)sc * batch, 0);
+        for (auto &v : A) v = (int8_t)((int)(rng() % 256) - 128);
+        for (auto &v : B) v = (int8_t)((int)(rng() % 256) - 128);
+        int8_t *dA, *dB; int32_t *dC;
+        CUDA_OK(cudaMalloc(&dA, A.size())); CUDA_OK(cudaMalloc(&dB, B.size())); CUDA_OK(cudaMalloc(&dC, C.size() * 4));
+        CUDA_OK(cudaMemcpy(dA, A.data(), A.size(), cudaMemcpyHostToDevice));
+        CUDA_OK(cudaMemcpy(dB, B.data(), B.size(), cudaMemcpyHostToDevice));
+        CUDA_OK(cudaMemcpy(dC, C.data(), C.size() * 4, cudaMemcpyHostToDevice));
+        const int32_t one = 1, zero = 0;
+        BLAS_OK(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k, &one, dA, CUDA_R_8I, m, sa, dB, CUDA_R_8I, k, 0,
+                                           &zero, dC, CUDA_R_32I, m, sc, batch, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
+        CUDA_OK(cudaMemcpy(C.data(), dC, C.size() * 4, cudaMemcpyDeviceToHost));
+        long long bad = 0;
+        for (int q = 0; q < batch; ++q)
+            for (int j = 0; j < n; ++j)
+                for (int i = 0; i < m; ++i) {
+                    long long s = 0;
+                    for (int p = 0; p < k; ++p) s += (long long)A[(size_t)q * sa + i + (size_t)p * m] * B[(size_t)p + (size_t)j * k];
+                    bad += C[(size_t)q * sc + i + (size_t)j * m] != (int32_t)s;
+                }
+        ++g_checks;
+        if (bad) { ++g_fail; std::printf("FAIL gemm i8 strided batch: %lld wrong\n", bad); }
+        CUDA_OK(cudaFree(dA)); CUDA_OK(cudaFree(dB)); CUDA_OK(cudaFree(dC));
+    }
+    CUDA_OK(cudaFree(dscal));
+    std::printf("gemm i8: %lld results exact checks, %lld wrong\n", n_total, bad_total);
+}
+
 int main()
 {
     BLAS_OK(cublasCreate(&H));
     test_api_rules();
+    test_gemm_i8();
     test_sgemm_dgemm_hgemm();
     test_gemm_ex();
     test_batched();
