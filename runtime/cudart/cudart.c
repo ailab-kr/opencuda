@@ -754,6 +754,23 @@ static void range_remove(rt_device *d, void *p);
 static bool range_find(rt_device *d, const void *p, size_t n, mem_range *out);
 static bool range_overlaps(rt_device *d, const void *p, size_t n);
 
+static cudaError_t fill(void *ptr, int value, size_t count, cudaStream_t stream);
+
+/* OCU_MALLOC_FILL=B (0..255, decimal or 0x..): every new device allocation
+   is filled with byte B, as a checker for reads of memory nothing wrote
+   (0xff makes such f32 / f16 / bf16 values NaN). -1 = off (the default). */
+static int malloc_fill_byte(void)
+{
+    static int v = -2;
+    if (v == -2) {
+        const char *s = getenv("OCU_MALLOC_FILL");
+        char *end = NULL;
+        long b = s != NULL ? strtol(s, &end, 0) : -1;
+        v = (s != NULL && end != s && *end == '\0' && b >= 0 && b <= 255) ? (int)b : -1;
+    }
+    return v;
+}
+
 static cudaError_t device_alloc(void **ptr, size_t size, enum cudaMemoryType type)
 {
     rt_device *d;
@@ -768,6 +785,10 @@ static cudaError_t device_alloc(void **ptr, size_t size, enum cudaMemoryType typ
         (void)g_backend->mem_free(d->dev, *ptr);
         *ptr = NULL;
         return set_error(cudaErrorMemoryAllocation);
+    }
+    if (*ptr != NULL && size > 0 && malloc_fill_byte() >= 0) {
+        e = fill(*ptr, malloc_fill_byte(), size, NULL);
+        if (e != cudaSuccess) return e;
     }
     return cudaSuccess;
 }
