@@ -32,6 +32,9 @@ CUB(`namespace cub`, 헤더 하나):
 - `BlockLoad/BlockStore<T, X, N, ALG>`: `STRIPED`는 줄무늬 배치(i*블록스레드+t), 나머지는 블록 배치. 부분 적재(`valid_items`, 범위 밖 기본값), 부분 저장. 전치 알고리즘은 공유 메모리를 거쳐 읽고 쓴다.
 - `DeviceSegmentedReduce::Sum/Max/Min/Reduce`(구간 i는 [begin[i], end[i]), end <= begin이면 빈 구간이라 초깃값. 구간마다 블록 하나라 아주 긴 구간 하나가 전체 시간을 정한다. ArgMin/ArgMax는 없음).
 - `DeviceReduce::Sum/Max/Min/Reduce`, `DeviceScan::InclusiveSum/ExclusiveSum/InclusiveScan/ExclusiveScan`(제자리 가능).
+  - 누적형(2026-11-28, 문서대로): `Sum`은 출력의 값 형에서 시작한다(출력에 값 형이 없으면 입력의 형). 누적기는 (초깃값, 입력)에 연산자를 적용한 형이다. 그래서 bool 반복자를 int64_t로 더하면 개수가 되고(전에는 입력 형 bool로 누적해 1이 됐다), float을 double로 더하면 double로 누적한다. `Max`·`Min`은 그대로 입력 형.
+- `KeyValuePair<Key, Value>`(사소한 기본 생성자라 `__shared__`에 둘 수 있음, `operator!=`), `ArgMax`·`ArgMin`(큰·작은 값, 같으면 낮은 키): `BlockReduce<KeyValuePair, ...>`와 함께(HeCBench moe-cuda).
+- 입력 반복자 `CountingInputIterator<T, OffsetT>`, `TransformInputIterator<V, Op, InIt, OffsetT>`(무작위 접근, 호스트와 장치 코드, `cub/iterator/*.cuh` 경로로도 포함 가능).
 - `DeviceRadixSort::SortPairs(Descending)/SortKeys(Descending)`: 안정 정렬, 비트 범위 [begin_bit, end_bit).
 - `DeviceSegmentedRadixSort::SortPairs(Descending)/SortKeys(Descending)`, `DeviceSegmentedSort::(Stable)SortPairs(Descending)/(Stable)SortKeys(Descending)`: 구간마다 블록 하나, 안정 정렬.
 - 장치 전체 호출의 공통 규약: `d_temp_storage == nullptr`이면 `temp_storage_bytes`만 쓰고 아무것도 실행하지 않는다(값은 항상 1 이상). 그 밖에는 `stream`에 작업을 넣고 실행 상태를 돌려준다. 동기화하지 않는다.

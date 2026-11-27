@@ -35,6 +35,17 @@
 #define __NVCC__ 1
 #endif
 
+/* Programs that build with nvcc call assert() (also in device code) and,
+   in C++, use std::chrono without including <assert.h> or <chrono>
+   themselves (HeCBench moe-align-cuda; ccsd-trpdrv-cuda, nonzero-cuda): a
+   CUDA compile makes them available. */
+#if defined(__CUDACC__)
+#include <assert.h>
+#if defined(__cplusplus)
+#include <chrono>
+#endif
+#endif
+
 /*
  * cudaLaunchKernelEx(config, kernel, args...): the C++ form described in
  * the public API reference. Each argument is converted to the type of the

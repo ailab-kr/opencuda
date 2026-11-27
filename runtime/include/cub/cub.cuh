@@ -81,6 +81,115 @@ struct Min {
     }
 };
 
+/* A key and a value (CUB documentation: KeyValuePair), and the arg max /
+   arg min operators on such pairs: the larger / smaller value, the lower
+   key when the values are equal. Trivially constructible, so it can sit in
+   __shared__ memory. */
+template <typename _Key, typename _Value>
+struct KeyValuePair {
+    typedef _Key Key;
+    typedef _Value Value;
+    Key key;
+    Value value;
+    KeyValuePair() = default;
+    __host__ __device__ __forceinline__ KeyValuePair(Key const &k, Value const &v) : key(k), value(v) {}
+    __host__ __device__ __forceinline__ bool operator!=(const KeyValuePair &b) const
+    {
+        return (value != b.value) || (key != b.key);
+    }
+};
+
+struct ArgMax {
+    template <typename T, typename OffsetT>
+    __host__ __device__ __forceinline__ KeyValuePair<OffsetT, T> operator()(const KeyValuePair<OffsetT, T> &a,
+                                                                             const KeyValuePair<OffsetT, T> &b) const
+    {
+        return ((b.value > a.value) || ((a.value == b.value) && (b.key < a.key))) ? b : a;
+    }
+};
+
+struct ArgMin {
+    template <typename T, typename OffsetT>
+    __host__ __device__ __forceinline__ KeyValuePair<OffsetT, T> operator()(const KeyValuePair<OffsetT, T> &a,
+                                                                             const KeyValuePair<OffsetT, T> &b) const
+    {
+        return ((b.value < a.value) || ((a.value == b.value) && (b.key < a.key))) ? b : a;
+    }
+};
+
+/* ---- input iterators (CUB documentation: CountingInputIterator,
+   TransformInputIterator): random access, on the host and in device code,
+   for the device-wide algorithms and BlockLoad ------------------------- */
+
+template <typename ValueType, typename OffsetT = ptrdiff_t>
+class CountingInputIterator {
+public:
+    typedef CountingInputIterator self_type;
+    typedef OffsetT difference_type;
+    typedef ValueType value_type;
+    typedef ValueType *pointer;
+    typedef ValueType reference;
+    typedef std::random_access_iterator_tag iterator_category;
+
+    __host__ __device__ __forceinline__ CountingInputIterator(const ValueType &val) : val_(val) {}
+    __host__ __device__ __forceinline__ self_type operator++(int) { self_type r = *this; ++val_; return r; }
+    __host__ __device__ __forceinline__ self_type &operator++() { ++val_; return *this; }
+    __host__ __device__ __forceinline__ reference operator*() const { return val_; }
+    template <typename Distance>
+    __host__ __device__ __forceinline__ self_type operator+(Distance n) const { return self_type(val_ + (ValueType)n); }
+    template <typename Distance>
+    __host__ __device__ __forceinline__ self_type &operator+=(Distance n) { val_ += (ValueType)n; return *this; }
+    template <typename Distance>
+    __host__ __device__ __forceinline__ self_type operator-(Distance n) const { return self_type(val_ - (ValueType)n); }
+    template <typename Distance>
+    __host__ __device__ __forceinline__ self_type &operator-=(Distance n) { val_ -= (ValueType)n; return *this; }
+    __host__ __device__ __forceinline__ difference_type operator-(self_type other) const { return (difference_type)(val_ - other.val_); }
+    template <typename Distance>
+    __host__ __device__ __forceinline__ reference operator[](Distance n) const { return val_ + (ValueType)n; }
+    __host__ __device__ __forceinline__ bool operator==(const self_type &rhs) const { return val_ == rhs.val_; }
+    __host__ __device__ __forceinline__ bool operator!=(const self_type &rhs) const { return val_ != rhs.val_; }
+
+private:
+    ValueType val_;
+};
+
+/* conversion_op(*input) for each element */
+template <typename ValueType, typename ConversionOp, typename InputIteratorT, typename OffsetT = ptrdiff_t>
+class TransformInputIterator {
+public:
+    typedef TransformInputIterator self_type;
+    typedef OffsetT difference_type;
+    typedef ValueType value_type;
+    typedef ValueType *pointer;
+    typedef ValueType reference;
+    typedef std::random_access_iterator_tag iterator_category;
+
+    __host__ __device__ __forceinline__ TransformInputIterator(InputIteratorT input_itr, ConversionOp conversion_op)
+        : op_(conversion_op), it_(input_itr)
+    {
+    }
+    __host__ __device__ __forceinline__ self_type operator++(int) { self_type r = *this; ++it_; return r; }
+    __host__ __device__ __forceinline__ self_type &operator++() { ++it_; return *this; }
+    __host__ __device__ __forceinline__ reference operator*() const { return op_(*it_); }
+    template <typename Distance>
+    __host__ __device__ __forceinline__ self_type operator+(Distance n) const { return self_type(it_ + n, op_); }
+    template <typename Distance>
+    __host__ __device__ __forceinline__ self_type &operator+=(Distance n) { it_ += n; return *this; }
+    template <typename Distance>
+    __host__ __device__ __forceinline__ self_type operator-(Distance n) const { return self_type(it_ - n, op_); }
+    template <typename Distance>
+    __host__ __device__ __forceinline__ self_type &operator-=(Distance n) { it_ -= n; return *this; }
+    __host__ __device__ __forceinline__ difference_type operator-(self_type other) const { return (difference_type)(it_ - other.it_); }
+    template <typename Distance>
+    __host__ __device__ __forceinline__ reference operator[](Distance n) const { return op_(it_[n]); }
+    __host__ __device__ __forceinline__ bool operator==(const self_type &rhs) const { return it_ == rhs.it_; }
+    __host__ __device__ __forceinline__ bool operator!=(const self_type &rhs) const { return it_ != rhs.it_; }
+
+private:
+    ConversionOp op_;
+    InputIteratorT it_;
+};
+
 struct NullType {};
 
 /* ---- algorithm selectors (they change speed, not results) ------------ */
@@ -517,6 +626,15 @@ inline size_t align_bytes(size_t x) { return (x + 255) & ~(size_t)255; }
 
 template <typename It>
 using value_of = typename std::remove_cv<typename std::iterator_traits<It>::value_type>::type;
+
+/* As the CUB documentation describes DeviceReduce: Sum starts from the
+   output's value type (the input's when the output has none), and the
+   accumulator is the type the operator gives for (initial value, input):
+   a bool iterator summed into int64_t counts. */
+template <typename Out, typename In>
+using init_of = typename std::conditional<std::is_void<value_of<Out>>::value, value_of<In>, value_of<Out>>::type;
+template <typename Op, typename Init, typename In>
+using accum_of = typename std::decay<decltype(std::declval<Op>()(std::declval<Init>(), std::declval<value_of<In>>()))>::type;
 
 /* Bump allocator over the caller's temporary storage. */
 struct carve {
@@ -1156,7 +1274,7 @@ struct DeviceReduce {
                               ReductionOpT reduction_op, T init, cudaStream_t stream = 0)
     {
         using namespace ocu_detail;
-        using Acc = value_of<InputIteratorT>;
+        using Acc = accum_of<ReductionOpT, T, InputIteratorT>;
         const long long n = (long long)num_items;
         /* Small inputs: one block, one launch. */
         const bool single = n <= (long long)kThreads * kReduceSingleItems;
@@ -1186,9 +1304,9 @@ struct DeviceReduce {
     static cudaError_t Sum(void *d_temp_storage, size_t &temp_storage_bytes, InputIteratorT d_in,
                            OutputIteratorT d_out, NumItemsT num_items, cudaStream_t stream = 0)
     {
-        using Acc = ocu_detail::value_of<InputIteratorT>;
+        using Init = ocu_detail::init_of<OutputIteratorT, InputIteratorT>;
         return Reduce(d_temp_storage, temp_storage_bytes, d_in, d_out, num_items, cub::Sum(),
-                      Acc(0), stream);
+                      Init(0), stream);
     }
 
     /* Max and Min start from the lowest / highest value of the type
