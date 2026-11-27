@@ -51,6 +51,8 @@ OCU_MX_Q long long llroundf(float x) { return ocu_dm::llround((double)x); }
 OCU_MX_Q long lrintf(float x) { return (long)ocu_dm::llrint((double)x); }
 OCU_MX_Q float nanf(const char *t) { return ocu_dm::nanf(t); }
 OCU_MX_Q double nan(const char *t) { return ocu_dm::nan(t); }
+OCU_MX_Q double erf(double x) { return ocu_dm::erf(x); }
+OCU_MX_Q double erfc(double x) { return ocu_dm::erfc(x); }
 #endif /* OCU_MX_STD */
 
 /* ---- CUDA's own functions ------------------------------------------------------------- */

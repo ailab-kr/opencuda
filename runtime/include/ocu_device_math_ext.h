@@ -591,6 +591,94 @@ OCU_DM_FN float rnorm4df(float a, float b, float c, float d)
 OCU_DM_FN float normf(int n, const float *a) { return normf_n(n, a, false); }
 OCU_DM_FN float rnormf(int n, const float *a) { return normf_n(n, a, true); }
 
+/* ---- erf, erfc (double) -------------------------------------------------------------
+ * |x| < 1.5: the Taylor series erf(x) = 2/sqrt(pi) sum_n (-1)^n x^(2n+1) / (n! (2n+1))
+ *   summed in two doubles, so erfc = 1 - erf keeps its accuracy there as well
+ *   (erfc(1.5) = 0.034: one double would lose 5 bits).
+ * x >= 1.5: erfc(x) = exp(-x^2) / sqrt(pi) / F, F the continued fraction
+ *   x + (1/2) / (x + 1 / (x + (3/2) / (x + 2 / (x + ...)))), evaluated from the
+ *   bottom in two doubles at a depth that converges for that x; exp(-x^2) from
+ *   x^2 = h + l exactly as exp(-h) (1 - l), so its error does not grow with x.
+ *   erf = 1 - erfc there (and +-1 from 6 on, where erfc < 2^-55).
+ * Special values as the C library: erf(+-0) = +-0, erf(+-inf) = +-1,
+ * erfc(+inf) = 0, erfc(-inf) = 2, NaN in, NaN out. */
+
+constexpr double TWO_OVER_SQRTPI_HI = 1.1283791670955126, TWO_OVER_SQRTPI_LO = 1.533545961316588e-17;
+constexpr double ONE_OVER_SQRTPI_HI = 0.5641895835477563, ONE_OVER_SQRTPI_LO = 7.66772980658294e-18;
+
+OCU_DM_FN dd dd_mul(dd a, dd b)
+{
+    dd p = two_prod(a.hi, b.hi);
+    p.lo += a.hi * b.lo + a.lo * b.hi;
+    return fast_two_sum(p.hi, p.lo);
+}
+OCU_DM_FN dd dd_div(dd a, dd b)
+{
+    double q1 = a.hi / b.hi;
+    dd p = dd_mul(dd{q1, 0.0}, b);
+    dd r = dd_add(a, dd{-p.hi, -p.lo});
+    double q2 = r.hi / b.hi;
+    return fast_two_sum(q1, q2);
+}
+
+/* erf(x) for |x| < 1.5 as two doubles */
+OCU_DM_FN dd erf_series(double x)
+{
+    dd x2 = two_prod(x, x);
+    dd p = dd{x, 0.0}; /* (-1)^n x^(2n+1) / n! */
+    dd s = p;
+    for (int n = 1; n < 80; ++n) {
+        p = dd_mul(p, x2);
+        p = dd_div(dd{-p.hi, -p.lo}, dd{(double)n, 0.0});
+        dd t = dd_div(p, dd{(double)(2 * n + 1), 0.0});
+        s = dd_add(s, t);
+        if (fabs(t.hi) <= 1e-34 * fabs(s.hi)) break;
+    }
+    return dd_mul(s, dd{TWO_OVER_SQRTPI_HI, TWO_OVER_SQRTPI_LO});
+}
+
+/* erfc(x) for x >= 1.5 */
+OCU_DM_FN double erfc_cf(double x)
+{
+    if (x >= 27.3) return 0.0; /* below the smallest subnormal */
+    const int depth = (int)(250.0 / (x * x)) + 12;
+    dd f = dd{x, 0.0};
+    for (int n = depth; n >= 1; --n) f = dd_add(dd{x, 0.0}, dd_div(dd{0.5 * n, 0.0}, f));
+    dd x2 = two_prod(x, x);
+    double e = exp(-x2.hi) * (1.0 - x2.lo); /* exp(-(h + l)), |l| <= ulp(h) / 2 */
+    dd q = dd_div(dd{ONE_OVER_SQRTPI_HI, ONE_OVER_SQRTPI_LO}, f);
+    return e * q.hi + e * q.lo;
+}
+
+OCU_DM_FN double erf(double x)
+{
+    if (x != x) return x;
+    double ax = fabs(x);
+    double r;
+    if (ax < 1.5) {
+        dd s = erf_series(ax);
+        r = s.hi + s.lo;
+    } else if (ax < 6.0) {
+        r = 1.0 - erfc_cf(ax);
+    } else {
+        r = 1.0;
+    }
+    return x < 0.0 ? -r : (x == 0.0 ? x : r);
+}
+
+OCU_DM_FN double erfc(double x)
+{
+    if (x != x) return x;
+    double ax = fabs(x);
+    if (ax < 1.5) {
+        dd s = erf_series(ax); /* erf |x| */
+        dd r = x < 0.0 ? dd_add(dd{1.0, 0.0}, s) : dd_add(dd{1.0, 0.0}, dd{-s.hi, -s.lo});
+        return r.hi + r.lo;
+    }
+    if (x > 0.0) return erfc_cf(ax);
+    return 2.0 - erfc_cf(ax); /* -inf: 2 */
+}
+
 } // namespace ocu_dm
 
 #endif /* OCU_DEVICE_MATH_EXT_H */
