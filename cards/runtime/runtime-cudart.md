@@ -48,6 +48,7 @@ cost: { hours: 5.0, ai_usage: 0 }
   - 3차원 메모리: `cudaMalloc3D`, `cudaMemset3D`·`Async`, `cudaMemcpy3D`·`Async`(피치 있는 원본·대상, `srcPos`·`dstPos`, `ysize`; 배열이 얽히면 `cudaErrorNotSupported`), `cudaMemset2DAsync`, 형식 `cudaExtent`·`cudaPos`·`cudaPitchedPtr`·`cudaMemcpy3DParms`와 `make_cudaExtent` 등.
   - `cudaDeviceGetLimit`·`cudaDeviceSetLimit`: 스택 크기·printf FIFO·말록 힙은 기록해 돌려줌(효과 없음, 0은 `cudaErrorInvalidValue`). 장치 런타임 한도 둘과 L2 상주 한도는 `cudaErrorUnsupportedLimit`. L2 가져오기 단위는 힌트라 0.
   - `cuda_profiler_api.h`의 `cudaProfilerStart`·`cudaProfilerStop`: 붙은 도구가 없으므로 효과 없이 `cudaSuccess`.
+  - 진단: 환경변수 `OCU_MALLOC_FILL=B`(0~255, 10진수나 0x..)이면 새 장치 할당(`cudaMalloc` 계열)을 모두 바이트 B로 채운다. 아무도 쓰지 않은 메모리를 읽는 곳을 찾는 용도(0xff면 f32·f16·bf16 값이 NaN). 없거나 바이트 값이 아니면 할당을 건드리지 않는다. 값은 프로세스당 한 번 읽는다.
   - `math_constants.h`: `CUDART_*` 단·배정밀도 상수와 `_HI`/`_LO`.
   - 장치 쪽: 캐시 힌트 적재·저장 9개(`__ldcg` 등), 범위 지정 원자(`atomicAdd_block`/`_system` 등; NVIDIA 경로의 `_system`은 컴파일 때 지원 안 함), 무동기 워프 함수(`__shfl` 등)는 컴파일 때 지원 안 함과 대체 함수 안내. Cooperative Groups 타일의 `meta_group_rank`·`meta_group_size`.
 
@@ -74,6 +75,7 @@ cost: { hours: 5.0, ai_usage: 0 }
 - [x] `tests/runtime/rt_mem.cu`: 포인터 종류(할당 안쪽 주소, 해제 뒤), `cudaMemcpyDefault` 네 방향과 범위 초과 오류, 통합 메모리를 호스트·커널이 함께 씀, 장치 속성과 속성 구조체 일치·잘못된 값
 - [x] `tests/runtime/rt_misc.cu`: 우선순위·플래그·캡처 상태, 호스트 함수 순서, 호스트 메모리 등록과 그 메모리에서 커널 실행·중복 등록·해제 오류, 장치 플래그·피어, 함수 속성 상한, 점유율
 - [x] `tests/runtime/rt_fp16.cu`: 구현과 독립인 정확한 기준(모든 유한 half를 2^-24 단위 정수로, 합·곱은 128비트 정수로 계산하고 정렬한 전체 표에서 가장 가까운 값). 65,536개 왕복, 이웃 사이 중간값 6만여 개와 그 바로 위아래, 넘침 경계·특수값, 20만 개 무작위 조합의 덧셈·뺄셈·곱셈·fma와 5만 개 나눗셈, 커널 안 `__half2` fma. 결함 두 가지(동률 올림, 자리올림 경계)를 넣으면 실패함을 확인
+- [x] `tests/runtime/rt_malloc_fill.cu`: `OCU_MALLOC_FILL` 없음·0xff·7·잘못된 값("x", "300")에서 1바이트·4 KiB·3 MiB 할당이 채워지거나(값 일치) 건드려지지 않음(쓴 값 그대로 읽힘). CPU 경로와 OpenCL(Arc Pro B70)에서 통과
 - [x] `tests/runtime/rt_launch_api.cu`: 구조체 인자 포함 실행, 호출 뒤 값을 바꿔도 영향 없음, 동적 공유 메모리, 설정 오류와 인자 없음 오류
 - [x] `tests/runtime/rt_review.cu`(다섯째 검토 회귀): 바쁜 스트림에 일반 메모리 비동기 복사, 템플릿 커널의 리터럴 0(형 추론 int), `<<<g, b, 0, NULL>>>`, 동적 공유 메모리 바이트 배열의 형 변환, `operator<< <>`, 커널 실패 유지와 초기화
 
