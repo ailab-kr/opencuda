@@ -19,6 +19,7 @@ static int g_fail, g_checks;
 #define CHECK(c) do { ++g_checks; if (!(c)) { std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++g_fail; } } while (0)
 
 static __device__ const unsigned table[8] = {3, 1, 4, 1, 5, 9, 2, 6};
+static const unsigned host_table[8] = {3, 1, 4, 1, 5, 9, 2, 6};
 
 // Constant tables only in this group of kernels (the split applies if the
 // whole translation unit has no variable that can change; see 2 below).
@@ -51,7 +52,7 @@ static float heavy_ref(const float *in, int tid, int n)
     float acc[kLive];
     for (int j = 0; j < kLive; ++j) acc[j] = in[(tid + j) % n];
     for (int r = 0; r < 8; ++r)
-        for (int j = 0; j < kLive; ++j) acc[j] = acc[j] * 0.5f + acc[(j + 1) % kLive] * 0.25f + (float)table[j & 7];
+        for (int j = 0; j < kLive; ++j) acc[j] = acc[j] * 0.5f + acc[(j + 1) % kLive] * 0.25f + (float)host_table[j & 7];
     float s = 0.0f;
     for (int j = 0; j < kLive; ++j) s += acc[j] * (float)(j + 1);
     return s;
