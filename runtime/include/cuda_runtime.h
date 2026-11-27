@@ -28,6 +28,13 @@
 #define OCU_CUDA_LANG_READY 1 /* the path's device language (atomicCAS ...) is declared */
 #endif
 
+/* nvcc defines __NVCC__ (with __CUDACC__) in every pass of a CUDA compile;
+   programs gate __host__ / __device__ on it. ocu-nvcc force-includes this
+   header in each such pass; a plain host compile has no __CUDACC__. */
+#if defined(__CUDACC__) && !defined(__NVCC__) && !defined(OCU_NO_NVCC_MACRO)
+#define __NVCC__ 1
+#endif
+
 /*
  * cudaLaunchKernelEx(config, kernel, args...): the C++ form described in
  * the public API reference. Each argument is converted to the type of the
