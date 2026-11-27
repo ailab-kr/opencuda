@@ -502,6 +502,7 @@ static inline cudaError_t cudaLaunchKernel(void (*func)(P...), dim3 grid, dim3 b
 #define OCU_MX_Q OCU_D
 #define OCU_MX_STD 1
 #define OCU_MX_HAS_FMAF_RM 1
+#define OCU_MX_HAS_I2F_RN 1
 #include "ocu_cuda_math_ext.h"
 
 #endif /* OCU_CUDA_LANG_NVPTX_H */

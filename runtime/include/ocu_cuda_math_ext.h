@@ -9,6 +9,9 @@
  *   OCU_MX_HAS_FSUB_RN    the path already has __fsub_rn
  *   OCU_MX_NEED_DSQRT_RN  the path lacks __dsqrt_rn
  *   OCU_MX_HAS_FMAF_RM    the path already has __fmaf_rz / _ru / _rd
+ *   OCU_MX_HAS_I2F_RN     ... __int2float_rn
+ *   OCU_MX_HAS_U2F_RN     ... __uint2float_rn
+ *   OCU_MX_HAS_F2U32      ... __float2uint_rn / _rz / _ru / _rd
  *
  * Written for this project from the public CUDA Math API reference (names,
  * argument types, special values); not derived from any vendor header.
@@ -125,5 +128,39 @@ OCU_MX_CV(rz, ocu_dm::trunc, ocu_dm::RZ)
 OCU_MX_CV(ru, ocu_dm::ceil, ocu_dm::RU)
 OCU_MX_CV(rd, ocu_dm::floor, ocu_dm::RD)
 #undef OCU_MX_CV
+
+/* ---- 32-bit conversions the paths do not all have ---------------------------------------
+ * double -> unsigned (saturated, NaN 0), int / unsigned -> float in each mode
+ * (the value is exact as a double; one rounding to float), int / unsigned ->
+ * double (exact), double -> float in each mode. */
+#define OCU_MX_CV32(sfx, R, M)                                                                                \
+    OCU_MX_Q unsigned __double2uint_##sfx(double x) { return ocu_dm::sat_u32(R(x)); }                         \
+    OCU_MX_Q float __double2float_##sfx(double x) { return ocu_dm::to_float(x, 0, M); }
+OCU_MX_CV32(rn, ocu_dm::rint, ocu_dm::RN)
+OCU_MX_CV32(rz, ocu_dm::trunc, ocu_dm::RZ)
+OCU_MX_CV32(ru, ocu_dm::ceil, ocu_dm::RU)
+OCU_MX_CV32(rd, ocu_dm::floor, ocu_dm::RD)
+#undef OCU_MX_CV32
+#define OCU_MX_I2F(sfx, M)                                                                                    \
+    OCU_MX_Q float __int2float_##sfx(int v) { return ocu_dm::to_float((double)v, 0, M); }                     \
+    OCU_MX_Q float __uint2float_##sfx(unsigned v) { return ocu_dm::to_float((double)v, 0, M); }
+OCU_MX_I2F(rz, ocu_dm::RZ)
+OCU_MX_I2F(ru, ocu_dm::RU)
+OCU_MX_I2F(rd, ocu_dm::RD)
+#undef OCU_MX_I2F
+OCU_MX_Q double __int2double_rn(int v) { return (double)v; }
+OCU_MX_Q double __uint2double_rn(unsigned v) { return (double)v; }
+#ifndef OCU_MX_HAS_I2F_RN
+OCU_MX_Q float __int2float_rn(int v) { return (float)v; }
+#endif
+#ifndef OCU_MX_HAS_U2F_RN
+OCU_MX_Q float __uint2float_rn(unsigned v) { return (float)v; }
+#endif
+#ifndef OCU_MX_HAS_F2U32
+OCU_MX_Q unsigned __float2uint_rn(float x) { return ocu_dm::sat_u32(ocu_dm::rint((double)x)); }
+OCU_MX_Q unsigned __float2uint_rz(float x) { return ocu_dm::sat_u32(ocu_dm::trunc((double)x)); }
+OCU_MX_Q unsigned __float2uint_ru(float x) { return ocu_dm::sat_u32(ocu_dm::ceil((double)x)); }
+OCU_MX_Q unsigned __float2uint_rd(float x) { return ocu_dm::sat_u32(ocu_dm::floor((double)x)); }
+#endif
 
 #endif /* OCU_CUDA_MATH_EXT_H */

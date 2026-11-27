@@ -720,6 +720,9 @@ static inline cudaError_t cudaLaunchKernel(void (*func)(P...), dim3 grid, dim3 b
 /* more of the CUDA Math API (ocu_cuda_math_ext.h) */
 #define OCU_MX_Q OCU_D
 #define OCU_MX_STD 1
+#define OCU_MX_HAS_I2F_RN 1
+#define OCU_MX_HAS_U2F_RN 1
+#define OCU_MX_HAS_F2U32 1
 #include "ocu_cuda_math_ext.h"
 
 #endif /* OCU_CUDA_LANG_SPIRV_H */

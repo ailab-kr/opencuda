@@ -170,6 +170,12 @@ OCU_DM_FN long long sat_i64(double r)
     if (r < -9223372036854775807.0) return (-9223372036854775807ll - 1);
     return (long long)r;
 }
+OCU_DM_FN unsigned sat_u32(double r)
+{
+    if (r != r || r <= 0.0) return 0u;
+    if (r >= 4294967295.0) return 4294967295u;
+    return (unsigned)r;
+}
 OCU_DM_FN unsigned long long sat_u64(double r)
 {
     if (r != r || r <= 0.0) return 0ull;
