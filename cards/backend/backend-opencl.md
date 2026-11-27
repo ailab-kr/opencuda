@@ -21,6 +21,8 @@ cost: { hours: 3, ai_usage: 0 }
 - 변환(`compiler/opencl/cu2ocl.py`): cu2msl의 하위 클래스. 주소 공간 분석·템플릿·장치 함수·모듈 변수를 그대로 쓰고, 커널 머리·인덱스·3성분 벡터 인자·`long long`(OpenCL에서는 128비트라 `long`으로)·안쪽 블록의 `__shared__`(커널 맨 위로)만 다르다. 생성한 소스는 변환 때 Clang으로 C++ for OpenCL 2021로 컴파일해 보고, `llvm-spirv`가 있으면 SPIR-V로.
 - 전체 프로그램: `ocu_cc.py --target opencl`, `OCU_BACKEND=opencl`로 실행 API가 그대로 OpenCL에서 돈다.
 
+- 공유 할당(`mem_alloc_shared`, `cudaMallocManaged`): 고운 단위 SVM 버퍼가 있으면 그것, 없고 `cl_intel_unified_shared_memory`의 단일 장치 공유 메모리 접근이 되면 USM 공유 할당(`clSharedMemAllocINTEL`, 256바이트 정렬, 해제는 `clMemBlockingFreeINTEL`). 호스트가 직접 읽고 쓰고 드라이버가 페이지를 옮긴다. 커널은 이미 켠 간접 접근 플래그로 닿는다. 둘 다 없으면 "지원 안 함". Arc Pro B70은 고운 단위 SVM이 없어 USM.
+
 ## 경계 조건
 
 - SVM이 없는 장치(OpenCL 1.2, SVM을 빼는 3.0 드라이버)는 목록에 없다(`OCU_OPENCL_VERBOSE=1`로 이유).

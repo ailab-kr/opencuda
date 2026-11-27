@@ -23,7 +23,7 @@ cost: { hours: 5.0, ai_usage: 0 }
 - 오류: 스레드별 마지막 오류. `cudaGetLastError`는 읽고 지움, `cudaPeekAtLastError`는 남김. "아직 안 끝남"은 기록하지 않음.
 - 메모리: 할당·해제·고정 메모리·남은 양, 1차원·2차원 복사와 채우기(동기·비동기), 기호 복사(`__constant__`·`__device__`).
   `cudaMemcpyDefault`는 런타임이 할당한 포인터로 방향을 정한다(시작 주소 기준, 범위 검사는 그대로).
-- 포인터 종류 조회(`cudaPointerGetAttributes`: 장치·고정 호스트·통합·일반), 통합 메모리(`cudaMallocManaged`, 호스트와 메모리를 공유하는 장치에서만. 아니면 "지원 안 함"), 장치 속성 개별 조회(`cudaDeviceGetAttribute`, 자주 쓰는 27개. 모르는 값은 오류).
+- 포인터 종류 조회(`cudaPointerGetAttributes`: 장치·고정 호스트·통합·일반), 통합 메모리(`cudaMallocManaged`: 호스트와 메모리를 공유하는 장치, 백엔드가 공유 할당을 주는 장치(OpenCL: fine-grained SVM 또는 Intel USM 공유 할당 `cl_intel_unified_shared_memory`)에서. 아니면 "지원 안 함"), 통합 메모리 힌트(`cudaMemPrefetchAsync`·`cudaMemAdvise`와 `_v2`, CUDA 13의 `cudaMemLocation` 형 C++ 오버로드: 범위가 통합 할당 하나 안에 있고 장치가 있거나 `cudaCpuDeviceId`인지만 확인하고 돌아옴. 페이지는 쓸 때 옮겨짐. 아니면 `cudaErrorInvalidValue`·`cudaErrorInvalidDevice`, flags는 0), 장치 속성 개별 조회(`cudaDeviceGetAttribute`, 자주 쓰는 27개. 모르는 값은 오류).
 - 스트림: 막는 스트림·안 막는 스트림, 동기화·조회, 사건 기다리기.
   예전 기본 스트림 규칙: 기본 스트림 작업은 막는 스트림을 먼저 끝내고, 막는 스트림 작업은 기본 스트림을 먼저 끝낸다.
 - 사건: 만들기(시간 재기 끄기 포함)·기록·동기화·조회·경과 시간.
@@ -79,6 +79,7 @@ cost: { hours: 5.0, ai_usage: 0 }
 - [x] `tests/runtime/rt_mem.cu`: 포인터 종류(할당 안쪽 주소, 해제 뒤), `cudaMemcpyDefault` 네 방향과 범위 초과 오류, 통합 메모리를 호스트·커널이 함께 씀, 장치 속성과 속성 구조체 일치·잘못된 값
 - [x] `tests/runtime/rt_misc.cu`: 우선순위·플래그·캡처 상태, 호스트 함수 순서, 호스트 메모리 등록과 그 메모리에서 커널 실행·중복 등록·해제 오류, 장치 플래그·피어, 함수 속성 상한, 점유율
 - [x] `tests/runtime/rt_fp16.cu`: 구현과 독립인 정확한 기준(모든 유한 half를 2^-24 단위 정수로, 합·곱은 128비트 정수로 계산하고 정렬한 전체 표에서 가장 가까운 값). 65,536개 왕복, 이웃 사이 중간값 6만여 개와 그 바로 위아래, 넘침 경계·특수값, 20만 개 무작위 조합의 덧셈·뺄셈·곱셈·fma와 5만 개 나눗셈, 커널 안 `__half2` fma. 결함 두 가지(동률 올림, 자리올림 경계)를 넣으면 실패함을 확인
+- [x] `tests/runtime/rt_managed.cu`: 통합 메모리를 호스트가 쓰고 커널이 읽고 쓰고 동기화 뒤 호스트가 읽음, 통합 메모리 양쪽 복사·채우기(H2D·D2H·D2D·Default), 포인터 속성, 힌트의 올바른 인자(장치·호스트·`_v2`·CUDA 13 형)와 틀린 인자(통합이 아님, 끝을 넘음, 0바이트, 없는 장치, 잘못된 advice, flags ≠ 0), 64 MiB 할당을 양쪽에서 만짐. CPU 경로 45개, Arc Pro B70(USM 공유 할당) 45개 통과
 - [x] `tests/runtime/rt_cucomplex.cu`: 형식이 `float2`·`double2`, 더하기·빼기·켤레·실수부·허수부는 공식 그대로, 곱·fma는 |a||b| 기준 몇 ulp, 나눗셈·절댓값은 long double 기준 몇 ulp, 1e30·1e300 크기에서 넘침 없음, 1e-30·1e-300에서 아래넘침 없음, 큰 허수부 분기, 변환, inf·NaN 절댓값. 호스트와 장치(CPU 경로 131개 통과, Arc Pro B70 통과)
 - [x] `tests/runtime/rt_math_ext_gpu.cu`(+ `rt_math_ext_ref.cpp`): 장치에서 정확한 결과(반올림 방향 연산 27종, 64비트 변환, remquo·remainder·modf·nextafter·ilogb·scalbn·llrint, `__frsqrt_rn`)가 같은 코드의 호스트 결과와 비트까지 같고, 근사 함수 18종이 호스트 시험과 같은 상한 안(26만 입력). Arc Pro B70: 71개 검사 통과, 근사 최대 sinpi 0.96·cospi 0.67·acosh 1.83·asinh 1.48·atanh 1.40·rcbrt 0.50·rnorm4d 0.74ulp, float 형 0.50ulp
 - [x] `tests/runtime/test_device_math_ext.cpp`(ctest `device_math_ext`, 호스트): 정확한 함수는 C 라이브러리와 비트까지 같음(200만 쌍), 반올림 방향 연산·64비트 정수 변환은 같은 반올림 모드(`fesetround`)의 호스트 FPU와 비트까지 같음(모드마다 40만 건, 0의 부호·넘침·아래넘침 포함), `__frsqrt_rn`은 양수 float 61개마다 하나(`OCU_MATH_EXT_FULL=1`이면 전부)가 정확한 반올림, 근사 함수는 long double 기준으로 double 형 1.5ulp(`acosh` 3, `asinh`·`atanh` 2) 이내·float 형 0.5ulp + 2^-20 이내, 특수값. 잰 최대: sinpi 0.95, cospi 0.78, acosh 2.46, asinh 1.87, atanh 1.91, rcbrt 0.50, rhypot·rnorm 0.75, norm 0.50ulp; float 형 모두 0.50ulp

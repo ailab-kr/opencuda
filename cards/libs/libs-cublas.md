@@ -32,7 +32,7 @@ cost: { hours: 1, ai_usage: 0 }
 | BLAS 확장·LAPACK 비슷 | `cublasSgeam`, `cublasDgeam`(C = αop(A) + βop(B), α 0이면 A를, β 0이면 B를 읽지 않음, C가 A·B와 같아도 됨: op N·같은 ld일 때만), `cublasSgetrfBatched`(부분 피벗 LU, LAPACK getf2 순서, 행렬마다 블록 하나: 작은 행렬용. 피벗 0이면 첫 번째 것을 info에, P가 NULL이면 피벗 없음) |
 | 호스트↔장치 복사(핸들 없음) | `cublasSetMatrix`, `cublasGetMatrix`, `cublasSetVector`, `cublasGetVector`와 각 `Async`(cudaMemcpy2D로, 실패하면 `MAPPING_ERROR`) |
 
-`*Ex`의 형 조합: COMPUTE_32F(`_PEDANTIC` 포함)에서 A=B=32F→C 32F, 16F→16F·32F, 16BF→16BF·32F. COMPUTE_16F에서 16F→16F(스칼라 half). COMPUTE_32F_FAST_16F/16BF/TF32에서 32F→32F. COMPUTE_64F(`_PEDANTIC`)에서 64F→64F. 예전 방식의 `CUDA_R_16F/32F/64F` 계산형 값도 받는다.
+`*Ex`의 형 조합: COMPUTE_32F(`_PEDANTIC` 포함)에서 A=B=32F→C 32F, 16F→16F·32F, 16BF→16BF·32F. COMPUTE_16F에서 16F→16F(스칼라 half). COMPUTE_32F_FAST_16F/16BF/TF32에서 32F→32F. COMPUTE_64F(`_PEDANTIC`)에서 64F→64F. COMPUTE_32I(`_PEDANTIC`)에서 8I→32I(스칼라 int32, 합은 int32로 정확: 어떤 int8 값이든 k ≤ 2^17이면 넘치지 않음). 예전 방식의 `CUDA_R_16F/32F/64F/32I` 계산형 값도 받는다.
 
 GEMM 커널: 256스레드 블록, 공유 메모리 타일 두 가지(128×128×16·스레드당 8×8, 64×64×16·4×4), 다음 타일을 레지스터에 미리 읽음, 전치별로 이웃 스레드가 이웃 주소를 읽는 순서. 큰 타일이 다중처리기 절반 이상을 채우면 큰 타일(`OCU_CUBLAS_TILE=64|128`로 강제 가능). 배치는 grid z(65535 넘으면 나눠 실행).
 
@@ -48,7 +48,7 @@ GEMM 커널: 256스레드 블록, 공유 메모리 타일 두 가지(128×128×1
 ## 오류 코드
 
 - 핸들 NULL: `NOT_INITIALIZED`. 크기 음수, ld 부족, 잘못된 연산·측·삼각·대각 값, 배치 음수, 잘못된 algo 값, 스칼라 NULL: `INVALID_VALUE`.
-- 계산하지 않는 조합은 `CUBLAS_STATUS_NOT_SUPPORTED`: 복소수와 정수 형(`CUDA_C_*`, `CUDA_R_8I`→`32I`, `COMPUTE_32I`), FP8, `COMPUTE_16F_PEDANTIC`(반정밀도 산술을 요구하는데 여기서는 32F로 누적), A와 B 형이 다른 경우, 문서에 없는 형 조합, axpy의 incy 0(n > 1), grid y 한도(n/타일 > 65535). `OCU_CUBLAS_NO_FP64`로 빌드한 변형에서 64F 전부.
+- 계산하지 않는 조합은 `CUBLAS_STATUS_NOT_SUPPORTED`: 복소수 형(`CUDA_C_*`), 8I→32I 밖의 정수 조합(예: 8I→32F), FP8, `COMPUTE_16F_PEDANTIC`(반정밀도 산술을 요구하는데 여기서는 32F로 누적), A와 B 형이 다른 경우, 문서에 없는 형 조합, axpy의 incy 0(n > 1), grid y 한도(n/타일 > 65535). `OCU_CUBLAS_NO_FP64`로 빌드한 변형에서 64F 전부.
 - 실행 실패: `EXECUTION_FAILED`, 메모리 부족: `ALLOC_FAILED`.
 
 ## 시험 목록
