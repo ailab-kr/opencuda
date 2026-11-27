@@ -398,3 +398,12 @@ Apache License 2.0. [LICENSE](LICENSE)와 [NOTICE](NOTICE)를 본다.
 
 Apache-2.0에는 특허 사용 허가와 특허 소송 시 허가가 끝나는 조항이 명시되어 있어, 칩 회사와 그 법무팀이
 잘 알려진 조건으로 도입하고 기여할 수 있다.
+
+## 후원
+
+| 기관 | 지원 |
+|---|---|
+| [(사)한국인공지능연구소](https://ai-lab.kr) | 연구 지원 |
+| [(주)퀀텀아이](https://quantumai.kr) | 기술 지원 |
+| [H3Lab](https://h3lab.kr) | 하드웨어 지원 |
+| [메사쿠어컴퍼니](https://www.metsakuur.com/) | 서버 지원 |

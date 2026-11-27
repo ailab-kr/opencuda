@@ -419,3 +419,12 @@ Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 Apache-2.0 includes an explicit patent licence and patent-retaliation clause, so chip makers
 and their legal teams can adopt and contribute with a well-understood set of terms.
+
+## Supporters
+
+| Organization | Support |
+|---|---|
+| [Korea Artificial Intelligence Lab (사단법인 한국인공지능연구소)](https://ai-lab.kr) | Research |
+| [QuantumAI Inc. ((주)퀀텀아이)](https://quantumai.kr) | Engineering |
+| [H3Lab](https://h3lab.kr) | Hardware |
+| [Metsakuur Company (메사쿠어컴퍼니)](https://www.metsakuur.com/) | Servers |
