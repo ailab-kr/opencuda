@@ -1839,11 +1839,17 @@ static const char k_hgemm4_src[] =
     "        ushort8 a[4];\n"
     "        uint8 b[4];\n"
     "        intel_sub_group_2d_block_read_16b_32r16x1c((global void *)A, wA, M, pA, (int2)(k0, m0), (private ushort *)a);\n"
-    "        for (int j = 0; j < 4; ++j)\n"
     "#if TB\n"
-    "            intel_sub_group_2d_block_read_transpose_32b_16r8x1c((global void *)B, wB, hB, pB, (int2)(k0 / 2, n0 + 16 * j),\n"
-    "                                                                (private uint *)&b[j]);\n"
+    "        /* 32 rows per transposed read: lane l gets rows l and l + 16 interleaved (two B tiles) */\n"
+    "        for (int j = 0; j < 4; j += 2) {\n"
+    "            uint16 t;\n"
+    "            intel_sub_group_2d_block_read_transpose_32b_32r8x1c((global void *)B, wB, hB, pB, (int2)(k0 / 2, n0 + 16 * j),\n"
+    "                                                                (private uint *)&t);\n"
+    "            b[j] = t.even;\n"
+    "            b[j + 1] = t.odd;\n"
+    "        }\n"
     "#else\n"
+    "        for (int j = 0; j < 4; ++j)\n"
     "            intel_sub_group_2d_block_read_transform_16b_16r16x1c((global void *)B, wB, hB, pB, (int2)(n0 + 16 * j, k0),\n"
     "                                                                 (private uint *)&b[j]);\n"
     "#endif\n"
@@ -1885,6 +1891,80 @@ static const char k_hgemm4_src[] =
     "            }\n"
     "        }\n"
     "}\n"
+    "#if TB && defined(SWAP)\n"
+    "// TB=1, computed as C^T = B A^T: B ([N x K], the weights) is DPAS's A operand, read with plain 2D block\n"
+    "// reads; A is the B operand, one 32-row transposed read giving two 16-column tiles (lane l: rows l and\n"
+    "// l + 16 interleaved). A sub-group owns 64 n x 32 m; the 16 sub-groups of a work-group share the same\n"
+    "// 64 rows of B and cover 512 m, so for M <= 512 every B tile is read by one work-group only.\n"
+    "__attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(16 * SGM * SGN, 1, 1)))\n"
+    "kernel void ocu_hgemm4s(int M, int N, int K, float alpha, float beta,\n"
+    "                        global const ushort *A0, long lda, long sa,\n"
+    "                        global const ushort *B0, long ldb, long sb,\n"
+    "                        global void *C0v, long ldc, long sc, int S, int kc)\n"
+    "{\n"
+    "    const int sg = get_sub_group_id(), lane = get_sub_group_local_id();\n"
+    "    const int n0 = get_group_id(0) * 64 * SGN + (sg / SGM) * 64, m0 = get_group_id(1) * 32 * SGM + (sg % SGM) * 32;\n"
+    "    const long bz = get_group_id(2) / S;\n"
+    "    const int ks = (int)(get_group_id(2) % S);\n"
+    "    const int kbeg = ks * kc, kend = min(K, kbeg + kc);\n"
+    "    global const ushort *A = A0 + bz * sa;\n"
+    "    global const ushort *B = B0 + bz * sb;\n"
+    "#if OUT == 0\n"
+    "    global float *C = (global float *)C0v + (S > 1 ? (long)get_group_id(2) : bz) * sc;\n"
+    "#else\n"
+    "    global ushort *C = (global ushort *)C0v + bz * sc;\n"
+    "#endif\n"
+    "    const int w = kend * 2, pA = (int)lda * 2, pB = (int)ldb * 2;\n"
+    "    float8 acc[8][2];\n"
+    "    for (int i = 0; i < 8; ++i) { acc[i][0] = (float8)0.0f; acc[i][1] = (float8)0.0f; }\n"
+    "    for (int k0 = kbeg; k0 < kend; k0 += 16) {\n"
+    "        ushort8 a[8];\n"
+    "        intel_sub_group_2d_block_read_16b_32r16x1c((global void *)B, w, N, pB, (int2)(k0, n0), (private ushort *)&a[0]);\n"
+    "        intel_sub_group_2d_block_read_16b_32r16x1c((global void *)B, w, N, pB, (int2)(k0, n0 + 32), (private ushort *)&a[4]);\n"
+    "        uint16 t;\n"
+    "        intel_sub_group_2d_block_read_transpose_32b_32r8x1c((global void *)A, w, M, pA, (int2)(k0 / 2, m0), (private uint *)&t);\n"
+    "        const int8 b0 = as_int8(t.even), b1 = as_int8(t.odd);\n"
+    "        for (int i = 0; i < 8; ++i) {\n"
+    "            acc[i][0] = MAD(as_short8(a[i]), b0, acc[i][0]);\n"
+    "            acc[i][1] = MAD(as_short8(a[i]), b1, acc[i][1]);\n"
+    "        }\n"
+    "    }\n"
+    "    for (int j = 0; j < 2; ++j) {\n"
+    "        const int gm = m0 + 16 * j + lane;\n"
+    "        if (gm >= M) continue;\n"
+    "        for (int i = 0; i < 8; ++i) {\n"
+    "            const int n = n0 + 8 * i;\n"
+    "            const float v8[8] = {acc[i][j].s0, acc[i][j].s1, acc[i][j].s2, acc[i][j].s3,\n"
+    "                                 acc[i][j].s4, acc[i][j].s5, acc[i][j].s6, acc[i][j].s7};\n"
+    "#if OUT == 0\n"
+    "            if (beta == 0.0f && n + 8 <= N && ((ldc | n) & 3) == 0) {\n"
+    "                vstore8(alpha * acc[i][j], 0, C + (long)gm * ldc + n);\n"
+    "                continue;\n"
+    "            }\n"
+    "#endif\n"
+    "            for (int r = 0; r < 8; ++r) {\n"
+    "                const int gn = n + r;\n"
+    "                if (gn >= N) break;\n"
+    "                const long at = (long)gm * ldc + gn;\n"
+    "                float v = alpha * v8[r];\n"
+    "#if OUT == 0\n"
+    "                if (beta != 0.0f) v = fma(beta, C[at], v);\n"
+    "                C[at] = v;\n"
+    "#elif OUT == 1\n"
+    "                if (beta != 0.0f) v = fma(beta, vload_half(at, (global const half *)C), v);\n"
+    "                vstore_half_rte(v, at, (global half *)C);\n"
+    "#else\n"
+    "                if (beta != 0.0f) v = fma(beta, as_float((uint)C[at] << 16), v);\n"
+    "                uint u = as_uint(v);\n"
+    "                if ((u & 0x7f800000u) != 0x7f800000u) u += 0x7fffu + ((u >> 16) & 1u);\n"
+    "                else if (u & 0x007fffffu) u |= 0x00400000u;\n"
+    "                C[at] = (ushort)(u >> 16);\n"
+    "#endif\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "}\n"
+    "#endif\n"
 ;
 
 static const char k_nf4_src[] =
@@ -1979,7 +2059,7 @@ typedef struct ocu_op_plan {
 } ocl_gemm_plan;
 
 static pthread_mutex_t ops_lock = PTHREAD_MUTEX_INITIALIZER;
-typedef struct { ocu_device *dev; cl_kernel k[4]; cl_kernel kp[4]; cl_kernel kt[4][4][4][2]; cl_kernel reduce; int state; int xmx; cl_kernel hk[2][3][4][2]; cl_kernel hk4[2][3][3][2]; cl_kernel nf4; int blk; } ocl_ops_dev; /* state: 0 new, 1 ok, -1 no */
+typedef struct { ocu_device *dev; cl_kernel k[4]; cl_kernel kp[4]; cl_kernel kt[4][4][4][2]; cl_kernel reduce; int state; int xmx; cl_kernel hk[2][3][4][2]; cl_kernel hk4[2][3][4][2]; cl_kernel nf4; int blk; } ocl_ops_dev; /* state: 0 new, 1 ok, -1 no */
 static ocl_ops_dev ops_devs[16];
 
 static int ops_enabled(ocu_device *d)
@@ -2042,7 +2122,8 @@ static int xmx_enabled(ocu_device *d)
 
 /* The XMX kernel for (input type, output type, transposes), built on first use. ops_lock held. */
 /* The 2D-block-load XMX GEMM; cfg 0: 256 x 256 tiles, 1: 128 x 256, 2: 256 x 64 (short M: every
-   work-group covers all of M, so B -- the weights, usually -- is read once). */
+   work-group covers all of M, so B -- the weights, usually -- is read once); 3 (TB only): the swapped
+   kernel ocu_hgemm4s, 512 x 64 tiles. */
 static cl_kernel hgemm4_kernel(ocu_device *d, ocl_ops_dev *o, int bf, int out, int cfg, int tb)
 {
     if (o->hk4[bf][out][cfg][tb] != NULL) return o->hk4[bf][out][cfg][tb];
@@ -2059,10 +2140,13 @@ static cl_kernel hgemm4_kernel(ocu_device *d, ocl_ops_dev *o, int bf, int out, i
     cl_program prog = a->CreateProgramWithSource(d->ctx, 1, &src, NULL, &err);
     if (prog == NULL) return NULL;
     char opts[256];
-    snprintf(opts, sizeof opts, "-cl-std=CL3.0 -DBF16=%d -DOUT=%d -DSGM=%d -DSGN=%d -DTB=%d -cl-intel-256-GRF-per-thread",
-             bf, out, cfg == 1 ? 4 : 8, cfg == 2 ? 1 : 4, tb);
+    if (cfg == 3)
+        snprintf(opts, sizeof opts, "-cl-std=CL3.0 -DBF16=%d -DOUT=%d -DSGM=16 -DSGN=1 -DTB=1 -DSWAP=1 -cl-intel-256-GRF-per-thread", bf, out);
+    else
+        snprintf(opts, sizeof opts, "-cl-std=CL3.0 -DBF16=%d -DOUT=%d -DSGM=%d -DSGN=%d -DTB=%d -cl-intel-256-GRF-per-thread",
+                 bf, out, cfg == 1 ? 4 : 8, cfg == 2 ? 1 : 4, tb);
     err = a->BuildProgram(prog, 1, &d->entry->device, opts, NULL, NULL);
-    cl_kernel k = err == CL_SUCCESS ? a->CreateKernel(prog, "ocu_hgemm4", &err) : NULL;
+    cl_kernel k = err == CL_SUCCESS ? a->CreateKernel(prog, cfg == 3 ? "ocu_hgemm4s" : "ocu_hgemm4", &err) : NULL;
     a->ReleaseProgram(prog);
     if (k == NULL) {
         if (verbose()) fprintf(stderr, "ocu opencl: the 2D-block XMX GEMM does not build here (%d)\n", (int)err);
@@ -2336,9 +2420,19 @@ static ocu_status ops_plan(ocu_device *dev, const ocu_op_desc *d, ocu_op_plan **
             /* Short M: 256 x 64 tiles read B once, but only pay when there are enough of them. */
             const long tall = (long)((pl->M + 255) / 256) * ((pl->N + 63) / 64) * pl->batch;
             if (pl->M <= 512 && tall >= 32 && getenv("OCU_OPENCL_NO_TALL") == NULL) cfg = 2;
+            /* B transposed (weights [N x K]: a Linear layer's forward) with M >= 256 and enough 512 x 64 tiles:
+               the swapped kernel (Arc B70, M 512, K 5120: N 17408 1.32 -> 0.87 ms, N 12288 0.92 -> 0.57 ms). */
+            const long tsw = (long)((pl->M + 511) / 512) * ((pl->N + 63) / 64) * pl->batch;
+            if (tb == 1 && pl->M >= 256 && tsw >= 48 && getenv("OCU_OPENCL_NO_SWAP") == NULL) cfg = 3;
             pl->k4 = hgemm4_kernel(dev, o, p.in == OCU_DT_BF16, p.out == OCU_DT_F32 ? 0 : p.out == OCU_DT_F16 ? 1 : 2, cfg, tb);
-            pl->sgm4 = cfg == 1 ? 4 : 8;
-            pl->sgn4 = cfg == 2 ? 1 : 4;
+            if (pl->k4 == NULL && cfg == 3) {   /* the swapped kernel does not build here: the 2D kernel */
+                cfg = pl->M <= 512 && tall >= 32 && getenv("OCU_OPENCL_NO_TALL") == NULL ? 2 : big >= 64 ? 0 : 1;
+                o->blk = 1;
+                pl->k4 = hgemm4_kernel(dev, o, p.in == OCU_DT_BF16, p.out == OCU_DT_F32 ? 0 : p.out == OCU_DT_F16 ? 1 : 2, cfg, tb);
+            }
+            /* sub-group grid (the work-group covers 32 sgm4 rows x 64 sgn4 columns) */
+            pl->sgm4 = cfg == 3 ? 16 : cfg == 1 ? 4 : 8;
+            pl->sgn4 = cfg == 2 || cfg == 3 ? 1 : 4;
         }
         pthread_mutex_unlock(&ops_lock);
         if (pl->k == NULL) { free(pl); return OCU_ERR_NOT_SUPPORTED; }
@@ -2378,6 +2472,9 @@ static ocu_status ops_plan(ocu_device *dev, const ocu_op_desc *d, ocu_op_plan **
         /* A very long K (a vocabulary: the LM head in the backward pass) with a few hundred tiles: each
            work-group would walk the whole K. Slices of 16K or more, at most 8. */
         if (S == 1 && pl->K >= 32768 && t4 < 1024) { S = (int)((pl->K + 16383) / 16384); if (S > 8) S = 8; }
+        /* A long K (8K to 32K: the down projection's input gradient, M 512 x N 5120 x K 17408) with a few
+           hundred tiles: slices of about 4K, at most 4 (measured on Arc B70: 53 -> 79 TFLOPS). */
+        else if (S == 1 && pl->K >= 8192 && t4 < 1024) { S = (int)((pl->K + 4095) / 4096); if (S > 4) S = 4; }
         if (S > pl->K / 1024) S = pl->K / 1024;
         { const char *fs = getenv("OCU_OPENCL_SPLIT4"); if (fs != NULL) S = atoi(fs); }
         if (S > 1) {
