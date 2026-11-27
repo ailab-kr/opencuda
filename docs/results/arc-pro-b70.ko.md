@@ -26,22 +26,38 @@ GPU는 다른 작업과 함께 쓰는 장비라, 측정은 모두 GPU에 다른 
 
 실행 전체에 실행을 시작할 때의 OpenCuda 툴킷(커밋 4f9930a)을 썼다. 모든 프로그램을 한 툴킷으로 재기 위해서다.
 
-**중간 결과, 570개 중 277개(실행은 아직 도는 중):**
+**중간 결과, 570개 중 356개(실행은 아직 도는 중):**
 
 | 상태 | OpenCuda | chipStar 1.3.0 |
 |---|---|---|
-| pass | 104 | 80 |
-| ran | 53 | 50 |
-| fail | 10 | 5 |
-| crash | 13 | 8 |
-| timeout | 12 | 12 |
-| build_fail | 62 | 104 |
-| no_data | 23 | 18 |
+| pass | 127 | 96 |
+| ran | 72 | 67 |
+| fail | 10 | 6 |
+| crash | 22 | 13 |
+| timeout | 14 | 14 |
+| build_fail | 83 | 137 |
+| no_data | 28 | 23 |
 
-- 끝까지 도는 프로그램(pass 또는 ran): OpenCuda 157, chipStar 130. 둘 다 117, OpenCuda만 40, chipStar만 13.
-- 둘 다 끝까지 도는 프로그램의 속도(0.05초 넘는 115개): chipStar 시간 / OpenCuda 시간의 기하평균 1.00. OpenCuda가 10% 넘게 빠른 것 30, 10% 넘게 느린 것 44, 10% 안 41.
-- chipStar만 끝낸 13개 중 넷은 이 글을 쓰는 시점의 툴킷(이 실행이 쓰는 것보다 나중)이 같은 GPU에서 고친 것을 확인했다: axpby-cuda(FAIL → PASS, 드라이버의 2 KB 한도를 넘는 커널 인자), cmembench-cuda(FAIL → PASS, `cudaMemcpyToSymbol`), intrinsics-cast-cuda(빌드 실패 → 실행, 변환 내장 함수), ert-cuda(빌드됨, `__half2` 연산자). 그 밖에 collision-cuda(crash → 실행), convolution1D-cuda(crash → chipStar처럼 180초 시간 초과): 둘 다 기호 복사.
+- 끝까지 도는 프로그램(pass 또는 ran): OpenCuda 199, chipStar 163. 둘 다 148, OpenCuda만 51, chipStar만 15.
+- 둘 다 끝까지 도는 프로그램의 속도(0.05초 넘는 146개): chipStar 시간 / OpenCuda 시간의 기하평균 0.98. OpenCuda가 10% 넘게 빠른 것 38, 10% 넘게 느린 것 55, 10% 안 53.
 
+### 나중 커밋으로 고친 프로그램
+
+실행은 모든 프로그램을 시작 때의 툴킷으로 잰다. 이 브랜치의 나중 커밋을 같은 GPU, 같은 `make run`(잰 실행 한 번)으로 확인한 결과:
+
+| 프로그램 | 실행에서(OpenCuda / chipStar) | 지금 툴킷 | 없던 것 |
+|---|---|---|---|
+| axpby-cuda | fail / pass | **pass**(39.6초, chipStar 33.8초) | 드라이버의 2KB 한도를 넘는 커널 인자 |
+| cmembench-cuda | fail / pass | **pass** | SPIR-V 경로의 `cudaMemcpyToSymbol` |
+| collision-cuda | crash / build_fail | 실행 | 호스트에서 쓰는 장치 변수 |
+| intrinsics-cast-cuda | build_fail / ran | 실행 | 변환 내장 함수 |
+| mcmd-cuda | build_fail / ran | 실행 | double `erf`·`erfc` |
+| asyncAllocation-cuda | build_fail / build_fail | **pass**(cudaMallocAsync 215ms, cudaMalloc 1592ms) | 스트림 순서 할당 |
+| ccsd-trpdrv-cuda | build_fail / build_fail | **pass** | 헤더 없이 쓰는 `std::chrono` |
+| relu-cuda, mlp-cuda, streamOrderedAllocation-cuda, streamUM-cuda, moe-cuda | 아직 안 돎(이전 툴킷 빌드 점검에서 실패) | **pass** | `__half2` 비교, cuBLASLt, 메모리 풀, `cublasDgemv`, `cub::KeyValuePair` |
+| qkv-cuda, rayleighBenardConvection-cuda | 아직 안 돎 | 실행 | cuBLASLt 에필로그, `cublasScopy` |
+
+colorwheel-cuda는 여전히 실패한다(반복 100회. 1회는 통과).
 OpenCuda가 빌드하지 못하는 주된 이유는 아직 없는 라이브러리(Thrust, cuSPARSE, cuSOLVER, cuRAND, cuFFT, NCCL/MPI)와 인라인 PTX 어셈블리다. 프로그램마다 첫 오류는 실행 기록에 있다.
 
 ## llama.cpp
@@ -50,19 +66,19 @@ OpenCuda가 빌드하지 못하는 주된 이유는 아직 없는 라이브러�
 
 | | pp512 (t/s) | tg128 (t/s) |
 |---|---|---|
-| OpenCuda, 이 브랜치 | 11,223 / 11,649 | 243.3 / 245.8 |
+| OpenCuda, 이 브랜치 | 11,521 / 11,555 | 245.4 / 244.6 |
 | llama.cpp SYCL 백엔드(기준, 2026-11-27 같은 기계에서 잼) | 25,964 | 403 |
 
-같은 빌드의 `test-backend-ops -b CUDA0`: SOFT_MAX 215/215, RMS_NORM 121/121, MUL_MAT 2724/2724, GET_ROWS 228/228, CPY 286/286, ROPE 514/514, ADD 173/173, MUL 143/143, SUM_ROWS 11/11, ARGMAX 7/7, 머리 크기 128의 FLASH_ATTN_EXT 859/859. FlashAttention은 상류에 제안한 수정(llvm/llvm-project#246644, `compiler/spirv/clang-hipspv-kernel-address.patch`)을 넣은 Clang으로 빌드된다. FLASH_ATTN_EXT 전체로는 IGC 2.41에서 4178/4370이 통과하고, 나머지 192개는 IGC 2.41의 자동 큰 레지스터 파일 모드 문제로 좁혀졌다(IGC 2.42로 확인한 경우는 맞게 컴파일된다. 스레드당 레지스터 256개로 강제하면 여전히 일부가 비결정적으로 틀린다).
+같은 빌드의 `test-backend-ops -b CUDA0`: SOFT_MAX 215/215, RMS_NORM 121/121, MUL_MAT 2724/2724, GET_ROWS 228/228, CPY 286/286, ROPE 514/514, ADD 173/173, MUL 143/143, SUM_ROWS 11/11, SUM 10/10, ARGMAX 7/7, ARGSORT 98/98, 머리 크기 128의 FLASH_ATTN_EXT 859/859. FlashAttention은 상류에 제안한 수정(llvm/llvm-project#246644, `compiler/spirv/clang-hipspv-kernel-address.patch`)을 넣은 Clang으로 빌드된다. FLASH_ATTN_EXT 전체로는 IGC 2.41에서 4178/4370이 통과하고, 나머지 192개는 IGC 2.41의 자동 큰 레지스터 파일 모드 문제로 좁혀졌다(IGC 2.42로 확인한 경우는 맞게 컴파일된다. 스레드당 레지스터 256개로 강제하면 여전히 일부가 비결정적으로 틀린다).
 
 ## GPU에서의 실행 라이브러리·라이브러리 시험
 
-OpenCuda용으로 쓴 시험을 B70에서(SPIR-V 경로): 기호 복사(`rt_symbols` 32/32), 통합 메모리(`rt_managed` 45/45), 커널이 직접 쓰는 고정 호스트 메모리(`rt_pinned_mapped` 21/21), 메모리 API(`rt_mem` 49/49), 짧은 마지막 워프를 포함한 워프 셔플·투표(`rt_warp_lang` 346/346), `__half2` 비교(`rt_half2_cmp` 7073/7073), 변환·수학 내장 함수(`rt_math_ext_gpu` 71/71), 큰 커널 인자(`rt_big_args` 8/8), cuBLAS 정확도(`cublas_accuracy` 1959/1959, int8 GEMM 정확). CPU 경로 묶음(`ctest`) 197/197.
+OpenCuda용으로 쓴 시험을 B70에서(SPIR-V 경로): 기호 복사(`rt_symbols` 32/32), 통합 메모리(`rt_managed` 45/45), 커널이 직접 쓰는 고정 호스트 메모리(`rt_pinned_mapped` 21/21), 메모리 API(`rt_mem` 49/49), 짧은 마지막 워프를 포함한 워프 셔플·투표(`rt_warp_lang` 346/346), `__half2` 비교(`rt_half2_cmp` 7073/7073), 변환·수학 내장 함수(`rt_math_ext_gpu` 71/71), double erf·erfc(`rt_erf_gpu`: 최대 0.58·3.25ulp, 문서 한도 2·5), 큰 커널 인자(`rt_big_args` 8/8), 메모리 풀(`rt_mempool` 275/275), CUB 쌍·반복자(`rt_cub_kvp` 120/120, `rt_cub_iter` 13/13), cuBLAS 정확도(`cublas_accuracy` 1959/1959, int8 GEMM 정확), cuBLASLt(`cublaslt_matmul` 101/101), cuBLAS 1·2단계(`cublas_level1` 301/301). CPU 경로 묶음(`ctest`) 207/207.
 
 ## 알려진 한계
 
 - 커널이 호스트가 고정 메모리에 쓰는 깃발을 기다리면 그 쓰기를 못 볼 수 있다(시험에서 한 프로세스에 한 번은 보였지만 믿을 만하지 않다). 호스트 메모리로 실행 중인 커널과 일을 주고받는 프로그램은 이 경로에서 멈출 수 있다.
-- 번역 단위 사이에 나누는 장치 변수(재배치 가능 장치 코드, `-rdc`)는 파일마다 따로다(HeCBench egs-cuda가 멈춤).
+- 재배치 가능 장치 코드(`-dc`·`-rdc`: 파일 사이에 나누는 장치 함수·변수)는 이 경로에서 링크하지 않는다(HeCBench egs-cuda, fresnel-cuda. HeCBench 11개가 이렇게 빌드).
 - Thrust, cuSPARSE, cuSOLVER, cuRAND, cuFFT, CUDA 그래프, 인라인 PTX는 없다.
 - llama.cpp 토큰 생성은 SYCL 백엔드의 약 60%다. SYCL은 Intel 전용 가중치 배치를 쓰고, CUDA 호환 층은 그것을 재현하지 않는다.
 - 시험은 코드와 같은 사람(과 AI 세션)이 썼다. 독립적인 검토를 환영한다.
