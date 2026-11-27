@@ -493,6 +493,14 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   target_compile_options(test_device_mathf PRIVATE -O2 -ffp-contract=off)
   target_link_libraries(test_device_mathf PRIVATE Threads::Threads m)
   add_test(NAME device_mathf COMMAND test_device_mathf)
+  # ocu_device_math_ext.h: exact functions and rounding modes bit for bit
+  # against the C library / the host FPU (fesetround), the rest against long
+  # double (OCU_MATH_EXT_FULL=1: every positive float for __frsqrt_rn).
+  add_executable(test_device_math_ext runtime/test_device_math_ext.cpp)
+  target_include_directories(test_device_math_ext PRIVATE ${PROJECT_SOURCE_DIR}/runtime/include)
+  target_compile_options(test_device_math_ext PRIVATE -O2 -frounding-math -ffp-contract=off)
+  target_link_libraries(test_device_math_ext PRIVATE Threads::Threads m)
+  add_test(NAME device_math_ext COMMAND test_device_math_ext)
 
   # The installed package works for a project outside this tree, built
   # with the same compilers and flags (sanitizers included). Not when
