@@ -94,7 +94,9 @@ struct ocu_kernel {
     int                indirect;     /* 1: Intel indirect-access flags set (no SVM list), -1: not available */
     bool               direct;       /* compiled SPIR-V: one OpenCL argument per CUDA parameter */
     bool               dyn;          /* direct: one more argument, the launch's dynamic shared memory */
-    char              *ptr_param;    /* direct: per parameter, 1 = global pointer (set as SVM pointer) */
+    char              *ptr_param;    /* direct: per parameter, 1 = global pointer (set as SVM pointer),
+                                        2 = a value passed in a buffer ("b<size>": larger than the
+                                        driver's kernel argument limit) */
     pthread_mutex_t    lock;         /* argument setting + enqueue is one step */
     struct ocu_kernel *next;
     /* Register file chosen by measurement (module grf_split, a kernel that
@@ -1147,8 +1149,8 @@ static void parse_sparams(struct ocu_kernel *k, const char *meta)
             if (strncmp(p, "dyn", 3) == 0) { k->dyn = true; p += 3; continue; }
             /* the module's variables block is one more parameter, after "dyn" */
             if (strncmp(p, "glob", 4) == 0) { k->takes_glob = true; p += 4; continue; }
-            if (*p != 'p' && *p != 'v') break;
-            ptr[n] = *p == 'p';
+            if (*p != 'p' && *p != 'v' && *p != 'b') break;
+            ptr[n] = *p == 'p' ? 1 : (*p == 'b' ? 2 : 0);
             char *end;
             sizes[n] = strtoul(p + 1, &end, 10);
             p = end;
@@ -1474,9 +1476,91 @@ static ocu_status finish_launch(ocu_queue *queue, ocu_queue *q, ocu_kernel *k, c
     return st;
 }
 
+/* A by-value argument larger than the driver takes (cu2spv's "b<size>": the
+   kernel copies it from a global pointer): the bytes go to a new SVM buffer
+   by a copy queued before the kernel, from a host copy freed when that copy
+   completes, so the launch stays asynchronous and the caller may reuse its
+   argument storage at once. The buffer is freed by clEnqueueSVMFree queued
+   after the kernel. Without event callbacks or queued frees the copy is
+   synchronous and the buffer freed after the kernel finishes. */
+static void free_staging_cb(cl_event e, cl_int status, void *host)
+{
+    (void)e;
+    (void)status;
+    free(host);
+}
+
+static bool stage_sync(void)
+{
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("OCU_OPENCL_STAGE_SYNC"); v = e != NULL && *e == '1'; }
+    return v == 1;
+}
+
+/* clEnqueueSVMFree's free function: the pointer list is our own heap copy
+   (the driver may read it when the command runs) */
+typedef struct staged_free { cl_context ctx; uint32_t n; void *ptrs[]; } staged_free;
+static void staged_free_cb(cl_command_queue q, cl_uint n, void *ptrs[], void *user)
+{
+    (void)q;
+    staged_free *s = user;
+    const ocl_api *a = ocl_load();
+    for (cl_uint i = 0; i < n; ++i) a->SVMFree(s->ctx, ptrs[i]);
+    free(s);
+}
+
+static cl_int stage_value(ocu_queue *queue, ocu_device *d, const void *value, size_t bytes, void **out)
+{
+    const ocl_api *a = ocl_load();
+    void *buf = a->SVMAlloc(d->ctx, CL_MEM_READ_WRITE, bytes < 16 ? 16 : bytes, 0);
+    if (buf == NULL) return -4; /* CL_MEM_OBJECT_ALLOCATION_FAILURE */
+    bool async = a->SetEventCallback != NULL && a->EnqueueSVMFree != NULL && !stage_sync();
+    void *host = async ? malloc(bytes) : NULL;
+    if (async && host == NULL) async = false;
+    cl_event ev = NULL;
+    cl_int err;
+    if (async) {
+        memcpy(host, value, bytes);
+        err = a->EnqueueSVMMemcpy(queue->q, CL_FALSE, buf, host, bytes, 0, NULL, &ev);
+        if (err == CL_SUCCESS) err = a->SetEventCallback(ev, CL_COMPLETE, free_staging_cb, host);
+        else free(host);
+        if (ev != NULL) a->ReleaseEvent(ev);
+    } else {
+        err = a->EnqueueSVMMemcpy(queue->q, CL_TRUE, buf, value, bytes, 0, NULL, NULL);
+    }
+    if (err != CL_SUCCESS) {
+        a->SVMFree(d->ctx, buf);
+        return err;
+    }
+    *out = buf;
+    return CL_SUCCESS;
+}
+
+static void unstage_values(ocu_queue *queue, ocu_device *d, void **bufs, uint32_t n, bool launched)
+{
+    if (n == 0) return;
+    const ocl_api *a = ocl_load();
+    if (launched && a->EnqueueSVMFree != NULL && !stage_sync()) {
+        staged_free *s = malloc(sizeof(staged_free) + n * sizeof(void *));
+        if (s != NULL) {
+            s->ctx = d->ctx;
+            s->n = n;
+            memcpy(s->ptrs, bufs, n * sizeof(void *));
+            if (a->EnqueueSVMFree(queue->q, n, s->ptrs, staged_free_cb, s, 0, NULL, NULL) == CL_SUCCESS) {
+                a->Flush(queue->q);
+                return;
+            }
+            free(s);
+        }
+    }
+    if (launched) a->Finish(queue->q);
+    for (uint32_t i = 0; i < n; ++i) a->SVMFree(d->ctx, bufs[i]);
+}
+
 /* Compiled SPIR-V: each CUDA parameter is an OpenCL kernel argument; global
-   pointers go as SVM pointers, everything else by value; the launch's dynamic
-   shared memory is one more (local) argument. */
+   pointers go as SVM pointers, everything else by value (or in a buffer, see
+   stage_value); the launch's dynamic shared memory is one more (local)
+   argument. */
 static ocu_status launch_direct(ocu_queue *queue, ocu_queue *q, ocu_kernel *k, const ocu_launch_params *p)
 {
     ocu_device *d = k->module->dev;
@@ -1488,11 +1572,17 @@ static ocu_status launch_direct(ocu_queue *queue, ocu_queue *q, ocu_kernel *k, c
     size_t dyn = (p->shared_memory_bytes + 15) / 16 * 16;
     cl_event ev = NULL;
     cl_int err = CL_SUCCESS;
+    void *staged[8];
+    uint32_t nstaged = 0;
     pthread_mutex_lock(&k->lock);
     tune_before(k);
     HP_B(HP_ARGS);
     for (uint32_t i = 0; i < p->num_args && err == CL_SUCCESS; ++i) {
-        if (k->ptr_param[i]) {
+        if (k->ptr_param[i] == 2) {
+            if (nstaged == sizeof staged / sizeof staged[0]) { err = -51; break; } /* CL_INVALID_ARG_SIZE */
+            err = stage_value(queue, d, p->args[i], k->param_sizes[i], &staged[nstaged]);
+            if (err == CL_SUCCESS) err = a->SetKernelArgSVMPointer(k->k, i, staged[nstaged++]);
+        } else if (k->ptr_param[i]) {
             void *ptr = NULL;
             memcpy(&ptr, p->args[i], sizeof ptr);
             err = a->SetKernelArgSVMPointer(k->k, i, ptr);
@@ -1510,6 +1600,7 @@ static ocu_status launch_direct(ocu_queue *queue, ocu_queue *q, ocu_kernel *k, c
     tune_after(k, err, ev, global);
     HP_E(HP_ENQ);
     pthread_mutex_unlock(&k->lock);
+    unstage_values(queue, d, staged, nstaged, err == CL_SUCCESS);
     HP_B(HP_FIN);
     ocu_status fst = finish_launch(queue, q, k, err, ev);
     HP_E(HP_FIN);

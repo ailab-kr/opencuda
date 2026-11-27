@@ -450,6 +450,182 @@ def globals_to_block(ll: str, meta: list[str]) -> tuple[str, list[str]]:
     return out, new_meta
 
 
+def split_params(s: str) -> list[str]:
+    """The parameters of a define line's parameter list, split at top-level commas."""
+    out, depth, cur = [], 0, ""
+    for ch in s:
+        if ch in "([{<":
+            depth += 1
+        elif ch in ")]}>":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        out.append(cur.strip())
+    return out
+
+
+# OpenCL drivers take at most CL_DEVICE_MAX_PARAMETER_SIZE bytes of kernel
+# arguments (2048 on an Arc Pro B70, the least the OpenCL 3.0 specification
+# allows for a GPU is 1024), CUDA up to 32764 (4096 before 12.1): PyTorch's
+# and Apex's multi_tensor_apply pass a ~3 KB struct of tensor addresses.
+ARG_LIMIT = int(os.environ.get("OCU_SPV_ARG_LIMIT", "1024"))
+
+
+def byval_buffers(ll: str, meta: list[str]) -> tuple[str, list[str]]:
+    """A kernel whose by-value arguments total more than ARG_LIMIT bytes gets
+    its largest byval parameters as global pointers instead ("b<size>" in the
+    sparam line): the backend puts the bytes in a buffer for the launch, and
+    the kernel copies them into a private copy at entry, which the body uses
+    as it used the byval pointer (the same meaning: a copy of the argument)."""
+    lines = ll.split("\n")
+    sp = {l.split()[1]: i for i, l in enumerate(meta) if l.startswith("sparam ")}
+    need_memcpy = False
+    i = 0
+    while i < len(lines):
+        m = re.match(r'^define .*?spir_kernel .*?@("[^"]+"|[\w.$]+)\(', lines[i])
+        if not m or m.group(1).strip('"') not in sp:
+            i += 1
+            continue
+        name = m.group(1).strip('"')
+        mi = sp[name]
+        toks = meta[mi].split()[2:]
+        vals = [t for t in toks if t[:1] in "pv" and t[1:].isdigit()]
+        total = sum(int(t[1:]) for t in vals if t[0] == "v") + 8 * sum(1 for t in vals if t[0] == "p")
+        head = lines[i]
+        lo = m.end(0)  # just past the "(" of the parameter list
+        depth, hi = 1, lo
+        while depth:
+            depth += {"(": 1, ")": -1}.get(head[hi], 0)
+            hi += 1
+        hi -= 1
+        params = split_params(head[lo:hi])
+        if total <= ARG_LIMIT or len(params) < len(vals):
+            i += 1
+            continue
+        # byval parameters, largest first, until the rest fits
+        cands = sorted([(int(vals[j][1:]), j) for j in range(len(vals))
+                        if vals[j][0] == "v" and " byval(" in params[j]], reverse=True)
+        moved = []
+        for size, j in cands:
+            if total <= ARG_LIMIT:
+                break
+            moved.append((j, size))
+            total -= size - 8
+        if not moved:
+            i += 1
+            continue
+        end = i
+        while not lines[end].startswith("}"):
+            end += 1
+        entry = []
+        body = "\n".join(lines[i + 1:end])
+        for j, size in moved:
+            pm = re.search(r"(%[\w.$\"-]+)\s*$", params[j])
+            am = re.search(r"\balign (\d+)", params[j])
+            if not pm:
+                break
+            pname, align = pm.group(1), am.group(1) if am else "8"
+            copy = f"%ocu_bv.{j}"
+            # noalias readonly: memory nothing else writes during the kernel, so
+            # instcombine replaces the copy with the buffer itself when the body
+            # only reads it (as for AMDGPU's byval kernel arguments)
+            params[j] = f"ptr addrspace(1) noalias noundef readonly align {align} {pname}"
+            body = re.sub(re.escape(pname) + r"(?![\w.$])", copy, body)
+            entry.append(f"  {copy} = alloca [{size} x i8], align {align}")
+            entry.append(f"  call void @llvm.memcpy.p0.p1.i64(ptr align {align} {copy}, ptr addrspace(1) align {align} {pname}, i64 {size}, i1 false)")
+        else:
+            lines[i] = head[:lo] + ", ".join(params) + head[hi:]
+            blines = body.split("\n")
+            if blines and LABEL.match(blines[0]):
+                blines = blines[:1] + entry + blines[1:]
+            else:
+                blines = entry + blines
+            lines[i + 1:end] = blines
+            need_memcpy = True
+            moved_idx = {j for j, _ in moved}
+            k = 0
+            new_toks = []
+            for t in toks:
+                if t[:1] in "pv" and t[1:].isdigit():
+                    new_toks.append("b" + t[1:] if k in moved_idx else t)
+                    k += 1
+                else:
+                    new_toks.append(t)
+            meta[mi] = " ".join(meta[mi].split()[:2] + new_toks)
+            i = i + 1 + len(blines)
+            continue
+        i += 1
+    out = "\n".join(lines)
+    if need_memcpy and not re.search(r"^declare .*@llvm\.memcpy\.p0\.p1\.i64\(", out, re.M):
+        out += "\ndeclare void @llvm.memcpy.p0.p1.i64(ptr noalias writeonly, ptr addrspace(1) noalias readonly, i64, i1 immarg)\n"
+    return out, meta
+
+
+def byval_direct(ll: str) -> str:
+    """After opt: where a by-buffer argument's private copy (%ocu_bv.N, see
+    byval_buffers) is only addressed (getelementptr) and read (load,
+    addrspacecast, ptrtoint), the body reads the buffer itself instead: the
+    copy goes and the pointers derived from it become global pointers. A
+    per-work-item copy of a 3 KB argument made each of HeCBench axpby-cuda's
+    ~13,000 launches (320 blocks x 512 work-items) move ~0.5 GB. Any other
+    use (a phi, select, call, compare or store of the pointer) keeps the
+    copy, which is correct."""
+    if "%ocu_bv." not in ll:
+        return ll
+    parts = re.split(r"(?=^define )", ll, flags=re.M)
+    for n, f in enumerate(parts):
+        if not f.startswith("define ") or "%ocu_bv." not in f:
+            continue
+        lines = f.split("\n")
+        for copy in sorted(set(re.findall(r"(%ocu_bv\.\d+) = alloca ", f))):
+            mc = [i for i, l in enumerate(lines) if "@llvm.memcpy.p0.p1.i64(" in l and re.search(re.escape(copy) + r",", l)]
+            if len(mc) != 1:
+                continue
+            src = re.search(r"ptr addrspace\(1\)[^%]*(%[\w.$\"-]+), i64", lines[mc[0]])
+            if not src:
+                continue
+            arg = src.group(1)
+            ok, S, changed = True, {copy}, True
+            new = list(lines)
+            drop = {mc[0]} | {i for i, l in enumerate(lines) if re.match(r"\s*" + re.escape(copy) + r" = alloca ", l)}
+            drop |= {i for i, l in enumerate(lines) if "@llvm.lifetime." in l and re.search(re.escape(copy) + r"\)", l)}
+            while changed and ok:
+                changed = False
+                for i, l in enumerate(new):
+                    if i in drop or i == 0:
+                        continue
+                    for name in list(S):
+                        tok = re.escape(name) + r"(?![\w.$])"
+                        am = re.match(r"\s*%[\w.$\"-]+ = ", l)
+                        if not re.search(tok, l[am.end():] if am else l):
+                            continue  # not used here (at most defined)
+                        if re.search(r"ptr addrspace\(1\) " + tok, l) and not re.search(r"ptr " + tok, l):
+                            continue  # done already
+                        g = re.match(r"\s*(%[\w.$\"-]+) = getelementptr (?:[\w()]+ )*?[^,]+, ptr " + tok + r"(,|\s*$)", l)
+                        if g:
+                            new[i] = re.sub(r"ptr " + tok, "ptr addrspace(1) " + name, l, count=1)
+                            S.add(g.group(1))
+                            changed = True
+                        elif re.match(r"\s*%[\w.$\"-]+ = (load (?:atomic )?(?:volatile )?[^,]+, ptr " + tok + r"|addrspacecast ptr " + tok + r" to |ptrtoint ptr " + tok + r" to )", l):
+                            new[i] = re.sub(r"ptr " + tok, "ptr addrspace(1) " + name, l, count=1)
+                            changed = True
+                        else:
+                            ok = False
+                            break
+                    if not ok:
+                        break
+            if not ok:
+                continue
+            body = "\n".join(x for i, x in enumerate(new) if i not in drop)
+            lines = re.sub(re.escape(copy) + r"(?![\w.$])", arg, body).split("\n")
+        parts[n] = "\n".join(lines)
+    return "".join(parts)
+
+
 GLOBAL_P2I = re.compile(r"^\s*(%[\w.]+) = ptrtoint ptr addrspace\(1\) (%[\w.]+) to i64$", re.M)
 GENERIC_I2P = re.compile(r"^\s*(%[\w.]+) = inttoptr i64 (%[\w.]+) to ptr addrspace\(4\)$", re.M)
 
@@ -660,6 +836,7 @@ def main(argv):
         if not meta:
             Path(a.o).write_bytes(b"OCUSPV1\n---\n")
             return 0
+        text, meta = byval_buffers(text, meta)
         infer = os.environ.get("OCU_SPV_INFER", "1") != "0"
         if infer:
             text = global_pointers(text)
@@ -686,7 +863,7 @@ def main(argv):
             r = subprocess.run([opt, "-passes=always-inline,infer-address-spaces,instcombine<no-verify-fixpoint>,simplifycfg", "-S", str(ll2), "-o", str(ll3)],
                                capture_output=True, text=True)
             if r.returncode == 0:
-                ll3.write_text(legalize_intrinsics(ll3.read_text()))
+                ll3.write_text(legalize_intrinsics(byval_direct(ll3.read_text())))
                 r = subprocess.run([llvm_as, str(ll3), "-o", str(bc)], capture_output=True, text=True)
         else:
             r = subprocess.run([llvm_as, str(ll2), "-o", str(bc)], capture_output=True, text=True)

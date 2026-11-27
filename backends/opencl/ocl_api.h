@@ -167,6 +167,12 @@ typedef struct ocl_api {
     cl_program (*CreateProgramWithIL)(cl_context, const void *, size_t, cl_int *);
     /* OpenCL 1.2; NULL when the library does not have it */
     void *(*GetExtensionFunctionAddressForPlatform)(cl_platform_id, const char *);
+    /* OpenCL 1.1 / 2.0; NULL when the library does not have them (by-buffer
+       kernel arguments then copy synchronously) */
+    cl_int (*SetEventCallback)(cl_event, cl_int, void (*)(cl_event, cl_int, void *), void *);
+    cl_int (*EnqueueSVMFree)(cl_command_queue, cl_uint, void *[],
+                             void (*)(cl_command_queue, cl_uint, void *[], void *), void *, cl_uint,
+                             const cl_event *, cl_event *);
 } ocl_api;
 
 /* cl_intel_unified_shared_memory (Khronos extension registry) */
