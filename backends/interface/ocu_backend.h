@@ -68,6 +68,10 @@ typedef struct ocu_dev_info {
        Programs size grids by it (llama.cpp's FlashAttention KV split,
        stream-k matrix products). */
     uint32_t multiprocessor_count;
+    /* 1: memory from host_alloc_pinned is device memory too, at the same
+       address (kernels read and write it directly, as CUDA's mapped
+       page-locked memory); 0: copies only. */
+    uint32_t pinned_is_mapped;
 } ocu_dev_info;
 
 typedef enum ocu_copy_dir {

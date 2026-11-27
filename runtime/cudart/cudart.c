@@ -911,7 +911,10 @@ cudaError_t cudaHostGetDevicePointer(void **dptr, void *hptr, unsigned int flags
     ocu_dev_info info;
     ocu_status st = g_backend->dev_info((uint32_t)tl_device, &info);
     if (st != OCU_OK) return from(st);
-    if (!info.supports_unified_memory) return set_error(cudaErrorNotSupported);
+    /* page-locked memory from cudaMallocHost / cudaHostAlloc: the device
+       reaches it at the same address where the backend maps it */
+    if (!info.supports_unified_memory && !(info.pinned_is_mapped && r.type == cudaMemoryTypeHost))
+        return set_error(cudaErrorNotSupported);
     *dptr = hptr;
     return cudaSuccess;
 }

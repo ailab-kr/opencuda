@@ -170,9 +170,11 @@ typedef struct ocl_api {
 } ocl_api;
 
 /* cl_intel_unified_shared_memory (Khronos extension registry) */
+#define CL_DEVICE_HOST_MEM_CAPABILITIES_INTEL 0x4190
 #define CL_DEVICE_SINGLE_DEVICE_SHARED_MEM_CAPABILITIES_INTEL 0x4192
 #define CL_UNIFIED_SHARED_MEMORY_ACCESS_INTEL (1u << 0)
 typedef void *(*ocl_shared_mem_alloc_intel)(cl_context, cl_device_id, const cl_ulong *, size_t, cl_uint, cl_int *);
+typedef void *(*ocl_host_mem_alloc_intel)(cl_context, const cl_ulong *, size_t, cl_uint, cl_int *);
 typedef cl_int (*ocl_mem_blocking_free_intel)(cl_context, void *);
 
 /* The OpenCL library's entry points, or NULL when there is none (or it is

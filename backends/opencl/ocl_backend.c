@@ -37,7 +37,8 @@ typedef struct ocl_alloc {
     char  *ptr;   /* SVM address: the same for host-side calls and kernels */
     size_t size;
     char  *base;  /* what clSVMAlloc returned (ptr is aligned up from it) */
-    bool   usm;   /* a USM shared allocation (cl_intel_unified_shared_memory) */
+    bool   usm;   /* a USM allocation (cl_intel_unified_shared_memory) */
+    bool   pinned_host; /* a USM host allocation from host_alloc_pinned */
 } ocl_alloc;
 
 typedef struct ocl_dev_entry {
@@ -51,6 +52,10 @@ typedef struct ocl_dev_entry {
        address, migrated by the driver */
     ocl_shared_mem_alloc_intel  usm_alloc;
     ocl_mem_blocking_free_intel usm_free;
+    /* USM host allocations for host_alloc_pinned: page-locked host memory
+       kernels reach directly (CUDA's mapped pinned memory); NULL = malloc */
+    ocl_host_mem_alloc_intel    usm_host_alloc;
+    ocl_mem_blocking_free_intel usm_host_free;
     pthread_once_t warp_once;
 } ocl_dev_entry;
 
@@ -226,6 +231,16 @@ static void enumerate_once(void)
                     if (e->usm_alloc == NULL || e->usm_free == NULL) e->usm_alloc = NULL, e->usm_free = NULL;
                 }
             }
+            if (has_word(ext, "cl_intel_unified_shared_memory") && a->GetExtensionFunctionAddressForPlatform != NULL &&
+                !(getenv("OCU_OPENCL_PINNED_USM") != NULL && getenv("OCU_OPENCL_PINNED_USM")[0] == '0')) {
+                cl_ulong caps = 0;
+                if (a->GetDeviceInfo(d, CL_DEVICE_HOST_MEM_CAPABILITIES_INTEL, sizeof(caps), &caps, NULL) == CL_SUCCESS &&
+                    (caps & CL_UNIFIED_SHARED_MEMORY_ACCESS_INTEL)) {
+                    *(void **)&e->usm_host_alloc = a->GetExtensionFunctionAddressForPlatform(plats[p], "clHostMemAllocINTEL");
+                    *(void **)&e->usm_host_free = a->GetExtensionFunctionAddressForPlatform(plats[p], "clMemBlockingFreeINTEL");
+                    if (e->usm_host_alloc == NULL || e->usm_host_free == NULL) e->usm_host_alloc = NULL, e->usm_host_free = NULL;
+                }
+            }
             pthread_once_t once = PTHREAD_ONCE_INIT;
             e->warp_once = once;
             ocu_dev_info *info = &e->info;
@@ -263,6 +278,7 @@ static void enumerate_once(void)
             } else {
                 info->multiprocessor_count = cu;
             }
+            info->pinned_is_mapped = e->usm_host_alloc != NULL;
         }
     }
 }
@@ -426,7 +442,8 @@ static ocu_status ocl_dev_close(ocu_device *d)
     finish_all(d);
     ocu_status st = ocl_queue_destroy(d->sync_q);
     for (size_t i = 0; i < d->count; ++i) {
-        if (d->allocs[i].usm) d->entry->usm_free(d->ctx, d->allocs[i].base);
+        if (d->allocs[i].pinned_host) d->entry->usm_host_free(d->ctx, d->allocs[i].base);
+        else if (d->allocs[i].usm) d->entry->usm_free(d->ctx, d->allocs[i].base);
         else a->SVMFree(d->ctx, d->allocs[i].base);
     }
     free(d->allocs);
@@ -575,6 +592,7 @@ static bool table_add(ocu_device *d, char *ptr, size_t size, char *base, bool us
         d->allocs[d->count].size = size;
         d->allocs[d->count].base = base;
         d->allocs[d->count].usm = usm;
+        d->allocs[d->count].pinned_host = false;
         d->count++;
         d->gen++;
         d->allocated += size;
@@ -583,16 +601,17 @@ static bool table_add(ocu_device *d, char *ptr, size_t size, char *base, bool us
     return ok;
 }
 
-/* Remove the allocation that starts at ptr; its SVM base, or NULL if there
-   is none (*usm: whether it is a USM shared allocation). */
-static char *table_remove(ocu_device *d, const char *ptr, bool *usm)
+/* Remove the allocation that starts at ptr and is (or is not) pinned host
+   memory; its base, or NULL if there is none (*usm: whether it is a USM
+   allocation). */
+static char *table_remove_kind(ocu_device *d, const char *ptr, bool *usm, bool pinned)
 {
     char *found = NULL;
     *usm = false;
     pthread_mutex_lock(&d->lock);
     for (size_t i = 0; i < d->count; ++i) {
-        if (d->allocs[i].ptr == ptr) {
-            d->allocated -= d->allocs[i].size;
+        if (d->allocs[i].ptr == ptr && d->allocs[i].pinned_host == pinned) {
+            if (!pinned) d->allocated -= d->allocs[i].size;
             found = d->allocs[i].base;
             *usm = d->allocs[i].usm;
             d->allocs[i] = d->allocs[--d->count];
@@ -602,6 +621,11 @@ static char *table_remove(ocu_device *d, const char *ptr, bool *usm)
     }
     pthread_mutex_unlock(&d->lock);
     return found;
+}
+
+static char *table_remove(ocu_device *d, const char *ptr, bool *usm)
+{
+    return table_remove_kind(d, ptr, usm, false);
 }
 
 /* Is [p, p + n) inside one allocation? */
@@ -755,14 +779,34 @@ static ocu_status ocl_mem_info(ocu_device *d, uint64_t *free_bytes, uint64_t *to
     return OCU_OK;
 }
 
-/* Copies read host memory through the driver; page-locking is the driver's
-   business. Page-aligned memory is what drivers copy from fastest. */
+/* With cl_intel_unified_shared_memory host allocations: page-locked host
+   memory that kernels read and write directly at the same address (CUDA's
+   mapped pinned memory, polled flags, zero-copy buffers). These go in the
+   allocation table, so copies and fills accept them as device memory, but
+   do not count as device memory in use (pinned_host). Elsewhere copies
+   read host memory through the driver; page-aligned memory is what
+   drivers copy from fastest. */
 static ocu_status ocl_host_alloc_pinned(ocu_device *d, size_t bytes, void **ptr)
 {
     if (d == NULL) return OCU_ERR_INVALID_HANDLE;
     if (ptr == NULL) return OCU_ERR_INVALID_VALUE;
     if (bytes == 0) {
         *ptr = NULL;
+        return OCU_OK;
+    }
+    if (d->entry->usm_host_alloc != NULL) {
+        cl_int err = CL_SUCCESS;
+        char *p = d->entry->usm_host_alloc(d->ctx, NULL, bytes, 4096, &err);
+        if (p == NULL || err != CL_SUCCESS) return OCU_ERR_OUT_OF_MEMORY;
+        if (!table_add(d, p, bytes, p, true)) {
+            d->entry->usm_host_free(d->ctx, p);
+            return OCU_ERR_OUT_OF_MEMORY;
+        }
+        pthread_mutex_lock(&d->lock);
+        d->allocs[d->count - 1].pinned_host = true;
+        d->allocated -= bytes;
+        pthread_mutex_unlock(&d->lock);
+        *ptr = p;
         return OCU_OK;
     }
     void *p = NULL;
@@ -775,6 +819,14 @@ static ocu_status ocl_host_free_pinned(ocu_device *d, void *ptr)
 {
     if (d == NULL) return OCU_ERR_INVALID_HANDLE;
     finish_all(d);
+    if (ptr == NULL) return OCU_OK;
+    if (d->entry->usm_host_alloc != NULL) {
+        bool usm;
+        char *base = table_remove_kind(d, ptr, &usm, true);
+        if (base == NULL) return OCU_ERR_INVALID_VALUE;
+        d->entry->usm_host_free(d->ctx, base);
+        return OCU_OK;
+    }
     free(ptr);
     return OCU_OK;
 }
