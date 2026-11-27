@@ -16,6 +16,7 @@ Add a row before the first use.
 | Clang / LLVM 23 (upstream; the build shipped inside Intel oneAPI also works) | `compiler/spirv/cu2spv.py`: HIP-mode device compile for spirv64, `opt`, LLVM's SPIR-V back end (`llc`) | Apache-2.0 WITH LLVM-exception | External tools, not vendored | 2026-11-26 |
 | Intel compute runtime (NEO) and Intel Graphics Compiler | OpenCL driver on Intel Arc GPUs | MIT | External driver loaded through the ICD loader, not vendored | 2026-11-26 |
 | bitsandbytes (CUDA kernels, built from source) | Test program for the SPIR-V path and the NF4 GEMM (`ocublasGemmNF4` reads its NF4 storage format) | MIT | Fetched and built outside the repository, not vendored; the NF4 code values are those of the QLoRA paper | 2026-11-26 |
+| `compiler/spirv/clang-hipspv-kernel-address.patch` (a change to Clang, also proposed upstream) | Lets host code store a HIP kernel in a function pointer on spirv64 (llama.cpp FlashAttention); applied by the user to their own Clang build | Apache-2.0 WITH LLVM-exception (it changes LLVM source) | A patch file only; no LLVM source vendored | 2026-11-27 |
 
 Not used, by rule (see `ALLOWLIST.md`): vendor CUDA SDK headers, libraries,
 samples and tools.

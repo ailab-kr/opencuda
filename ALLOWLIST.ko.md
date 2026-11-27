@@ -41,3 +41,4 @@
 | QLoRA 논문(Dettmers 외 2023): NF4 자료형 | https://arxiv.org/abs/2305.14314 | 2026-11-26 |
 | GNU ld 매뉴얼(-rpath, --disable-new-dtags)과 ld.so(8) 매뉴얼 페이지(DT_RPATH·DT_RUNPATH 검색 순서) | https://sourceware.org/binutils/docs/ld/ , https://man7.org/linux/man-pages/man8/ld.so.8.html | 2026-11-27 |
 | Intel oneAPI DPC++/C++ 컴파일러 문서(OpenMP 옵션, libiomp5) | https://www.intel.com/content/www/us/en/docs/dpcpp-cpp-compiler/developer-guide-reference/ | 2026-11-27 |
+| LLVM / Clang 소스(Apache-2.0 WITH LLVM-exception): `clang/lib/Sema/SemaType.cpp`(SPIR-V용 CUDA·HIP 커널의 호출 규약), `clang/lib/CodeGen/Targets/SPIR.cpp`와 `clang/lib/CodeGen/CGCall.cpp`(`setCUDAKernelCallingConvention`), 그리고 이를 쓴 커밋(D114407, #110447). spirv64에서 호스트 코드가 커널을 함수 포인터에 담지 못하는 이유를 찾고 `compiler/spirv/clang-hipspv-kernel-address.patch`를 쓰려고 읽음 | https://github.com/llvm/llvm-project | 2026-11-27 |
