@@ -504,6 +504,43 @@ def host_compilers(o) -> tuple[str, str]:
     return cxx, cc
 
 
+OPENMP_FLAGS = ("-fopenmp", "-qopenmp", "-fiopenmp")
+
+
+def host_openmp(cxx: str, host: list[str]) -> tuple[list[str], list[str]]:
+    """(compile flags, link flags) that make a host -fopenmp build work with a
+    host compiler that does not set up its own OpenMP paths (oneAPI's clang++
+    and icpx without setvars.sh: omp.h and libiomp5.so are outside the default
+    search). The runtime's directory is the one the compiler itself links
+    from; nothing is added when that is a system directory. The result is what
+    setvars.sh's LD_LIBRARY_PATH gives at run time."""
+    if not any(h in OPENMP_FLAGS or h.startswith("-fopenmp=") for h in host):
+        return [], []
+    ext = ".dylib" if sys.platform == "darwin" else ".so"
+    libdir = None
+    for name in ("libiomp5", "libomp", "libgomp"):
+        try:
+            got = subprocess.run([cxx, f"-print-file-name={name}{ext}"],
+                                 capture_output=True, text=True).stdout.strip()
+        except OSError:
+            return [], []
+        if os.path.isabs(got) and os.path.exists(got):
+            libdir = Path(got).resolve().parent
+            break
+    if libdir is None or str(libdir).startswith(("/usr/lib", "/lib", "/usr/local/lib")):
+        return [], []
+    compile_flags = []
+    inc = libdir.parent / "opt" / "compiler" / "include"  # oneAPI's layout
+    if (inc / "omp.h").is_file():
+        compile_flags = ["-isystem", str(inc)]
+    if sys.platform == "darwin":
+        return compile_flags, [f"-Wl,-rpath,{libdir}"]
+    # DT_RPATH, not DT_RUNPATH: the directory also holds oneAPI's libOpenCL,
+    # which the runtime's dlopen then finds; only DT_RPATH also serves that
+    # library's own dependencies (libsvml...), as LD_LIBRARY_PATH would.
+    return compile_flags, ["-Wl,--disable-new-dtags", f"-Wl,-rpath,{libdir}"]
+
+
 def toolkit_libdir() -> Path | None:
     """Our runtime libraries: next to the driver in a toolkit layout
     (<root>/bin/ocu-nvcc, <root>/lib), in an installed prefix, or where
@@ -641,7 +678,7 @@ class Driver:
         device = []
         if o.fast_math:
             device += ["-fcuda-approx-transcendentals", "-fgpu-flush-denormals-to-zero"]
-        host = list(o.host)
+        host = list(o.host) + host_openmp(self.cxx, o.host)[0]
         if o.verbose:
             host.append("-v")
         return SimpleNamespace(
@@ -738,7 +775,8 @@ class Driver:
             extra = runtime_link(libdir, want_blas, o.target)
         cmd = [self.cxx, *(["-shared"] if o.shared else []), *o.host,
                *(["-v"] if o.verbose else []),
-               *line, "-o", out, *[f"-L{d}" for d in o.libdirs], *o.linker, *extra]
+               *line, "-o", out, *[f"-L{d}" for d in o.libdirs], *o.linker, *extra,
+               *host_openmp(self.cxx, o.host)[1]]
         return self.run([cmd], out)
 
     def empty_object(self, out: str, work: Path) -> int:
