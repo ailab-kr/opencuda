@@ -313,6 +313,19 @@ def bypass_div64(ll: str) -> str:
     return ll + "\n" + "".join(_div_helper(op) for op in sorted(used))
 
 
+# Clang (20 to 23 at least) gives a HIP kernel the device_kernel calling
+# convention in its declared type when the target is SPIR-V other than AMD's,
+# so host code that stores a kernel in an ordinary function pointer does not
+# compile in the device-side pass (llama.cpp's FlashAttention dispatch does).
+KERNEL_ADDRESS = re.compile(r"__attribute__\(\(device_kernel\)\)|from incompatible type '<overloaded function type>'"
+                            r"|address of overloaded function '[^']*' does not match required type")
+KERNEL_ADDRESS_NOTE = (
+    "cu2spv: this looks like host code taking a kernel's address into a plain function pointer.\n"
+    "cu2spv: Clang's HIP mode for spirv64 puts the kernel calling convention in the kernel's type,\n"
+    "cu2spv: so that conversion fails (it works for NVIDIA and AMD targets). A Clang with\n"
+    "cu2spv: compiler/spirv/clang-hipspv-kernel-address.patch compiles it; set OCU_SPV_CLANG to it.\n")
+
+
 def main(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
@@ -343,6 +356,8 @@ def main(argv):
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode:
             sys.stderr.write(r.stderr[-6000:])
+            if KERNEL_ADDRESS.search(r.stderr):
+                sys.stderr.write(KERNEL_ADDRESS_NOTE)
             if os.environ.get("OCU_SPV_KEEP_GOING") == "1":
                 # like cu2ocl --keep-going: the file's kernels are left out; launching
                 # one fails at run time ("not found"), the build goes on
