@@ -34,6 +34,7 @@ CUB(`namespace cub`, 헤더 하나):
 - `DeviceReduce::Sum/Max/Min/Reduce`, `DeviceScan::InclusiveSum/ExclusiveSum/InclusiveScan/ExclusiveScan`(제자리 가능).
   - 누적형(2026-11-28, 문서대로): `Sum`은 출력의 값 형에서 시작한다(출력에 값 형이 없으면 입력의 형). 누적기는 (초깃값, 입력)에 연산자를 적용한 형이다. 그래서 bool 반복자를 int64_t로 더하면 개수가 되고(전에는 입력 형 bool로 누적해 1이 됐다), float을 double로 더하면 double로 누적한다. `Max`·`Min`은 그대로 입력 형.
 - `KeyValuePair<Key, Value>`(사소한 기본 생성자라 `__shared__`에 둘 수 있음, `operator!=`), `ArgMax`·`ArgMin`(큰·작은 값, 같으면 낮은 키): `BlockReduce<KeyValuePair, ...>`와 함께(HeCBench moe-cuda).
+- `DeviceSelect::Flagged/If/Unique`(2026-11-28): 고른 항목을 입력 순서대로(안정), 개수는 어떤 정수 반복자로든. 표시 → 표시의 배타적 합(출력 위치) → 흩어 쓰기 → 개수. 임시 저장소는 항목마다 long long 두 개와 scan의 것. Arc Pro B70에서 `rt_cub_select` 16/16, HeCBench nonzero-cuda PASS(전에는 빌드 실패).
 - 입력 반복자 `CountingInputIterator<T, OffsetT>`, `TransformInputIterator<V, Op, InIt, OffsetT>`(무작위 접근, 호스트와 장치 코드, `cub/iterator/*.cuh` 경로로도 포함 가능).
 - `DeviceRadixSort::SortPairs(Descending)/SortKeys(Descending)`: 안정 정렬, 비트 범위 [begin_bit, end_bit).
 - `DeviceSegmentedRadixSort::SortPairs(Descending)/SortKeys(Descending)`, `DeviceSegmentedSort::(Stable)SortPairs(Descending)/(Stable)SortKeys(Descending)`: 구간마다 블록 하나, 안정 정렬.

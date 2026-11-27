@@ -1466,6 +1466,134 @@ struct DeviceScan {
     }
 };
 
+/* ---- DeviceSelect ------------------------------------------------------
+ * Flagged, If, Unique (CUB documentation): the selected items, in their
+ * input order (stable), and their count. Done as marks (1 / 0 per item), an
+ * exclusive sum of the marks (each selected item's output position), a
+ * scatter, and the count from the last position and mark. Temporary
+ * storage: two long long per item plus the scan's. */
+
+namespace ocu_detail {
+
+template <typename FlagIt>
+__global__ void select_mark_flags(FlagIt flags, long long n, long long *mark)
+{
+    for (long long i = (long long)blockIdx.x * kThreads + threadIdx.x; i < n; i += (long long)gridDim.x * kThreads)
+        mark[i] = flags[i] ? 1 : 0;
+}
+
+template <typename InIt, typename Pred>
+__global__ void select_mark_if(InIt in, long long n, Pred pred, long long *mark)
+{
+    for (long long i = (long long)blockIdx.x * kThreads + threadIdx.x; i < n; i += (long long)gridDim.x * kThreads)
+        mark[i] = pred(in[i]) ? 1 : 0;
+}
+
+template <typename InIt>
+__global__ void select_mark_unique(InIt in, long long n, long long *mark)
+{
+    for (long long i = (long long)blockIdx.x * kThreads + threadIdx.x; i < n; i += (long long)gridDim.x * kThreads)
+        mark[i] = (i == 0 || !(in[i] == in[i - 1])) ? 1 : 0;
+}
+
+template <typename InIt, typename OutIt>
+__global__ void select_scatter(InIt in, const long long *mark, const long long *pos, long long n, OutIt out)
+{
+    for (long long i = (long long)blockIdx.x * kThreads + threadIdx.x; i < n; i += (long long)gridDim.x * kThreads)
+        if (mark[i]) out[pos[i]] = in[i];
+}
+
+template <typename NumIt>
+__global__ void select_count(const long long *mark, const long long *pos, long long n, NumIt num)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0) *num = n > 0 ? pos[n - 1] + mark[n - 1] : 0;
+}
+
+inline unsigned select_grid(long long n)
+{
+    long long b = (n + kThreads - 1) / kThreads;
+    return (unsigned)(b < 1 ? 1 : (b > 65535 ? 65535 : b));
+}
+
+/* marks already written: positions, scatter, count */
+template <typename InIt, typename OutIt, typename NumIt>
+inline cudaError_t select_finish(void *temp, InIt in, OutIt out, NumIt num, long long n, cudaStream_t stream)
+{
+    carve c{static_cast<unsigned char *>(temp), 0};
+    long long *mark = c.take<long long>((size_t)n);
+    long long *pos = c.take<long long>((size_t)n);
+    void *scan_temp = c.base + c.used;
+    cudaError_t e = scan_run<true, long long>(scan_temp, (const long long *)mark, pos, n, Sum(), 0LL, stream);
+    if (e != cudaSuccess) return e;
+    select_scatter<<<select_grid(n), kThreads, 0, stream>>>(in, mark, pos, n, out);
+    select_count<<<1, 1, 0, stream>>>(mark, pos, n, num);
+    return cudaPeekAtLastError();
+}
+
+inline size_t select_temp_bytes(long long n)
+{
+    return 2 * align_bytes((size_t)(n > 0 ? n : 1) * sizeof(long long)) + scan_temp_bytes<long long>(n);
+}
+
+template <typename NumIt>
+inline cudaError_t select_empty(NumIt num, cudaStream_t stream)
+{
+    select_count<<<1, 1, 0, stream>>>((const long long *)nullptr, (const long long *)nullptr, 0, num);
+    return cudaPeekAtLastError();
+}
+
+} // namespace ocu_detail
+
+struct DeviceSelect {
+    template <typename InputIteratorT, typename FlagIterator, typename OutputIteratorT, typename NumSelectedIteratorT,
+              typename NumItemsT>
+    static cudaError_t Flagged(void *d_temp_storage, size_t &temp_storage_bytes, InputIteratorT d_in,
+                               FlagIterator d_flags, OutputIteratorT d_out, NumSelectedIteratorT d_num_selected_out,
+                               NumItemsT num_items, cudaStream_t stream = 0)
+    {
+        using namespace ocu_detail;
+        const long long n = (long long)num_items;
+        if (d_temp_storage == nullptr) return finish_query(temp_storage_bytes, select_temp_bytes(n));
+        cudaError_t e = check_space(temp_storage_bytes, select_temp_bytes(n));
+        if (e != cudaSuccess) return e;
+        if (n <= 0) return select_empty(d_num_selected_out, stream);
+        select_mark_flags<<<select_grid(n), kThreads, 0, stream>>>(d_flags, n, static_cast<long long *>(d_temp_storage));
+        return select_finish(d_temp_storage, d_in, d_out, d_num_selected_out, n, stream);
+    }
+
+    template <typename InputIteratorT, typename OutputIteratorT, typename NumSelectedIteratorT, typename NumItemsT,
+              typename SelectOp>
+    static cudaError_t If(void *d_temp_storage, size_t &temp_storage_bytes, InputIteratorT d_in, OutputIteratorT d_out,
+                          NumSelectedIteratorT d_num_selected_out, NumItemsT num_items, SelectOp select_op,
+                          cudaStream_t stream = 0)
+    {
+        using namespace ocu_detail;
+        const long long n = (long long)num_items;
+        if (d_temp_storage == nullptr) return finish_query(temp_storage_bytes, select_temp_bytes(n));
+        cudaError_t e = check_space(temp_storage_bytes, select_temp_bytes(n));
+        if (e != cudaSuccess) return e;
+        if (n <= 0) return select_empty(d_num_selected_out, stream);
+        select_mark_if<<<select_grid(n), kThreads, 0, stream>>>(d_in, n, select_op, static_cast<long long *>(d_temp_storage));
+        return select_finish(d_temp_storage, d_in, d_out, d_num_selected_out, n, stream);
+    }
+
+    /* the first item of each run of equal consecutive items */
+    template <typename InputIteratorT, typename OutputIteratorT, typename NumSelectedIteratorT, typename NumItemsT>
+    static cudaError_t Unique(void *d_temp_storage, size_t &temp_storage_bytes, InputIteratorT d_in,
+                              OutputIteratorT d_out, NumSelectedIteratorT d_num_selected_out, NumItemsT num_items,
+                              cudaStream_t stream = 0)
+    {
+        using namespace ocu_detail;
+        const long long n = (long long)num_items;
+        if (d_temp_storage == nullptr) return finish_query(temp_storage_bytes, select_temp_bytes(n));
+        cudaError_t e = check_space(temp_storage_bytes, select_temp_bytes(n));
+        if (e != cudaSuccess) return e;
+        if (n <= 0) return select_empty(d_num_selected_out, stream);
+        select_mark_unique<<<select_grid(n), kThreads, 0, stream>>>(d_in, n, static_cast<long long *>(d_temp_storage));
+        return select_finish(d_temp_storage, d_in, d_out, d_num_selected_out, n, stream);
+    }
+};
+
 /* ---- DeviceRadixSort ------------------------------------------------- */
 
 /* Stable, ascending or descending, over key bits [begin_bit, end_bit) of
