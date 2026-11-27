@@ -148,6 +148,13 @@ OCU_MX_I2F(rz, ocu_dm::RZ)
 OCU_MX_I2F(ru, ocu_dm::RU)
 OCU_MX_I2F(rd, ocu_dm::RD)
 #undef OCU_MX_I2F
+/* the two 32-bit halves of a double's bits, and a double from them */
+OCU_MX_Q int __double2hiint(double x) { return (int)(__builtin_bit_cast(unsigned long long, x) >> 32); }
+OCU_MX_Q int __double2loint(double x) { return (int)(unsigned)__builtin_bit_cast(unsigned long long, x); }
+OCU_MX_Q double __hiloint2double(int hi, int lo)
+{
+    return __builtin_bit_cast(double, ((unsigned long long)(unsigned)hi << 32) | (unsigned)lo);
+}
 OCU_MX_Q double __int2double_rn(int v) { return (double)v; }
 OCU_MX_Q double __uint2double_rn(unsigned v) { return (double)v; }
 #ifndef OCU_MX_HAS_I2F_RN

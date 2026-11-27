@@ -383,8 +383,51 @@ OCU_F16_FN __half2 operator+(__half2 a, __half2 b) { return __hadd2(a, b); }
 OCU_F16_FN __half2 operator-(__half2 a, __half2 b) { return __hsub2(a, b); }
 OCU_F16_FN __half2 operator*(__half2 a, __half2 b) { return __hmul2(a, b); }
 OCU_F16_FN __half2 operator/(__half2 a, __half2 b) { return __h2div(a, b); }
+OCU_F16_FN __half2 operator-(__half2 a) { return __hneg2(a); }
+OCU_F16_FN __half2 operator+(__half2 a) { return a; }
 OCU_F16_FN __half2 &operator+=(__half2 &a, __half2 b) { return a = __hadd2(a, b); }
+OCU_F16_FN __half2 &operator-=(__half2 &a, __half2 b) { return a = __hsub2(a, b); }
 OCU_F16_FN __half2 &operator*=(__half2 &a, __half2 b) { return a = __hmul2(a, b); }
+OCU_F16_FN __half2 &operator/=(__half2 &a, __half2 b) { return a = __h2div(a, b); }
+
+/* __half2 comparisons, lane by lane (CUDA Math API, half2 comparison
+   functions): __heq2 ... give 1.0 or 0.0 in each half, the _mask forms
+   0xFFFF or 0 in each 16-bit half (low lane in the low bits), __hbeq2 ...
+   true when both lanes compare true. The u forms are unordered (true when
+   either value is NaN). Operators ==, != ... on __half2 are the __hb forms. */
+#define OCU_H2CMP(name, op)                                                                     \
+    OCU_F16_FN __half2 __h##name##2(__half2 a, __half2 b)                                       \
+    {                                                                                           \
+        return __half2(__float2half(op(a.x, b.x) ? 1.0f : 0.0f), __float2half(op(a.y, b.y) ? 1.0f : 0.0f)); \
+    }                                                                                           \
+    OCU_F16_FN unsigned __h##name##2_mask(__half2 a, __half2 b)                                 \
+    {                                                                                           \
+        return (op(a.x, b.x) ? 0xffffu : 0u) | (op(a.y, b.y) ? 0xffff0000u : 0u);               \
+    }                                                                                           \
+    OCU_F16_FN bool __hb##name##2(__half2 a, __half2 b) { return op(a.x, b.x) && op(a.y, b.y); }
+OCU_H2CMP(eq, __heq)
+OCU_H2CMP(ne, __hne)
+OCU_H2CMP(lt, __hlt)
+OCU_H2CMP(le, __hle)
+OCU_H2CMP(gt, __hgt)
+OCU_H2CMP(ge, __hge)
+OCU_H2CMP(equ, __hequ)
+OCU_H2CMP(neu, __hneu)
+OCU_H2CMP(ltu, __hltu)
+OCU_H2CMP(leu, __hleu)
+OCU_H2CMP(gtu, __hgtu)
+OCU_H2CMP(geu, __hgeu)
+#undef OCU_H2CMP
+OCU_F16_FN __half2 __hisnan2(__half2 a)
+{
+    return __half2(__float2half(__hisnan(a.x) ? 1.0f : 0.0f), __float2half(__hisnan(a.y) ? 1.0f : 0.0f));
+}
+OCU_F16_FN bool operator==(__half2 a, __half2 b) { return __hbeq2(a, b); }
+OCU_F16_FN bool operator!=(__half2 a, __half2 b) { return __hbneu2(a, b); }
+OCU_F16_FN bool operator<(__half2 a, __half2 b) { return __hblt2(a, b); }
+OCU_F16_FN bool operator<=(__half2 a, __half2 b) { return __hble2(a, b); }
+OCU_F16_FN bool operator>(__half2 a, __half2 b) { return __hbgt2(a, b); }
+OCU_F16_FN bool operator>=(__half2 a, __half2 b) { return __hbge2(a, b); }
 
 #undef OCU_F16_FN
 
