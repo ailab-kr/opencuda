@@ -39,3 +39,5 @@ If you need a new source, add it to this list first, then use it.
 | cuBLAS / cuBLASLt API reference (function descriptions only) | https://docs.nvidia.com/cuda/cublas/ | 2026-11-26 |
 | bitsandbytes source, MIT licence: the NF4 code table and block layout (block 64, f32 absmax, high nibble first), read to match its storage format; built unmodified as a test program | https://github.com/bitsandbytes-foundation/bitsandbytes | 2026-11-26 |
 | QLoRA paper (Dettmers et al. 2023): the NF4 data type | https://arxiv.org/abs/2305.14314 | 2026-11-26 |
+| GNU ld manual (-rpath, --disable-new-dtags) and the ld.so(8) manual page (DT_RPATH and DT_RUNPATH search order) | https://sourceware.org/binutils/docs/ld/ , https://man7.org/linux/man-pages/man8/ld.so.8.html | 2026-11-27 |
+| Intel oneAPI DPC++/C++ Compiler documentation (OpenMP options, libiomp5) | https://www.intel.com/content/www/us/en/docs/dpcpp-cpp-compiler/developer-guide-reference/ | 2026-11-27 |

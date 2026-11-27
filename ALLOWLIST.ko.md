@@ -39,3 +39,5 @@
 | cuBLAS / cuBLASLt API 설명서(함수 설명만) | https://docs.nvidia.com/cuda/cublas/ | 2026-11-26 |
 | bitsandbytes 소스(MIT): 저장 형식을 맞추려고 읽은 NF4 코드 표와 블록 배치(블록 64, f32 absmax, 앞 값이 상위 4비트). 시험 프로그램으로 고치지 않고 빌드 | https://github.com/bitsandbytes-foundation/bitsandbytes | 2026-11-26 |
 | QLoRA 논문(Dettmers 외 2023): NF4 자료형 | https://arxiv.org/abs/2305.14314 | 2026-11-26 |
+| GNU ld 매뉴얼(-rpath, --disable-new-dtags)과 ld.so(8) 매뉴얼 페이지(DT_RPATH·DT_RUNPATH 검색 순서) | https://sourceware.org/binutils/docs/ld/ , https://man7.org/linux/man-pages/man8/ld.so.8.html | 2026-11-27 |
+| Intel oneAPI DPC++/C++ 컴파일러 문서(OpenMP 옵션, libiomp5) | https://www.intel.com/content/www/us/en/docs/dpcpp-cpp-compiler/developer-guide-reference/ | 2026-11-27 |
