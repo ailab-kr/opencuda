@@ -452,6 +452,92 @@ __global__ void trsm_kernel(trsm_params p)
 #undef OCU_T
 }
 
+/* ---- geam and getrf kernels --------------------------------------------- */
+
+/* C = alpha op(A) + beta op(B), one element per thread (grid-stride). A is
+   not read when alpha == 0, B not when beta == 0. Each element is read and
+   written by the same thread, so C may be A or B (op N, same ld). */
+template <class T>
+__global__ void geam_kernel(int m, int n, T alpha, const T *alpha_dev, const T *A, long long lda,
+                            int ta, T beta, const T *beta_dev, const T *B, long long ldb, int tb,
+                            T *C, long long ldc)
+{
+    const T a = alpha_dev ? *alpha_dev : alpha;
+    const T b = beta_dev ? *beta_dev : beta;
+    const long long total = (long long)m * n;
+    for (long long e = (long long)blockIdx.x * blockDim.x + threadIdx.x; e < total;
+         e += (long long)gridDim.x * blockDim.x) {
+        const long long i = e % m, j = e / m;
+        T v = T(0);
+        if (a != T(0)) v = a * (ta ? A[j + i * lda] : A[i + j * lda]);
+        if (b != T(0)) v += b * (tb ? B[j + i * ldb] : B[i + j * ldb]);
+        C[i + j * ldc] = v;
+    }
+}
+
+/* Unblocked right-looking LU with partial pivoting (LAPACK's getf2 order):
+   column k's pivot is the first entry of largest magnitude on or below the
+   diagonal; a zero pivot records info = k + 1 (first one) and the column is
+   not scaled. One block per matrix. The pointer array travels in a struct,
+   as trsm's does (the OpenCL path takes no pointer-to-pointer parameter). */
+struct getrf_params {
+    int n;
+    float *const *a_arr;
+    long long lda;
+    int *piv, *info;
+    int batch_offset;
+};
+
+__global__ void getrf_kernel(getrf_params gp)
+{
+    const int n = gp.n;
+    const long long lda = gp.lda;
+    int *const piv = gp.piv;
+    const long long batch = (long long)blockIdx.x + gp.batch_offset;
+    float *A = gp.a_arr[batch];
+    __shared__ int s_p, s_info;
+    __shared__ float s_pv; /* read before the swap below changes it */
+    if (threadIdx.x == 0) s_info = 0;
+    for (int k = 0; k < n; ++k) {
+        if (threadIdx.x == 0) {
+            int p = k;
+            if (piv) {
+                float best = fabsf(A[k + k * lda]);
+                for (int i = k + 1; i < n; ++i) {
+                    const float v = fabsf(A[i + k * lda]);
+                    if (v > best) { best = v; p = i; }
+                }
+                piv[batch * n + k] = p + 1;
+            }
+            s_p = p;
+            s_pv = A[p + k * lda];
+        }
+        __syncthreads();
+        const int p = s_p;
+        const float pv = s_pv;
+        if (pv != 0.0f) {
+            if (p != k)
+                for (int j = threadIdx.x; j < n; j += blockDim.x) {
+                    const float t = A[k + j * lda];
+                    A[k + j * lda] = A[p + j * lda];
+                    A[p + j * lda] = t;
+                }
+            __syncthreads();
+            for (int i = k + 1 + threadIdx.x; i < n; i += blockDim.x) A[i + k * lda] /= pv;
+        } else if (threadIdx.x == 0 && s_info == 0) {
+            s_info = k + 1;
+        }
+        __syncthreads();
+        const int r = n - k - 1;
+        for (long long e = threadIdx.x; e < (long long)r * r; e += blockDim.x) {
+            const int i = k + 1 + (int)(e % r), j = k + 1 + (int)(e / r);
+            A[i + j * lda] -= A[i + k * lda] * A[k + j * lda];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) gp.info[batch] = s_info;
+}
+
 /* ---- host side ---------------------------------------------------------- */
 
 cublasStatus_t from_cuda(cudaError_t e)
@@ -795,6 +881,64 @@ unsigned blocks_for(long long n)
     return (unsigned)(b > 4096 ? 4096 : b < 1 ? 1 : b);
 }
 
+
+template <class T>
+cublasStatus_t geam_any(cublasHandle_t h, cublasOperation_t transa, cublasOperation_t transb,
+                        int m, int n, const T *alpha, const T *A, int lda, const T *beta,
+                        const T *B, int ldb, T *C, int ldc)
+{
+    if (h == nullptr) return CUBLAS_STATUS_NOT_INITIALIZED;
+    const int ar = transa == CUBLAS_OP_N ? m : n, br = transb == CUBLAS_OP_N ? m : n;
+    if (!valid_op(transa) || !valid_op(transb) || m < 0 || n < 0 || alpha == nullptr ||
+        beta == nullptr || lda < (ar > 1 ? ar : 1) || ldb < (br > 1 ? br : 1) ||
+        ldc < (m > 1 ? m : 1))
+        return CUBLAS_STATUS_INVALID_VALUE;
+    /* In place only where every element maps to itself. */
+    if ((C == A && (transa != CUBLAS_OP_N || lda != ldc)) ||
+        (C == B && (transb != CUBLAS_OP_N || ldb != ldc)))
+        return CUBLAS_STATUS_INVALID_VALUE;
+    if (m == 0 || n == 0) return CUBLAS_STATUS_SUCCESS;
+    T al = T(0), be = T(0);
+    const T *al_dev = nullptr, *be_dev = nullptr;
+    if (device_mode(h)) {
+        al_dev = alpha;
+        be_dev = beta;
+    } else {
+        al = *alpha;
+        be = *beta;
+    }
+    long long la = lda, lb = ldb, lc = ldc;
+    int ta = transa != CUBLAS_OP_N, tb = transb != CUBLAS_OP_N;
+    void *args[] = {&m, &n, &al, &al_dev, &A, &la, &ta, &be, &be_dev, &B, &lb, &tb, &C, &lc};
+    return from_cuda(cudaLaunchKernel(geam_kernel<T>, dim3(blocks_for((long long)m * n)), dim3(256),
+                                      args, 0, h->stream));
+}
+
+bool copy_args_ok(int rows, int cols, int elemSize, int lda, int ldb)
+{
+    return rows >= 0 && cols >= 0 && elemSize > 0 && lda > 0 && ldb > 0;
+}
+
+cublasStatus_t copy_matrix(int rows, int cols, int elemSize, const void *A, int lda, void *B,
+                           int ldb, cudaMemcpyKind kind, bool async, cudaStream_t stream)
+{
+    if (!copy_args_ok(rows, cols, elemSize, lda, ldb)) return CUBLAS_STATUS_INVALID_VALUE;
+    if (rows == 0 || cols == 0) return CUBLAS_STATUS_SUCCESS;
+    const size_t es = (size_t)elemSize;
+    cudaError_t e = async ? cudaMemcpy2DAsync(B, ldb * es, A, lda * es, rows * es, cols, kind, stream)
+                          : cudaMemcpy2D(B, ldb * es, A, lda * es, rows * es, cols, kind);
+    return e == cudaSuccess ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_MAPPING_ERROR;
+}
+
+cublasStatus_t copy_vector(int n, int elemSize, const void *x, int incx, void *y, int incy,
+                           cudaMemcpyKind kind, bool async, cudaStream_t stream)
+{
+    if (elemSize <= 0 || incx <= 0 || incy <= 0) return CUBLAS_STATUS_INVALID_VALUE;
+    if (n <= 0) return CUBLAS_STATUS_SUCCESS;
+    /* n elements of elemSize bytes, strides incx and incy: rows of a 2D copy. */
+    return copy_matrix(1, n, elemSize, x, incx, y, incy, kind, async, stream);
+}
+
 } // namespace
 
 /* ---- helper functions --------------------------------------------------- */
@@ -1110,6 +1254,99 @@ cublasStatus_t cublasStrsmBatched(cublasHandle_t handle, cublasSideMode_t side,
         if (e != cudaSuccess) return from_cuda(e);
     }
     return CUBLAS_STATUS_SUCCESS;
+}
+
+/* ---- BLAS-like extensions and LAPACK-like functions --------------------- */
+
+cublasStatus_t cublasSgeam(cublasHandle_t handle, cublasOperation_t transa,
+                           cublasOperation_t transb, int m, int n, const float *alpha,
+                           const float *A, int lda, const float *beta, const float *B, int ldb,
+                           float *C, int ldc)
+{
+    return geam_any<float>(handle, transa, transb, m, n, alpha, A, lda, beta, B, ldb, C, ldc);
+}
+
+cublasStatus_t cublasDgeam(cublasHandle_t handle, cublasOperation_t transa,
+                           cublasOperation_t transb, int m, int n, const double *alpha,
+                           const double *A, int lda, const double *beta, const double *B,
+                           int ldb, double *C, int ldc)
+{
+#ifdef OCU_CUBLAS_NO_FP64
+    (void)transa; (void)transb; (void)m; (void)n; (void)alpha; (void)A; (void)lda;
+    (void)beta; (void)B; (void)ldb; (void)C; (void)ldc;
+    return handle == nullptr ? CUBLAS_STATUS_NOT_INITIALIZED : CUBLAS_STATUS_NOT_SUPPORTED;
+#else
+    return geam_any<double>(handle, transa, transb, m, n, alpha, A, lda, beta, B, ldb, C, ldc);
+#endif
+}
+
+cublasStatus_t cublasSgetrfBatched(cublasHandle_t handle, int n, float *const A[], int lda,
+                                   int *P, int *info, int batchSize)
+{
+    if (handle == nullptr) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (n < 0 || lda < (n > 1 ? n : 1) || batchSize < 0 || info == nullptr)
+        return CUBLAS_STATUS_INVALID_VALUE;
+    if (batchSize == 0) return CUBLAS_STATUS_SUCCESS;
+    if (n == 0)
+        return from_cuda(cudaMemsetAsync(info, 0, sizeof(int) * (size_t)batchSize, handle->stream));
+    getrf_params gp{n, A, lda, P, info, 0};
+    for (int off = 0; off < batchSize; off += 65535) {
+        const int nb = batchSize - off < 65535 ? batchSize - off : 65535;
+        gp.batch_offset = off;
+        void *args[] = {&gp};
+        cudaError_t e = cudaLaunchKernel(getrf_kernel, dim3((unsigned)nb), dim3(256), args, 0,
+                                         handle->stream);
+        if (e != cudaSuccess) return from_cuda(e);
+    }
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+/* ---- host <-> device copies --------------------------------------------- */
+
+cublasStatus_t cublasSetMatrix(int rows, int cols, int elemSize, const void *A, int lda,
+                               void *B, int ldb)
+{
+    return copy_matrix(rows, cols, elemSize, A, lda, B, ldb, cudaMemcpyHostToDevice, false, nullptr);
+}
+
+cublasStatus_t cublasGetMatrix(int rows, int cols, int elemSize, const void *A, int lda,
+                               void *B, int ldb)
+{
+    return copy_matrix(rows, cols, elemSize, A, lda, B, ldb, cudaMemcpyDeviceToHost, false, nullptr);
+}
+
+cublasStatus_t cublasSetMatrixAsync(int rows, int cols, int elemSize, const void *A, int lda,
+                                    void *B, int ldb, cudaStream_t stream)
+{
+    return copy_matrix(rows, cols, elemSize, A, lda, B, ldb, cudaMemcpyHostToDevice, true, stream);
+}
+
+cublasStatus_t cublasGetMatrixAsync(int rows, int cols, int elemSize, const void *A, int lda,
+                                    void *B, int ldb, cudaStream_t stream)
+{
+    return copy_matrix(rows, cols, elemSize, A, lda, B, ldb, cudaMemcpyDeviceToHost, true, stream);
+}
+
+cublasStatus_t cublasSetVector(int n, int elemSize, const void *x, int incx, void *y, int incy)
+{
+    return copy_vector(n, elemSize, x, incx, y, incy, cudaMemcpyHostToDevice, false, nullptr);
+}
+
+cublasStatus_t cublasGetVector(int n, int elemSize, const void *x, int incx, void *y, int incy)
+{
+    return copy_vector(n, elemSize, x, incx, y, incy, cudaMemcpyDeviceToHost, false, nullptr);
+}
+
+cublasStatus_t cublasSetVectorAsync(int n, int elemSize, const void *x, int incx, void *y,
+                                    int incy, cudaStream_t stream)
+{
+    return copy_vector(n, elemSize, x, incx, y, incy, cudaMemcpyHostToDevice, true, stream);
+}
+
+cublasStatus_t cublasGetVectorAsync(int n, int elemSize, const void *x, int incx, void *y,
+                                    int incy, cudaStream_t stream)
+{
+    return copy_vector(n, elemSize, x, incx, y, incy, cudaMemcpyDeviceToHost, true, stream);
 }
 
 cublasStatus_t cublasSgemm_v2(cublasHandle_t handle, cublasOperation_t transa,

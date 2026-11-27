@@ -29,6 +29,8 @@ cost: { hours: 1, ai_usage: 0 }
 | GEMM | `cublasSgemm`, `cublasDgemm`, `cublasHgemm`, `cublasSgemmBatched`, `cublasDgemmBatched`, `cublasHgemmBatched`, `cublasSgemmStridedBatched`, `cublasDgemmStridedBatched`, `cublasHgemmStridedBatched`, `cublasGemmEx`, `cublasGemmBatchedEx`, `cublasGemmStridedBatchedEx` |
 | 1·2단계 | `cublasSaxpy`, `cublasSscal`, `cublasSdot`, `cublasSnrm2`, `cublasSgemv` |
 | 3단계 그 밖 | `cublasStrsmBatched`(llama.cpp의 solve_tri가 씀, 오른쪽 항마다 스레드 하나인 단순 구현) |
+| BLAS 확장·LAPACK 비슷 | `cublasSgeam`, `cublasDgeam`(C = αop(A) + βop(B), α 0이면 A를, β 0이면 B를 읽지 않음, C가 A·B와 같아도 됨: op N·같은 ld일 때만), `cublasSgetrfBatched`(부분 피벗 LU, LAPACK getf2 순서, 행렬마다 블록 하나: 작은 행렬용. 피벗 0이면 첫 번째 것을 info에, P가 NULL이면 피벗 없음) |
+| 호스트↔장치 복사(핸들 없음) | `cublasSetMatrix`, `cublasGetMatrix`, `cublasSetVector`, `cublasGetVector`와 각 `Async`(cudaMemcpy2D로, 실패하면 `MAPPING_ERROR`) |
 
 `*Ex`의 형 조합: COMPUTE_32F(`_PEDANTIC` 포함)에서 A=B=32F→C 32F, 16F→16F·32F, 16BF→16BF·32F. COMPUTE_16F에서 16F→16F(스칼라 half). COMPUTE_32F_FAST_16F/16BF/TF32에서 32F→32F. COMPUTE_64F(`_PEDANTIC`)에서 64F→64F. 예전 방식의 `CUDA_R_16F/32F/64F` 계산형 값도 받는다.
 
