@@ -2029,3 +2029,412 @@ cublasStatus_t cublasLtMatmul(cublasLtHandle_t handle, cublasLtMatmulDesc_t comp
 }
 
 } /* extern "C" */
+/* ---- level 1 and 2 for the other real types --------------------------------
+ * The same reference-BLAS rules as the single-precision functions above
+ * (negative increments start at the far end; asum, nrm2, scal, iamax and
+ * iamin do nothing / give 0 for incx <= 0; quick returns for n <= 0). */
+
+namespace {
+
+template <class T> CB_HD inline T absv(T v) { return v < T(0) ? -v : v; }
+template <class T> CB_HD inline T big_value();
+template <> CB_HD inline float big_value<float>() { return 3.402823466e38f; }
+template <> CB_HD inline double big_value<double>() { return 1.7976931348623157e308; }
+
+template <class T>
+__global__ void copy_kernel_t(int n, const T *x, int incx, T *y, int incy)
+{
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x)
+        y[vec_index(i, n, incy)] = x[vec_index(i, n, incx)];
+}
+
+template <class T>
+__global__ void swap_kernel_t(int n, T *x, int incx, T *y, int incy)
+{
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) {
+        T *a = x + vec_index(i, n, incx), *b = y + vec_index(i, n, incy);
+        T t = *a;
+        *a = *b;
+        *b = t;
+    }
+}
+
+template <class T>
+__global__ void axpy_kernel_t(int n, T alpha, const T *alpha_dev, const T *x, int incx, T *y, int incy)
+{
+    const T a = alpha_dev ? *alpha_dev : alpha;
+    if (a == T(0)) return;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x) {
+        T *yi = y + vec_index(i, n, incy);
+        *yi = a * x[vec_index(i, n, incx)] + *yi;
+    }
+}
+
+template <class T>
+__global__ void scal_kernel_t(int n, T alpha, const T *alpha_dev, T *x, int incx)
+{
+    const T a = alpha_dev ? *alpha_dev : alpha;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x)
+        x[i * incx] *= a;
+}
+
+/* dot (x of TX, sums in Acc, result of TR) and asum: one block, a tree in shared memory */
+template <class TX, class TR, class Acc>
+__global__ void dot_kernel_t(int n, const TX *x, int incx, const TX *y, int incy, TR *result)
+{
+    __shared__ Acc part[RED_THREADS];
+    Acc s = Acc(0);
+    for (long long i = threadIdx.x; i < n; i += RED_THREADS)
+        s += ld<Acc>(x + vec_index(i, n, incx)) * ld<Acc>(y + vec_index(i, n, incy));
+    part[threadIdx.x] = s;
+    __syncthreads();
+    for (int w = RED_THREADS / 2; w > 0; w /= 2) {
+        if ((int)threadIdx.x < w) part[threadIdx.x] += part[threadIdx.x + w];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) st(result, part[0]);
+}
+
+template <class T>
+__global__ void asum_kernel_t(int n, const T *x, int incx, T *result)
+{
+    __shared__ T part[RED_THREADS];
+    T s = T(0);
+    for (long long i = threadIdx.x; i < n; i += RED_THREADS) s += absv(x[i * incx]);
+    part[threadIdx.x] = s;
+    __syncthreads();
+    for (int w = RED_THREADS / 2; w > 0; w /= 2) {
+        if ((int)threadIdx.x < w) part[threadIdx.x] += part[threadIdx.x + w];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) *result = part[0];
+}
+
+/* isamax / isamin as the reference loop gives them: x(1) is the first
+   candidate and a later |x(i)| replaces it only when strictly larger
+   (smaller), so the result is the first index of the extreme value, NaNs
+   never replace a candidate, and a NaN in x(1) is never replaced (1). */
+template <class T>
+__global__ void iamax_kernel_t(int n, const T *x, int incx, int *result, int want_max)
+{
+    __shared__ T bv[RED_THREADS];
+    __shared__ int bi[RED_THREADS];
+    T best = T(0);
+    int idx = -1; /* -1: no number seen by this thread */
+    for (long long i = threadIdx.x; i < n; i += RED_THREADS) {
+        const T a = absv(x[i * incx]);
+        if (!(a == a)) continue;
+        if (idx < 0 || (want_max ? a > best : a < best)) { best = a; idx = (int)i; }
+    }
+    bv[threadIdx.x] = best;
+    bi[threadIdx.x] = idx;
+    __syncthreads();
+    for (int w = RED_THREADS / 2; w > 0; w /= 2) {
+        if ((int)threadIdx.x < w) {
+            const int o = threadIdx.x + w;
+            const T v1 = bv[threadIdx.x], v2 = bv[o];
+            const int i1 = bi[threadIdx.x], i2 = bi[o];
+            const bool take = i2 >= 0 && (i1 < 0 || (want_max ? v2 > v1 : v2 < v1) || (v2 == v1 && i2 < i1));
+            if (take) { bv[threadIdx.x] = v2; bi[threadIdx.x] = i2; }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const T a0 = absv(x[0]);
+        *result = (!(a0 == a0) || bi[0] < 0) ? 1 : bi[0] + 1;
+    }
+}
+/* Euclidean norm without overflow or underflow (as nrm2_kernel above) */
+template <class T>
+__global__ void nrm2_kernel_t(int n, const T *x, int incx, T *result)
+{
+    __shared__ T sc[RED_THREADS], sq[RED_THREADS];
+    __shared__ int special[RED_THREADS];
+    T scale = T(0), ssq = T(1);
+    int flags = 0;
+    for (long long i = threadIdx.x; i < n; i += RED_THREADS) {
+        const T a = absv(x[i * incx]);
+        if (a != a) { flags |= 2; continue; }
+        if (a > big_value<T>()) { flags |= 1; continue; }
+        if (a == T(0)) continue;
+        if (scale < a) { const T r = scale / a; ssq = T(1) + ssq * r * r; scale = a; }
+        else { const T r = a / scale; ssq += r * r; }
+    }
+    sc[threadIdx.x] = scale;
+    sq[threadIdx.x] = ssq;
+    special[threadIdx.x] = flags;
+    __syncthreads();
+    for (int w = RED_THREADS / 2; w > 0; w /= 2) {
+        if ((int)threadIdx.x < w) {
+            const int o = threadIdx.x + w;
+            T s1 = sc[threadIdx.x], q1 = sq[threadIdx.x], s2 = sc[o], q2 = sq[o];
+            if (s2 > s1) { T t = s1; s1 = s2; s2 = t; t = q1; q1 = q2; q2 = t; }
+            if (s2 > T(0)) { const T r = s2 / s1; q1 += q2 * r * r; }
+            sc[threadIdx.x] = s1;
+            sq[threadIdx.x] = q1;
+            special[threadIdx.x] |= special[o];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const int f = special[0];
+        T r;
+        if (f & 2) r = (T)NAN;
+        else if (f & 1) r = (T)INFINITY;
+        else r = sc[0] == T(0) ? T(0) : sc[0] * sqrt(sq[0]);
+        *result = r;
+    }
+}
+
+template <class T>
+__global__ void gemv_n_kernel_t(int m, int n, T alpha, const T *alpha_dev, const T *a, long long lda, const T *x, int incx,
+                                T beta, const T *beta_dev, T *y, int incy)
+{
+    const T al = alpha_dev ? *alpha_dev : alpha;
+    const T be = beta_dev ? *beta_dev : beta;
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= m) return;
+    T s = T(0);
+    if (al != T(0))
+        for (int j = 0; j < n; ++j) s += a[i + j * lda] * x[vec_index(j, n, incx)];
+    T *yi = y + vec_index(i, m, incy);
+    T r = al != T(0) ? al * s : T(0);
+    if (be != T(0)) r += be * *yi;
+    *yi = r;
+}
+
+template <class T>
+__global__ void gemv_t_kernel_t(int m, int n, T alpha, const T *alpha_dev, const T *a, long long lda, const T *x, int incx,
+                                T beta, const T *beta_dev, T *y, int incy)
+{
+    __shared__ T part[RED_THREADS];
+    const T al = alpha_dev ? *alpha_dev : alpha;
+    const T be = beta_dev ? *beta_dev : beta;
+    const long long j = blockIdx.x;
+    T s = T(0);
+    if (al != T(0))
+        for (int i = threadIdx.x; i < m; i += RED_THREADS) s += a[i + j * lda] * x[vec_index(i, m, incx)];
+    part[threadIdx.x] = s;
+    __syncthreads();
+    for (int w = RED_THREADS / 2; w > 0; w /= 2) {
+        if ((int)threadIdx.x < w) part[threadIdx.x] += part[threadIdx.x + w];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        T *yj = y + vec_index(j, n, incy);
+        T r = al != T(0) ? al * part[0] : T(0);
+        if (be != T(0)) r += be * *yj;
+        *yj = r;
+    }
+}
+
+template <class T>
+cublasStatus_t finish_scalar_t(cublasHandle_t h, T *result, T *dev)
+{
+    if (device_mode(h)) return CUBLAS_STATUS_SUCCESS;
+    cudaError_t e = cudaMemcpyAsync(result, dev, sizeof(T), cudaMemcpyDeviceToHost, h->stream);
+    if (e == cudaSuccess) e = cudaStreamSynchronize(h->stream);
+    return from_cuda(e);
+}
+
+template <class T>
+cublasStatus_t zero_scalar_t(cublasHandle_t h, T *result)
+{
+    if (!device_mode(h)) {
+        *result = T(0);
+        return CUBLAS_STATUS_SUCCESS;
+    }
+    return from_cuda(cudaMemsetAsync(result, 0, sizeof(T), h->stream));
+}
+
+template <class T>
+cublasStatus_t copy_any(cublasHandle_t h, int n, const T *x, int incx, T *y, int incy)
+{
+    if (h == nullptr) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (n <= 0) return CUBLAS_STATUS_SUCCESS;
+    if (incy == 0 && n > 1) return CUBLAS_STATUS_NOT_SUPPORTED; /* every element writes y[0] */
+    void *args[] = {&n, &x, &incx, &y, &incy};
+    return from_cuda(cudaLaunchKernel(copy_kernel_t<T>, dim3(blocks_for(n)), dim3(256), args, 0, h->stream));
+}
+
+template <class T>
+cublasStatus_t swap_any(cublasHandle_t h, int n, T *x, int incx, T *y, int incy)
+{
+    if (h == nullptr) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (n <= 0) return CUBLAS_STATUS_SUCCESS;
+    if ((incx == 0 || incy == 0) && n > 1) return CUBLAS_STATUS_NOT_SUPPORTED;
+    void *args[] = {&n, &x, &incx, &y, &incy};
+    return from_cuda(cudaLaunchKernel(swap_kernel_t<T>, dim3(blocks_for(n)), dim3(256), args, 0, h->stream));
+}
+
+template <class T>
+cublasStatus_t asum_any(cublasHandle_t h, int n, const T *x, int incx, T *result)
+{
+    if (h == nullptr) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (result == nullptr) return CUBLAS_STATUS_INVALID_VALUE;
+    if (n <= 0 || incx <= 0) return zero_scalar_t(h, result);
+    T *dev = device_mode(h) ? result : reinterpret_cast<T *>(h->scratch);
+    void *args[] = {&n, &x, &incx, &dev};
+    cudaError_t e = cudaLaunchKernel(asum_kernel_t<T>, dim3(1), dim3(RED_THREADS), args, 0, h->stream);
+    if (e != cudaSuccess) return from_cuda(e);
+    return finish_scalar_t(h, result, dev);
+}
+
+template <class T>
+cublasStatus_t iamax_any(cublasHandle_t h, int n, const T *x, int incx, int *result, int want_max)
+{
+    if (h == nullptr) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (result == nullptr) return CUBLAS_STATUS_INVALID_VALUE;
+    if (n <= 0 || incx <= 0) return zero_scalar_t(h, result);
+    int *dev = device_mode(h) ? result : reinterpret_cast<int *>(h->scratch);
+    void *args[] = {&n, &x, &incx, &dev, &want_max};
+    cudaError_t e = cudaLaunchKernel(iamax_kernel_t<T>, dim3(1), dim3(RED_THREADS), args, 0, h->stream);
+    if (e != cudaSuccess) return from_cuda(e);
+    return finish_scalar_t(h, result, dev);
+}
+
+template <class TX, class TR, class Acc>
+cublasStatus_t dot_launch(cublasHandle_t h, int n, const void *x, int incx, const void *y, int incy, void *result)
+{
+    TR *dev = device_mode(h) ? static_cast<TR *>(result) : reinterpret_cast<TR *>(h->scratch);
+    const TX *xp = static_cast<const TX *>(x), *yp = static_cast<const TX *>(y);
+    void *args[] = {&n, &xp, &incx, &yp, &incy, &dev};
+    cudaError_t e = cudaLaunchKernel(dot_kernel_t<TX, TR, Acc>, dim3(1), dim3(RED_THREADS), args, 0, h->stream);
+    if (e != cudaSuccess) return from_cuda(e);
+    return finish_scalar_t(h, static_cast<TR *>(result), dev);
+}
+
+template <class T>
+cublasStatus_t gemv_any(cublasHandle_t h, cublasOperation_t trans, int m, int n, const T *alpha, const T *A, int lda,
+                        const T *x, int incx, const T *beta, T *y, int incy)
+{
+    if (h == nullptr) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (!valid_op(trans) || m < 0 || n < 0 || lda < (m > 1 ? m : 1) || incx == 0 || incy == 0 || alpha == nullptr ||
+        beta == nullptr)
+        return CUBLAS_STATUS_INVALID_VALUE;
+    if (m == 0 || n == 0) return CUBLAS_STATUS_SUCCESS;
+    T al = T(0), be = T(0);
+    const T *al_dev = nullptr, *be_dev = nullptr;
+    if (device_mode(h)) {
+        al_dev = alpha;
+        be_dev = beta;
+    } else {
+        al = *alpha;
+        be = *beta;
+        if (al == T(0) && be == T(1)) return CUBLAS_STATUS_SUCCESS;
+    }
+    long long ldl = lda;
+    void *args[] = {&m, &n, &al, &al_dev, &A, &ldl, &x, &incx, &be, &be_dev, &y, &incy};
+    cudaError_t e;
+    if (trans == CUBLAS_OP_N)
+        e = cudaLaunchKernel(gemv_n_kernel_t<T>, dim3((unsigned)((m + 255) / 256)), dim3(256), args, 0, h->stream);
+    else
+        e = cudaLaunchKernel(gemv_t_kernel_t<T>, dim3((unsigned)n), dim3(RED_THREADS), args, 0, h->stream);
+    return from_cuda(e);
+}
+
+} // namespace
+
+extern "C" {
+
+cublasStatus_t cublasDaxpy_v2(cublasHandle_t handle, int n, const double *alpha, const double *x, int incx, double *y,
+                              int incy)
+{
+    if (handle == nullptr) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (alpha == nullptr) return CUBLAS_STATUS_INVALID_VALUE;
+    if (n <= 0) return CUBLAS_STATUS_SUCCESS;
+    if (incy == 0 && n > 1) return CUBLAS_STATUS_NOT_SUPPORTED;
+    double a = 0.0;
+    const double *a_dev = nullptr;
+    if (device_mode(handle)) a_dev = alpha;
+    else if ((a = *alpha) == 0.0) return CUBLAS_STATUS_SUCCESS;
+    void *args[] = {&n, &a, &a_dev, &x, &incx, &y, &incy};
+    return from_cuda(cudaLaunchKernel(axpy_kernel_t<double>, dim3(blocks_for(n)), dim3(256), args, 0, handle->stream));
+}
+
+cublasStatus_t cublasDscal_v2(cublasHandle_t handle, int n, const double *alpha, double *x, int incx)
+{
+    if (handle == nullptr) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (alpha == nullptr) return CUBLAS_STATUS_INVALID_VALUE;
+    if (n <= 0 || incx <= 0) return CUBLAS_STATUS_SUCCESS;
+    double a = 0.0;
+    const double *a_dev = nullptr;
+    if (device_mode(handle)) a_dev = alpha;
+    else a = *alpha;
+    void *args[] = {&n, &a, &a_dev, &x, &incx};
+    return from_cuda(cudaLaunchKernel(scal_kernel_t<double>, dim3(blocks_for(n)), dim3(256), args, 0, handle->stream));
+}
+
+cublasStatus_t cublasDdot_v2(cublasHandle_t handle, int n, const double *x, int incx, const double *y, int incy,
+                             double *result)
+{
+    if (handle == nullptr) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (result == nullptr) return CUBLAS_STATUS_INVALID_VALUE;
+    if (n <= 0) return zero_scalar_t(handle, result);
+    return dot_launch<double, double, double>(handle, n, x, incx, y, incy, result);
+}
+
+cublasStatus_t cublasDnrm2_v2(cublasHandle_t handle, int n, const double *x, int incx, double *result)
+{
+    if (handle == nullptr) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (result == nullptr) return CUBLAS_STATUS_INVALID_VALUE;
+    if (n <= 0 || incx <= 0) return zero_scalar_t(handle, result);
+    double *dev = device_mode(handle) ? result : reinterpret_cast<double *>(handle->scratch);
+    void *args[] = {&n, &x, &incx, &dev};
+    cudaError_t e = cudaLaunchKernel(nrm2_kernel_t<double>, dim3(1), dim3(RED_THREADS), args, 0, handle->stream);
+    if (e != cudaSuccess) return from_cuda(e);
+    return finish_scalar_t(handle, result, dev);
+}
+
+cublasStatus_t cublasScopy_v2(cublasHandle_t h, int n, const float *x, int incx, float *y, int incy) { return copy_any(h, n, x, incx, y, incy); }
+cublasStatus_t cublasDcopy_v2(cublasHandle_t h, int n, const double *x, int incx, double *y, int incy) { return copy_any(h, n, x, incx, y, incy); }
+cublasStatus_t cublasSswap_v2(cublasHandle_t h, int n, float *x, int incx, float *y, int incy) { return swap_any(h, n, x, incx, y, incy); }
+cublasStatus_t cublasDswap_v2(cublasHandle_t h, int n, double *x, int incx, double *y, int incy) { return swap_any(h, n, x, incx, y, incy); }
+cublasStatus_t cublasSasum_v2(cublasHandle_t h, int n, const float *x, int incx, float *r) { return asum_any(h, n, x, incx, r); }
+cublasStatus_t cublasDasum_v2(cublasHandle_t h, int n, const double *x, int incx, double *r) { return asum_any(h, n, x, incx, r); }
+cublasStatus_t cublasIsamax_v2(cublasHandle_t h, int n, const float *x, int incx, int *r) { return iamax_any(h, n, x, incx, r, 1); }
+cublasStatus_t cublasIdamax_v2(cublasHandle_t h, int n, const double *x, int incx, int *r) { return iamax_any(h, n, x, incx, r, 1); }
+cublasStatus_t cublasIsamin_v2(cublasHandle_t h, int n, const float *x, int incx, int *r) { return iamax_any(h, n, x, incx, r, 0); }
+cublasStatus_t cublasIdamin_v2(cublasHandle_t h, int n, const double *x, int incx, int *r) { return iamax_any(h, n, x, incx, r, 0); }
+
+cublasStatus_t cublasDgemv_v2(cublasHandle_t handle, cublasOperation_t trans, int m, int n, const double *alpha,
+                              const double *A, int lda, const double *x, int incx, const double *beta, double *y,
+                              int incy)
+{
+    return gemv_any(handle, trans, m, n, alpha, A, lda, x, incx, beta, y, incy);
+}
+
+cublasStatus_t cublasDotEx(cublasHandle_t handle, int n, const void *x, cudaDataType xType, int incx, const void *y,
+                           cudaDataType yType, int incy, void *result, cudaDataType resultType,
+                           cudaDataType executionType)
+{
+    if (handle == nullptr) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (result == nullptr) return CUBLAS_STATUS_INVALID_VALUE;
+    if (xType != yType) return CUBLAS_STATUS_NOT_SUPPORTED;
+    const bool f32 = executionType == CUDA_R_32F, f64 = executionType == CUDA_R_64F;
+    if (n <= 0) {
+        switch (resultType) {
+        case CUDA_R_32F: return zero_scalar_t(handle, static_cast<float *>(result));
+        case CUDA_R_64F: return zero_scalar_t(handle, static_cast<double *>(result));
+        case CUDA_R_16F: case CUDA_R_16BF: return zero_scalar_t(handle, static_cast<uint16_t *>(result));
+        default: return CUBLAS_STATUS_NOT_SUPPORTED;
+        }
+    }
+    if (xType == CUDA_R_32F && resultType == CUDA_R_32F && f32) return dot_launch<float, float, float>(handle, n, x, incx, y, incy, result);
+    if (xType == CUDA_R_64F && resultType == CUDA_R_64F && f64) return dot_launch<double, double, double>(handle, n, x, incx, y, incy, result);
+    if (xType == CUDA_R_16F && resultType == CUDA_R_16F && f32) return dot_launch<f16, f16, float>(handle, n, x, incx, y, incy, result);
+    if (xType == CUDA_R_16F && resultType == CUDA_R_32F && f32) return dot_launch<f16, float, float>(handle, n, x, incx, y, incy, result);
+    if (xType == CUDA_R_16BF && resultType == CUDA_R_16BF && f32) return dot_launch<bf16, bf16, float>(handle, n, x, incx, y, incy, result);
+    if (xType == CUDA_R_16BF && resultType == CUDA_R_32F && f32) return dot_launch<bf16, float, float>(handle, n, x, incx, y, incy, result);
+    return CUBLAS_STATUS_NOT_SUPPORTED;
+}
+
+/* real types only: the conjugate changes nothing */
+cublasStatus_t cublasDotcEx(cublasHandle_t handle, int n, const void *x, cudaDataType xType, int incx, const void *y,
+                            cudaDataType yType, int incy, void *result, cudaDataType resultType,
+                            cudaDataType executionType)
+{
+    return cublasDotEx(handle, n, x, xType, incx, y, yType, incy, result, resultType, executionType);
+}
+
+} /* extern "C" */

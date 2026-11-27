@@ -183,12 +183,39 @@ cublasStatus_t cublasSdot_v2(cublasHandle_t handle, int n, const float *x, int i
                              const float *y, int incy, float *result);
 cublasStatus_t cublasSnrm2_v2(cublasHandle_t handle, int n, const float *x, int incx,
                               float *result);
+cublasStatus_t cublasDaxpy_v2(cublasHandle_t handle, int n, const double *alpha, const double *x, int incx, double *y,
+                              int incy);
+cublasStatus_t cublasDscal_v2(cublasHandle_t handle, int n, const double *alpha, double *x, int incx);
+cublasStatus_t cublasDdot_v2(cublasHandle_t handle, int n, const double *x, int incx, const double *y, int incy,
+                             double *result);
+cublasStatus_t cublasDnrm2_v2(cublasHandle_t handle, int n, const double *x, int incx, double *result);
+cublasStatus_t cublasScopy_v2(cublasHandle_t handle, int n, const float *x, int incx, float *y, int incy);
+cublasStatus_t cublasDcopy_v2(cublasHandle_t handle, int n, const double *x, int incx, double *y, int incy);
+cublasStatus_t cublasSswap_v2(cublasHandle_t handle, int n, float *x, int incx, float *y, int incy);
+cublasStatus_t cublasDswap_v2(cublasHandle_t handle, int n, double *x, int incx, double *y, int incy);
+cublasStatus_t cublasSasum_v2(cublasHandle_t handle, int n, const float *x, int incx, float *result);
+cublasStatus_t cublasDasum_v2(cublasHandle_t handle, int n, const double *x, int incx, double *result);
+cublasStatus_t cublasIsamax_v2(cublasHandle_t handle, int n, const float *x, int incx, int *result);
+cublasStatus_t cublasIdamax_v2(cublasHandle_t handle, int n, const double *x, int incx, int *result);
+cublasStatus_t cublasIsamin_v2(cublasHandle_t handle, int n, const float *x, int incx, int *result);
+cublasStatus_t cublasIdamin_v2(cublasHandle_t handle, int n, const double *x, int incx, int *result);
+/* x and y of one type (16F, 16BF, 32F, 64F), summed in executionType (32F;
+   64F for 64F data), the result of x's type or 32F */
+cublasStatus_t cublasDotEx(cublasHandle_t handle, int n, const void *x, cudaDataType xType, int incx, const void *y,
+                           cudaDataType yType, int incy, void *result, cudaDataType resultType,
+                           cudaDataType executionType);
+cublasStatus_t cublasDotcEx(cublasHandle_t handle, int n, const void *x, cudaDataType xType, int incx, const void *y,
+                            cudaDataType yType, int incy, void *result, cudaDataType resultType,
+                            cudaDataType executionType);
 
 /* ---- level 2 ------------------------------------------------------------ */
 
 cublasStatus_t cublasSgemv_v2(cublasHandle_t handle, cublasOperation_t trans, int m, int n,
                               const float *alpha, const float *A, int lda, const float *x,
                               int incx, const float *beta, float *y, int incy);
+cublasStatus_t cublasDgemv_v2(cublasHandle_t handle, cublasOperation_t trans, int m, int n, const double *alpha,
+                              const double *A, int lda, const double *x, int incx, const double *beta, double *y,
+                              int incy);
 
 /* ---- level 3 ------------------------------------------------------------ */
 
