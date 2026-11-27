@@ -16,6 +16,7 @@
  *                                               thread, or the first num_valid threads)
  *   WarpReduce<T, LOGICAL_WARP_THREADS>         Reduce, Sum (optionally valid_items)
  *   DeviceReduce                                Sum, Max, Min, Reduce
+ *   DeviceSegmentedReduce                       Sum, Max, Min, Reduce
  *   DeviceScan                                  InclusiveSum, ExclusiveSum,
  *                                               InclusiveScan, ExclusiveScan
  *   DeviceRadixSort                             SortPairs(Descending), SortKeys(Descending)
@@ -608,6 +609,41 @@ __global__ void reduce_final(InIt partial, long long count, OutIt out, Op op, In
     }
 }
 
+/* One block per segment (grid-stride over segments): segment s is
+   [begin[s], end[s]); out[s] = op(init, items), or init when empty. */
+template <typename InIt, typename OutIt, typename BeginIt, typename EndIt, typename Acc,
+          typename Op, typename Init>
+__global__ void reduce_segments(InIt in, OutIt out, long long nseg, BeginIt begin, EndIt end,
+                                Op op, Init init)
+{
+    __shared__ raw_array<Acc, kThreads> vs;
+    __shared__ int fs[kThreads];
+    Acc *v = vs.data();
+    const int t = threadIdx.x;
+    for (long long seg = blockIdx.x; seg < nseg; seg += gridDim.x) {
+        const long long b = (long long)begin[seg], e = (long long)end[seg];
+        Acc acc{};
+        int have = 0;
+        for (long long i = b + t; i < e; i += kThreads) {
+            Acc x = (Acc)in[i];
+            acc = have ? (Acc)op(acc, x) : x;
+            have = 1;
+        }
+        v[t] = acc;
+        fs[t] = have;
+        __syncthreads();
+        for (int s = kThreads / 2; s > 0; s >>= 1) {
+            if (t < s && fs[t + s]) {
+                v[t] = fs[t] ? (Acc)op(v[t], v[t + s]) : v[t + s];
+                fs[t] = 1;
+            }
+            __syncthreads();
+        }
+        if (t == 0) out[seg] = fs[0] ? (Acc)op((Acc)init, v[0]) : (Acc)init;
+        __syncthreads(); /* v and fs are reused by the next segment */
+    }
+}
+
 /* -- scan: tile aggregates, scan of the aggregates, tiles -- */
 
 template <typename Acc, typename InIt>
@@ -1185,6 +1221,74 @@ private:
     static T highest()
     {
         return std::numeric_limits<T>::max();
+    }
+};
+
+/* ---- DeviceSegmentedReduce ------------------------------------------- */
+
+/* Segment i is [d_begin_offsets[i], d_end_offsets[i]); an empty one
+   (end <= begin) gives the initial value: 0 for Sum, the lowest / highest
+   value of the type for Max / Min. No temporary storage is used (the query
+   still answers at least 1 byte). ArgMin / ArgMax are not here. */
+struct DeviceSegmentedReduce {
+    template <typename InputIteratorT, typename OutputIteratorT, typename BeginOffsetIteratorT,
+              typename EndOffsetIteratorT, typename ReductionOpT, typename T>
+    static cudaError_t Reduce(void *d_temp_storage, size_t &temp_storage_bytes,
+                              InputIteratorT d_in, OutputIteratorT d_out, long long num_segments,
+                              BeginOffsetIteratorT d_begin_offsets,
+                              EndOffsetIteratorT d_end_offsets, ReductionOpT reduction_op,
+                              T initial_value, cudaStream_t stream = 0)
+    {
+        using namespace ocu_detail;
+        using Acc = value_of<InputIteratorT>;
+        if (d_temp_storage == nullptr) return finish_query(temp_storage_bytes, 0);
+        cudaError_t e = check_space(temp_storage_bytes, 0);
+        if (e != cudaSuccess) return e;
+        if (num_segments <= 0) return cudaSuccess;
+        const unsigned grid = (unsigned)(num_segments < 65535 ? num_segments : 65535);
+        reduce_segments<InputIteratorT, OutputIteratorT, BeginOffsetIteratorT, EndOffsetIteratorT,
+                        Acc, ReductionOpT, T><<<grid, kThreads, 0, stream>>>(
+            d_in, d_out, num_segments, d_begin_offsets, d_end_offsets, reduction_op,
+            initial_value);
+        return cudaPeekAtLastError();
+    }
+
+    template <typename InputIteratorT, typename OutputIteratorT, typename BeginOffsetIteratorT,
+              typename EndOffsetIteratorT>
+    static cudaError_t Sum(void *d_temp_storage, size_t &temp_storage_bytes, InputIteratorT d_in,
+                           OutputIteratorT d_out, long long num_segments,
+                           BeginOffsetIteratorT d_begin_offsets, EndOffsetIteratorT d_end_offsets,
+                           cudaStream_t stream = 0)
+    {
+        using Acc = ocu_detail::value_of<InputIteratorT>;
+        return Reduce(d_temp_storage, temp_storage_bytes, d_in, d_out, num_segments,
+                      d_begin_offsets, d_end_offsets, cub::Sum(), Acc(0), stream);
+    }
+
+    template <typename InputIteratorT, typename OutputIteratorT, typename BeginOffsetIteratorT,
+              typename EndOffsetIteratorT>
+    static cudaError_t Max(void *d_temp_storage, size_t &temp_storage_bytes, InputIteratorT d_in,
+                           OutputIteratorT d_out, long long num_segments,
+                           BeginOffsetIteratorT d_begin_offsets, EndOffsetIteratorT d_end_offsets,
+                           cudaStream_t stream = 0)
+    {
+        using Acc = ocu_detail::value_of<InputIteratorT>;
+        return Reduce(d_temp_storage, temp_storage_bytes, d_in, d_out, num_segments,
+                      d_begin_offsets, d_end_offsets, cub::Max(),
+                      std::numeric_limits<Acc>::lowest(), stream);
+    }
+
+    template <typename InputIteratorT, typename OutputIteratorT, typename BeginOffsetIteratorT,
+              typename EndOffsetIteratorT>
+    static cudaError_t Min(void *d_temp_storage, size_t &temp_storage_bytes, InputIteratorT d_in,
+                           OutputIteratorT d_out, long long num_segments,
+                           BeginOffsetIteratorT d_begin_offsets, EndOffsetIteratorT d_end_offsets,
+                           cudaStream_t stream = 0)
+    {
+        using Acc = ocu_detail::value_of<InputIteratorT>;
+        return Reduce(d_temp_storage, temp_storage_bytes, d_in, d_out, num_segments,
+                      d_begin_offsets, d_end_offsets, cub::Min(),
+                      std::numeric_limits<Acc>::max(), stream);
     }
 };
 

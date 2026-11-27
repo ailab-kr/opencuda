@@ -3,7 +3,7 @@ id: libs-cub-subset
 kind: component
 name: CUB parallel primitives subset (cub/cub.cuh) and programmatic dependent launch declarations
 spec_sources:
-  - CUB API documentation (nvidia.github.io/cccl, cub API pages): DeviceReduce, DeviceScan, DeviceRadixSort, DeviceSegmentedRadixSort, DeviceSegmentedSort, BlockScan, BlockLoad, BlockStore (signatures, two-phase temporary storage, stability, floating-point key order, bit ranges, data arrangements)
+  - CUB API documentation (nvidia.github.io/cccl, cub API pages): DeviceReduce, DeviceSegmentedReduce, DeviceScan, DeviceRadixSort, DeviceSegmentedRadixSort, DeviceSegmentedSort, BlockScan, BlockLoad, BlockStore (signatures, two-phase temporary storage, stability, floating-point key order, bit ranges, data arrangements)
   - CUDA Runtime API reference (docs.nvidia.com/cuda/cuda-runtime-api): cudaLaunchKernelEx / cudaLaunchKernelExC, cudaLaunchConfig_t, cudaLaunchAttribute, cudaLaunchAttributeValue, enum cudaLaunchAttributeID
   - CUDA C++ Programming Guide (public): programmatic dependent launch (cudaGridDependencySynchronize, cudaTriggerProgrammaticLaunchCompletion), __syncthreads memory visibility
 backend_map:
@@ -30,6 +30,7 @@ CUB(`namespace cub`, 헤더 하나):
 - 연산자 `Sum`, `Max`, `Min`, `NullType`; 알고리즘 열거형 `BlockScanAlgorithm`, `BlockLoadAlgorithm`, `BlockStoreAlgorithm`(속도만 바꾸고 결과는 같다).
 - `BlockScan<T, X, ALG, Y, Z>`: `TempStorage`, `InclusiveSum/ExclusiveSum/InclusiveScan/ExclusiveScan`(항목 하나, 블록 합계 출력 있는/없는 형, 스레드당 배열 형). 배열 형은 블록 배치(스레드 i가 i*N..i*N+N-1).
 - `BlockLoad/BlockStore<T, X, N, ALG>`: `STRIPED`는 줄무늬 배치(i*블록스레드+t), 나머지는 블록 배치. 부분 적재(`valid_items`, 범위 밖 기본값), 부분 저장. 전치 알고리즘은 공유 메모리를 거쳐 읽고 쓴다.
+- `DeviceSegmentedReduce::Sum/Max/Min/Reduce`(구간 i는 [begin[i], end[i]), end <= begin이면 빈 구간이라 초깃값. 구간마다 블록 하나라 아주 긴 구간 하나가 전체 시간을 정한다. ArgMin/ArgMax는 없음).
 - `DeviceReduce::Sum/Max/Min/Reduce`, `DeviceScan::InclusiveSum/ExclusiveSum/InclusiveScan/ExclusiveScan`(제자리 가능).
 - `DeviceRadixSort::SortPairs(Descending)/SortKeys(Descending)`: 안정 정렬, 비트 범위 [begin_bit, end_bit).
 - `DeviceSegmentedRadixSort::SortPairs(Descending)/SortKeys(Descending)`, `DeviceSegmentedSort::(Stable)SortPairs(Descending)/(Stable)SortKeys(Descending)`: 구간마다 블록 하나, 안정 정렬.
