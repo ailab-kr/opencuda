@@ -43,3 +43,7 @@
 | Intel oneAPI DPC++/C++ 컴파일러 문서(OpenMP 옵션, libiomp5) | https://www.intel.com/content/www/us/en/docs/dpcpp-cpp-compiler/developer-guide-reference/ | 2026-11-27 |
 | LLVM / Clang 소스(Apache-2.0 WITH LLVM-exception): `clang/lib/Sema/SemaType.cpp`(SPIR-V용 CUDA·HIP 커널의 호출 규약), `clang/lib/CodeGen/Targets/SPIR.cpp`와 `clang/lib/CodeGen/CGCall.cpp`(`setCUDAKernelCallingConvention`), 그리고 이를 쓴 커밋(D114407, #110447). spirv64에서 호스트 코드가 커널을 함수 포인터에 담지 못하는 이유를 찾고 `compiler/spirv/clang-hipspv-kernel-address.patch`를 쓰려고 읽음 | https://github.com/llvm/llvm-project | 2026-11-27 |
 | Khronos OpenCL 확장 명세 cl_intel_device_attribute_query(CL_DEVICE_NUM_SLICES_INTEL, CL_DEVICE_NUM_SUB_SLICES_PER_SLICE_INTEL): Intel GPU의 멀티프로세서 수 | https://registry.khronos.org/OpenCL/extensions/intel/cl_intel_device_attribute_query.html | 2026-11-27 |
+| CUDA Math API 레퍼런스(함수 목록, 인자 형, 특수값; 정확도 수치는 Programming Guide 부록) | https://docs.nvidia.com/cuda/cuda-math-api/ | 2026-11-28 |
+| IEEE 754-2019(반올림 속성, 정확한 0 합의 부호, remainder) | https://standards.ieee.org/ieee/754/6210/ | 2026-11-28 |
+| fdlibm, Sun Microsystems 1993("freely granted"): acosh·asinh·atanh 공식과 계수, sin·cos 커널(기존 장치 수학 라이브러리도 사용) | https://www.netlib.org/fdlibm/ | 2026-11-28 |
+| Knuth, TAOCP 2권(two-sum); Sterbenz, Floating-Point Computation(1974, 정확한 뺄셈); Figueroa, "When is double rounding innocuous?"(1995) | 교과서·논문 | 2026-11-28 |
