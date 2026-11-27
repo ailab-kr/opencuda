@@ -364,7 +364,7 @@ def main(argv):
         ll2.write_text(text)
         opt = os.environ.get("OCU_SPV_OPT") or str(Path(llc).with_name("opt"))
         if infer and Path(opt).exists():
-            r = subprocess.run([opt, "-passes=always-inline,infer-address-spaces,instcombine,simplifycfg", str(ll2), "-o", str(bc)],
+            r = subprocess.run([opt, "-passes=always-inline,infer-address-spaces,instcombine<no-verify-fixpoint>,simplifycfg", str(ll2), "-o", str(bc)],
                                capture_output=True, text=True)
         else:
             r = subprocess.run([llvm_as, str(ll2), "-o", str(bc)], capture_output=True, text=True)
