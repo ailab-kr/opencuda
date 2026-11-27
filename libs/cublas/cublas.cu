@@ -111,6 +111,9 @@ CB_HD inline uint16_t float_to_bf16(float f)
     return uint16_t((x + 0x7fffu + ((x >> 16) & 1u)) >> 16);
 }
 
+template <class Acc> CB_HD inline Acc ld(const int8_t *p) { return Acc(*p); }
+template <class Acc> CB_HD inline Acc ld(const int32_t *p) { return Acc(*p); }
+template <class Acc> CB_HD inline void st(int32_t *p, Acc v) { *p = int32_t(v); }
 template <class Acc> CB_HD inline Acc ld(const float *p) { return Acc(*p); }
 template <class Acc> CB_HD inline Acc ld(const double *p) { return Acc(*p); }
 template <class Acc> CB_HD inline Acc ld(const f16 *p) { return Acc(half_to_float(p->v)); }
@@ -594,7 +597,7 @@ cublasStatus_t launch_gemm(cublasHandle_t h, const gemm_params &p, int batch)
     return launch_gemm_cfg<TA, TC, TS, Acc, 64, 64, 16, 4, 4>(h, p, batch);
 }
 
-enum class combo { none, s, d, h16, h_s, h_f, bf_s, bf_f };
+enum class combo { none, s, d, h16, h_s, h_f, bf_s, bf_f, i8_i32 };
 
 bool valid_op(cublasOperation_t o)
 {
@@ -634,16 +637,21 @@ combo pick(cudaDataType_t at, cudaDataType_t bt, cudaDataType_t ct, int compute)
     case CUBLAS_COMPUTE_64F_PEDANTIC:
         return at == CUDA_R_64F && ct == CUDA_R_64F ? combo::d : combo::none;
 #endif
+    /* 8-bit integers, 32-bit integer sums and result, int32 alpha and beta */
+    case CUBLAS_COMPUTE_32I:
+    case CUBLAS_COMPUTE_32I_PEDANTIC:
+    case CUDA_R_32I: /* the older cudaDataType_t compute value */
+        return at == CUDA_R_8I && ct == CUDA_R_32I ? combo::i8_i32 : combo::none;
     default:
-        return combo::none; /* 16F_PEDANTIC, integer and complex compute */
+        return combo::none; /* 16F_PEDANTIC and complex compute */
     }
 }
 
-enum class scale { f32, f64, f16 };
+enum class scale { f32, f64, f16, i32 };
 
 scale scale_of(combo c)
 {
-    return c == combo::d ? scale::f64 : c == combo::h16 ? scale::f16 : scale::f32;
+    return c == combo::d ? scale::f64 : c == combo::h16 ? scale::f16 : c == combo::i8_i32 ? scale::i32 : scale::f32;
 }
 
 double host_scalar(scale s, const void *p)
@@ -651,6 +659,7 @@ double host_scalar(scale s, const void *p)
     switch (s) {
     case scale::f64: return *static_cast<const double *>(p);
     case scale::f16: return half_to_float(static_cast<const f16 *>(p)->v);
+    case scale::i32: return (double)*static_cast<const int32_t *>(p); /* exact */
     default: return *static_cast<const float *>(p);
     }
 }
@@ -852,6 +861,8 @@ cublasStatus_t gemm_any(cublasHandle_t h, cublasOperation_t transa, cublasOperat
     case combo::h_f: return launch_gemm<f16, float, float, float>(h, p, batch);
     case combo::bf_s: return launch_gemm<bf16, bf16, float, float>(h, p, batch);
     case combo::bf_f: return launch_gemm<bf16, float, float, float>(h, p, batch);
+    /* int32 sums: exact while |sum| < 2^31 (k <= 2^17 for any int8 values) */
+    case combo::i8_i32: return launch_gemm<int8_t, int32_t, int32_t, int32_t>(h, p, batch);
     default: return CUBLAS_STATUS_NOT_SUPPORTED;
     }
 }
