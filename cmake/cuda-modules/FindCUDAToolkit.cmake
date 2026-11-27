@@ -4,8 +4,8 @@
 #
 #   CUDA::cudart, CUDA::cudart_static, CUDA::cuda_driver, CUDA::cudadevrt
 #                       our runtime (ocu_cudart and the backends)
-#   CUDA::cublas, CUDA::cublas_static
-#                       ocu_cublas_<OCU_TARGET> (cublas_v2.h, built for the
+#   CUDA::cublas, CUDA::cublas_static, CUDA::cublasLt, CUDA::cublasLt_static
+#                       ocu_cublas_<OCU_TARGET> (cublas_v2.h and cublasLt.h, built for the
 #                       same target as the CUDA code: cpu or nvidia), else
 #                       ocu_blas (functions it does not have stay
 #                       unresolved at link time)
@@ -14,8 +14,9 @@
 # Libraries without an implementation get no target, so a project that
 # needs one fails at configure time with CMake's own message, unless the
 # name is in OCU_CUDA_PLACEHOLDER_LIBS (default: cublasLt, which projects
-# usually link next to cuBLAS): those get an empty target, a status
-# message, and their functions stay unresolved at link time.
+# usually link next to cuBLAS, when no cuBLAS library was built): those get
+# an empty target, a status message, and their functions stay unresolved
+# at link time.
 #
 # Nothing outside the toolkit folder is searched or run.
 get_filename_component(_ocu_root "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
@@ -94,7 +95,8 @@ if(CUDAToolkit_FOUND)
     set(CUDA_cublas_LIBRARY "${_ocu_root}/lib/libocu_blas.a")
   endif()
   if(CUDA_cublas_LIBRARY)
-    foreach(_ocu_t cublas cublas_static)
+    # cublasLt is in the same library (cublasLt.h)
+    foreach(_ocu_t cublas cublas_static cublasLt cublasLt_static)
       if(NOT TARGET CUDA::${_ocu_t})
         add_library(CUDA::${_ocu_t} INTERFACE IMPORTED)
         set_target_properties(CUDA::${_ocu_t} PROPERTIES
@@ -104,15 +106,15 @@ if(CUDAToolkit_FOUND)
     endforeach()
   endif()
   if(NOT DEFINED OCU_CUDA_PLACEHOLDER_LIBS)
-    set(OCU_CUDA_PLACEHOLDER_LIBS cublasLt cublasLt_static)
+    set(OCU_CUDA_PLACEHOLDER_LIBS cublasLt cublasLt_static) # only when there is no cuBLAS library
   endif()
   foreach(_ocu_t IN LISTS OCU_CUDA_PLACEHOLDER_LIBS)
     if(NOT TARGET CUDA::${_ocu_t})
       add_library(CUDA::${_ocu_t} INTERFACE IMPORTED)
       set_target_properties(CUDA::${_ocu_t} PROPERTIES INTERFACE_LINK_LIBRARIES "CUDA::toolkit")
       message(STATUS "ocu: CUDA::${_ocu_t} has no implementation yet (empty target)")
+      set(CUDAToolkit_${_ocu_t}_FOUND FALSE)
     endif()
-    set(CUDAToolkit_${_ocu_t}_FOUND FALSE)
   endforeach()
 endif()
 

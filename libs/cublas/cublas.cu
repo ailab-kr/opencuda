@@ -21,6 +21,7 @@
 #include <cuda_runtime.h>
 
 #include "cublas_v2.h"
+#include "cublasLt.h"
 #include "ocu_ops.h"
 #include "ocu_rt.h"
 
@@ -1560,3 +1561,471 @@ extern "C" cublasStatus_t ocublasGemmNF4(cublasHandle_t h, int M, int N, int K, 
     if (e != cudaSuccess) return from_cuda(e);
     return st == OCU_OK ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_NOT_SUPPORTED;
 }
+
+/* ---- cuBLASLt (cublasLt.h) ------------------------------------------------
+ * cublasLtMatmul on cublasGemmStridedBatchedEx: D = alpha op(A) op(B) +
+ * beta C, C copied to D first when they differ, then the epilogue (bias per
+ * row of D, ReLU, GELU) as one more kernel over D. Row-major problems are
+ * the column-major problem of the transposes (D^T = op(B)^T op(A)^T, same
+ * op flags, operands swapped, the bias then per column of the column-major
+ * view). The gradient / AUX epilogues, FP8 and scale pointers are not done
+ * (CUBLAS_STATUS_NOT_SUPPORTED). */
+
+struct ocu_cublaslt_context {
+    cublasHandle_t blas;
+};
+struct ocu_cublaslt_matmul_desc {
+    int32_t compute, scale, pointer_mode, transa, transb, transc, fill, bias_type;
+    uint32_t epilogue;
+    const void *bias;
+    int64_t bias_stride;
+    int32_t sm_target;
+    int8_t fast_accum;
+    bool unsupported; /* an attribute that needs what is not done here was set */
+};
+struct ocu_cublaslt_matrix_layout {
+    int32_t type, order;
+    uint64_t rows, cols;
+    int64_t ld;
+    int32_t batch;
+    int64_t stride;
+};
+struct ocu_cublaslt_matmul_preference {
+    uint32_t mode;
+    uint64_t max_ws;
+};
+static_assert(sizeof(ocu_cublaslt_matmul_desc) <= sizeof(cublasLtMatmulDescOpaque_t), "descriptor storage");
+static_assert(sizeof(ocu_cublaslt_matrix_layout) <= sizeof(cublasLtMatrixLayoutOpaque_t), "layout storage");
+static_assert(sizeof(ocu_cublaslt_matmul_preference) <= sizeof(cublasLtMatmulPreferenceOpaque_t), "preference storage");
+
+namespace {
+
+/* the objects inside the caller-visible storage */
+ocu_cublaslt_matmul_desc *lt_desc(cublasLtMatmulDesc_t d) { return reinterpret_cast<ocu_cublaslt_matmul_desc *>(d->data); }
+ocu_cublaslt_matrix_layout *lt_layout(cublasLtMatrixLayout_t l) { return reinterpret_cast<ocu_cublaslt_matrix_layout *>(l->data); }
+ocu_cublaslt_matmul_preference *lt_pref(cublasLtMatmulPreference_t p)
+{
+    return reinterpret_cast<ocu_cublaslt_matmul_preference *>(p->data);
+}
+
+/* GELU as the tanh form: x/2 (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3))) */
+template <class T, class TB, class Acc>
+__global__ void lt_epilogue(T *d, long long ldd, long long stride, int rows, int cols, const TB *bias,
+                            long long bias_stride, int bias_on_rows, int relu, int gelu)
+{
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)rows * cols) return;
+    int b = blockIdx.y;
+    int r = (int)(i % rows), c = (int)(i / rows);
+    T *p = d + b * stride + (long long)c * ldd + r;
+    Acc v = ld<Acc>(p);
+    if (bias != nullptr) v += ld<Acc>(bias + b * bias_stride + (bias_on_rows ? r : c));
+    if (relu) v = v > Acc(0) ? v : Acc(0);
+    if (gelu) {
+        Acc u = Acc(0.7978845608028654) * (v + Acc(0.044715) * v * v * v);
+        Acc t;
+        if constexpr (sizeof(Acc) == 4) t = tanhf(u);
+        else t = tanh(u);
+        v = Acc(0.5) * v * (Acc(1) + t);
+    }
+    st(p, v);
+}
+
+template <class T, class TB, class Acc>
+cudaError_t launch_lt_epilogue(cudaStream_t s, void *d, long long ldd, long long stride, int rows, int cols, int batch,
+                               const void *bias, long long bias_stride, int bias_on_rows, int relu, int gelu)
+{
+    const long long n = (long long)rows * cols;
+    T *dp = static_cast<T *>(d);
+    const TB *bp = static_cast<const TB *>(bias);
+    void *args[] = {&dp, &ldd, &stride, &rows, &cols, &bp, &bias_stride, &bias_on_rows, &relu, &gelu};
+    for (int off = 0; off < batch; off += 65535) {
+        const int nz = batch - off < 65535 ? batch - off : 65535;
+        dp = static_cast<T *>(d) + off * stride;
+        bp = bias != nullptr ? static_cast<const TB *>(bias) + off * bias_stride : nullptr;
+        cudaError_t e = cudaLaunchKernel(lt_epilogue<T, TB, Acc>, dim3((unsigned)((n + 255) / 256), (unsigned)nz),
+                                         dim3(256), args, 0, s);
+        if (e != cudaSuccess) return e;
+    }
+    return cudaSuccess;
+}
+
+size_t lt_type_size(int t)
+{
+    switch (t) {
+    case CUDA_R_32F: case CUDA_R_32I: return 4;
+    case CUDA_R_64F: return 8;
+    case CUDA_R_16F: case CUDA_R_16BF: return 2;
+    case CUDA_R_8I: return 1;
+    default: return 0;
+    }
+}
+
+bool lt_epilogue_known(uint32_t e)
+{
+    return e == CUBLASLT_EPILOGUE_DEFAULT || e == CUBLASLT_EPILOGUE_RELU || e == CUBLASLT_EPILOGUE_BIAS ||
+           e == CUBLASLT_EPILOGUE_RELU_BIAS || e == CUBLASLT_EPILOGUE_GELU || e == CUBLASLT_EPILOGUE_GELU_BIAS;
+}
+
+template <class T>
+cublasStatus_t lt_put(T &field, const void *buf, size_t size)
+{
+    if (size != sizeof(T)) return CUBLAS_STATUS_INVALID_VALUE;
+    memcpy(&field, buf, sizeof(T));
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+template <class T>
+cublasStatus_t lt_get(const T &field, void *buf, size_t size, size_t *written)
+{
+    if (written != nullptr) *written = sizeof(T);
+    if (size == 0 && buf == nullptr && written != nullptr) return CUBLAS_STATUS_SUCCESS; /* size query */
+    if (buf == nullptr || size < sizeof(T)) return CUBLAS_STATUS_INVALID_VALUE;
+    memcpy(buf, &field, sizeof(T));
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+} // namespace
+
+extern "C" {
+
+cublasStatus_t cublasLtCreate(cublasLtHandle_t *handle)
+{
+    if (handle == nullptr) return CUBLAS_STATUS_INVALID_VALUE;
+    auto *h = new (std::nothrow) ocu_cublaslt_context();
+    if (h == nullptr) return CUBLAS_STATUS_ALLOC_FAILED;
+    cublasStatus_t st = cublasCreate(&h->blas);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        delete h;
+        return st;
+    }
+    *handle = h;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtDestroy(cublasLtHandle_t handle)
+{
+    if (handle == nullptr) return CUBLAS_STATUS_NOT_INITIALIZED;
+    cublasStatus_t st = cublasDestroy(handle->blas);
+    delete handle;
+    return st;
+}
+
+size_t cublasLtGetVersion(void) { return 120300; }
+
+cublasStatus_t cublasLtMatmulDescInit(cublasLtMatmulDesc_t desc, cublasComputeType_t computeType,
+                                      cudaDataType_t scaleType)
+{
+    if (desc == nullptr) return CUBLAS_STATUS_INVALID_VALUE;
+    auto *d = new (desc->data) ocu_cublaslt_matmul_desc();
+    d->compute = (int32_t)computeType;
+    d->scale = (int32_t)scaleType;
+    d->pointer_mode = CUBLASLT_POINTER_MODE_HOST;
+    d->transa = d->transb = d->transc = CUBLAS_OP_N;
+    d->fill = CUBLAS_FILL_MODE_FULL;
+    d->epilogue = CUBLASLT_EPILOGUE_DEFAULT;
+    d->bias_type = -1; /* D's type */
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatmulDescCreate(cublasLtMatmulDesc_t *desc, cublasComputeType_t computeType,
+                                        cudaDataType_t scaleType)
+{
+    if (desc == nullptr) return CUBLAS_STATUS_INVALID_VALUE;
+    auto *o = new (std::nothrow) cublasLtMatmulDescOpaque_t();
+    if (o == nullptr) return CUBLAS_STATUS_ALLOC_FAILED;
+    cublasLtMatmulDescInit(o, computeType, scaleType);
+    *desc = o;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatmulDescDestroy(cublasLtMatmulDesc_t desc)
+{
+    delete desc;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatmulDescSetAttribute(cublasLtMatmulDesc_t desc, cublasLtMatmulDescAttributes_t attr,
+                                              const void *buf, size_t sizeInBytes)
+{
+    if (desc == nullptr || buf == nullptr) return CUBLAS_STATUS_INVALID_VALUE;
+    auto &d = *lt_desc(desc);
+    const void *ptr = nullptr;
+    int64_t i64 = 0;
+    int32_t i32 = 0;
+    switch (attr) {
+    case CUBLASLT_MATMUL_DESC_COMPUTE_TYPE: return lt_put(d.compute, buf, sizeInBytes);
+    case CUBLASLT_MATMUL_DESC_SCALE_TYPE: return lt_put(d.scale, buf, sizeInBytes);
+    case CUBLASLT_MATMUL_DESC_POINTER_MODE: return lt_put(d.pointer_mode, buf, sizeInBytes);
+    case CUBLASLT_MATMUL_DESC_TRANSA: return lt_put(d.transa, buf, sizeInBytes);
+    case CUBLASLT_MATMUL_DESC_TRANSB: return lt_put(d.transb, buf, sizeInBytes);
+    case CUBLASLT_MATMUL_DESC_TRANSC: return lt_put(d.transc, buf, sizeInBytes);
+    case CUBLASLT_MATMUL_DESC_FILL_MODE: return lt_put(d.fill, buf, sizeInBytes);
+    case CUBLASLT_MATMUL_DESC_EPILOGUE: return lt_put(d.epilogue, buf, sizeInBytes);
+    case CUBLASLT_MATMUL_DESC_BIAS_POINTER: return lt_put(d.bias, buf, sizeInBytes);
+    case CUBLASLT_MATMUL_DESC_BIAS_BATCH_STRIDE: return lt_put(d.bias_stride, buf, sizeInBytes);
+    case CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE: return lt_put(d.bias_type, buf, sizeInBytes);
+    case CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET: return lt_put(d.sm_target, buf, sizeInBytes);
+    case CUBLASLT_MATMUL_DESC_FAST_ACCUM: return lt_put(d.fast_accum, buf, sizeInBytes);
+    case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_POINTER:
+    case CUBLASLT_MATMUL_DESC_A_SCALE_POINTER:
+    case CUBLASLT_MATMUL_DESC_B_SCALE_POINTER:
+    case CUBLASLT_MATMUL_DESC_C_SCALE_POINTER:
+    case CUBLASLT_MATMUL_DESC_D_SCALE_POINTER:
+    case CUBLASLT_MATMUL_DESC_AMAX_D_POINTER:
+    case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_SCALE_POINTER:
+    case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_AMAX_POINTER: {
+        cublasStatus_t st = lt_put(ptr, buf, sizeInBytes);
+        if (st == CUBLAS_STATUS_SUCCESS && ptr != nullptr) d.unsupported = true; /* kept as given: not done */
+        return st;
+    }
+    case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_LD:
+    case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_BATCH_STRIDE:
+    case CUBLASLT_MATMUL_DESC_ALPHA_VECTOR_BATCH_STRIDE: return lt_put(i64, buf, sizeInBytes);
+    case CUBLASLT_MATMUL_DESC_EPILOGUE_AUX_DATA_TYPE: return lt_put(i32, buf, sizeInBytes);
+    default: return CUBLAS_STATUS_INVALID_VALUE;
+    }
+}
+
+cublasStatus_t cublasLtMatmulDescGetAttribute(cublasLtMatmulDesc_t desc, cublasLtMatmulDescAttributes_t attr,
+                                              void *buf, size_t sizeInBytes, size_t *sizeWritten)
+{
+    if (desc == nullptr) return CUBLAS_STATUS_INVALID_VALUE;
+    const auto &d = *lt_desc(desc);
+    switch (attr) {
+    case CUBLASLT_MATMUL_DESC_COMPUTE_TYPE: return lt_get(d.compute, buf, sizeInBytes, sizeWritten);
+    case CUBLASLT_MATMUL_DESC_SCALE_TYPE: return lt_get(d.scale, buf, sizeInBytes, sizeWritten);
+    case CUBLASLT_MATMUL_DESC_POINTER_MODE: return lt_get(d.pointer_mode, buf, sizeInBytes, sizeWritten);
+    case CUBLASLT_MATMUL_DESC_TRANSA: return lt_get(d.transa, buf, sizeInBytes, sizeWritten);
+    case CUBLASLT_MATMUL_DESC_TRANSB: return lt_get(d.transb, buf, sizeInBytes, sizeWritten);
+    case CUBLASLT_MATMUL_DESC_TRANSC: return lt_get(d.transc, buf, sizeInBytes, sizeWritten);
+    case CUBLASLT_MATMUL_DESC_FILL_MODE: return lt_get(d.fill, buf, sizeInBytes, sizeWritten);
+    case CUBLASLT_MATMUL_DESC_EPILOGUE: return lt_get(d.epilogue, buf, sizeInBytes, sizeWritten);
+    case CUBLASLT_MATMUL_DESC_BIAS_POINTER: return lt_get(d.bias, buf, sizeInBytes, sizeWritten);
+    case CUBLASLT_MATMUL_DESC_BIAS_BATCH_STRIDE: return lt_get(d.bias_stride, buf, sizeInBytes, sizeWritten);
+    case CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE: return lt_get(d.bias_type, buf, sizeInBytes, sizeWritten);
+    default: return CUBLAS_STATUS_INVALID_VALUE;
+    }
+}
+
+cublasStatus_t cublasLtMatrixLayoutInit(cublasLtMatrixLayout_t layout, cudaDataType type, uint64_t rows,
+                                        uint64_t cols, int64_t ld)
+{
+    if (layout == nullptr) return CUBLAS_STATUS_INVALID_VALUE;
+    auto *l = new (layout->data) ocu_cublaslt_matrix_layout();
+    l->type = (int32_t)type;
+    l->order = CUBLASLT_ORDER_COL;
+    l->rows = rows;
+    l->cols = cols;
+    l->ld = ld;
+    l->batch = 1;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatrixLayoutCreate(cublasLtMatrixLayout_t *layout, cudaDataType type, uint64_t rows,
+                                          uint64_t cols, int64_t ld)
+{
+    if (layout == nullptr) return CUBLAS_STATUS_INVALID_VALUE;
+    auto *o = new (std::nothrow) cublasLtMatrixLayoutOpaque_t();
+    if (o == nullptr) return CUBLAS_STATUS_ALLOC_FAILED;
+    cublasLtMatrixLayoutInit(o, type, rows, cols, ld);
+    *layout = o;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatrixLayoutDestroy(cublasLtMatrixLayout_t layout)
+{
+    delete layout;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatrixLayoutSetAttribute(cublasLtMatrixLayout_t layout, cublasLtMatrixLayoutAttribute_t attr,
+                                                const void *buf, size_t sizeInBytes)
+{
+    if (layout == nullptr || buf == nullptr) return CUBLAS_STATUS_INVALID_VALUE;
+    auto &l = *lt_layout(layout);
+    int64_t plane = 0;
+    switch (attr) {
+    case CUBLASLT_MATRIX_LAYOUT_TYPE: return lt_put(l.type, buf, sizeInBytes);
+    case CUBLASLT_MATRIX_LAYOUT_ORDER: return lt_put(l.order, buf, sizeInBytes);
+    case CUBLASLT_MATRIX_LAYOUT_ROWS: return lt_put(l.rows, buf, sizeInBytes);
+    case CUBLASLT_MATRIX_LAYOUT_COLS: return lt_put(l.cols, buf, sizeInBytes);
+    case CUBLASLT_MATRIX_LAYOUT_LD: return lt_put(l.ld, buf, sizeInBytes);
+    case CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT: return lt_put(l.batch, buf, sizeInBytes);
+    case CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET: return lt_put(l.stride, buf, sizeInBytes);
+    case CUBLASLT_MATRIX_LAYOUT_PLANE_OFFSET: return lt_put(plane, buf, sizeInBytes);
+    default: return CUBLAS_STATUS_INVALID_VALUE;
+    }
+}
+
+cublasStatus_t cublasLtMatrixLayoutGetAttribute(cublasLtMatrixLayout_t layout, cublasLtMatrixLayoutAttribute_t attr,
+                                                void *buf, size_t sizeInBytes, size_t *sizeWritten)
+{
+    if (layout == nullptr) return CUBLAS_STATUS_INVALID_VALUE;
+    const auto &l = *lt_layout(layout);
+    switch (attr) {
+    case CUBLASLT_MATRIX_LAYOUT_TYPE: return lt_get(l.type, buf, sizeInBytes, sizeWritten);
+    case CUBLASLT_MATRIX_LAYOUT_ORDER: return lt_get(l.order, buf, sizeInBytes, sizeWritten);
+    case CUBLASLT_MATRIX_LAYOUT_ROWS: return lt_get(l.rows, buf, sizeInBytes, sizeWritten);
+    case CUBLASLT_MATRIX_LAYOUT_COLS: return lt_get(l.cols, buf, sizeInBytes, sizeWritten);
+    case CUBLASLT_MATRIX_LAYOUT_LD: return lt_get(l.ld, buf, sizeInBytes, sizeWritten);
+    case CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT: return lt_get(l.batch, buf, sizeInBytes, sizeWritten);
+    case CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET: return lt_get(l.stride, buf, sizeInBytes, sizeWritten);
+    default: return CUBLAS_STATUS_INVALID_VALUE;
+    }
+}
+
+cublasStatus_t cublasLtMatmulPreferenceInit(cublasLtMatmulPreference_t pref)
+{
+    if (pref == nullptr) return CUBLAS_STATUS_INVALID_VALUE;
+    new (pref->data) ocu_cublaslt_matmul_preference();
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatmulPreferenceCreate(cublasLtMatmulPreference_t *pref)
+{
+    if (pref == nullptr) return CUBLAS_STATUS_INVALID_VALUE;
+    auto *o = new (std::nothrow) cublasLtMatmulPreferenceOpaque_t();
+    if (o == nullptr) return CUBLAS_STATUS_ALLOC_FAILED;
+    cublasLtMatmulPreferenceInit(o);
+    *pref = o;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatmulPreferenceDestroy(cublasLtMatmulPreference_t pref)
+{
+    delete pref;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatmulPreferenceSetAttribute(cublasLtMatmulPreference_t pref,
+                                                    cublasLtMatmulPreferenceAttributes_t attr, const void *buf,
+                                                    size_t sizeInBytes)
+{
+    if (pref == nullptr || buf == nullptr) return CUBLAS_STATUS_INVALID_VALUE;
+    switch (attr) {
+    case CUBLASLT_MATMUL_PREF_SEARCH_MODE: return lt_put(lt_pref(pref)->mode, buf, sizeInBytes);
+    case CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES: return lt_put(lt_pref(pref)->max_ws, buf, sizeInBytes);
+    default: return CUBLAS_STATUS_INVALID_VALUE;
+    }
+}
+
+/* One algorithm, no workspace: the GEMM kernels choose their tiles at run time. */
+cublasStatus_t cublasLtMatmulAlgoGetHeuristic(cublasLtHandle_t handle, cublasLtMatmulDesc_t operationDesc,
+                                              cublasLtMatrixLayout_t Adesc, cublasLtMatrixLayout_t Bdesc,
+                                              cublasLtMatrixLayout_t Cdesc, cublasLtMatrixLayout_t Ddesc,
+                                              cublasLtMatmulPreference_t preference, int requestedAlgoCount,
+                                              cublasLtMatmulHeuristicResult_t heuristicResultsArray[],
+                                              int *returnAlgoCount)
+{
+    if (handle == nullptr) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (operationDesc == nullptr || Adesc == nullptr || Bdesc == nullptr || Cdesc == nullptr || Ddesc == nullptr ||
+        preference == nullptr || requestedAlgoCount < 1 || heuristicResultsArray == nullptr || returnAlgoCount == nullptr)
+        return CUBLAS_STATUS_INVALID_VALUE;
+    *returnAlgoCount = 0;
+    if (lt_desc(operationDesc)->unsupported || !lt_epilogue_known(lt_desc(operationDesc)->epilogue))
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    memset(&heuristicResultsArray[0], 0, sizeof(heuristicResultsArray[0]));
+    heuristicResultsArray[0].algo.data[0] = 1;
+    heuristicResultsArray[0].workspaceSize = 0;
+    heuristicResultsArray[0].state = CUBLAS_STATUS_SUCCESS;
+    heuristicResultsArray[0].wavesCount = 1.0f;
+    *returnAlgoCount = 1;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+cublasStatus_t cublasLtMatmul(cublasLtHandle_t handle, cublasLtMatmulDesc_t computeDesc, const void *alpha,
+                              const void *A, cublasLtMatrixLayout_t Adesc, const void *B,
+                              cublasLtMatrixLayout_t Bdesc, const void *beta, const void *C,
+                              cublasLtMatrixLayout_t Cdesc, void *D, cublasLtMatrixLayout_t Ddesc,
+                              const cublasLtMatmulAlgo_t *algo, void *workspace, size_t workspaceSizeInBytes,
+                              cudaStream_t stream)
+{
+    (void)algo;
+    (void)workspace;
+    (void)workspaceSizeInBytes;
+    if (handle == nullptr) return CUBLAS_STATUS_NOT_INITIALIZED;
+    if (computeDesc == nullptr || Adesc == nullptr || Bdesc == nullptr || Cdesc == nullptr || Ddesc == nullptr ||
+        alpha == nullptr || beta == nullptr || D == nullptr)
+        return CUBLAS_STATUS_INVALID_VALUE;
+    const auto &op = *lt_desc(computeDesc);
+    const auto &la = *lt_layout(Adesc), &lb = *lt_layout(Bdesc), &lc = *lt_layout(Cdesc), &lD = *lt_layout(Ddesc);
+    if (op.unsupported || !lt_epilogue_known(op.epilogue) || op.transc != CUBLAS_OP_N) return CUBLAS_STATUS_NOT_SUPPORTED;
+    if (op.pointer_mode != CUBLASLT_POINTER_MODE_HOST && op.pointer_mode != CUBLASLT_POINTER_MODE_DEVICE)
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    const int order = lD.order;
+    if ((order != CUBLASLT_ORDER_COL && order != CUBLASLT_ORDER_ROW) || la.order != order || lb.order != order ||
+        lc.order != order)
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    if (lc.type != lD.type || lc.rows != lD.rows || lc.cols != lD.cols) return CUBLAS_STATUS_NOT_SUPPORTED;
+    const bool ta = op.transa != CUBLAS_OP_N, tb = op.transb != CUBLAS_OP_N;
+    const uint64_t m = lD.rows, n = lD.cols;
+    const uint64_t am = ta ? la.cols : la.rows, k = ta ? la.rows : la.cols;
+    const uint64_t bk = tb ? lb.cols : lb.rows, bn = tb ? lb.rows : lb.cols;
+    if (am != m || bk != k || bn != n) return CUBLAS_STATUS_INVALID_VALUE;
+    if (m > 0x7fffffffu || n > 0x7fffffffu || k > 0x7fffffffu) return CUBLAS_STATUS_NOT_SUPPORTED;
+    const int batch = lD.batch < 1 ? 1 : lD.batch;
+    if (la.batch != lD.batch || lb.batch != lD.batch || lc.batch != lD.batch) return CUBLAS_STATUS_INVALID_VALUE;
+    const bool has_bias = op.epilogue == CUBLASLT_EPILOGUE_BIAS || op.epilogue == CUBLASLT_EPILOGUE_RELU_BIAS ||
+                          op.epilogue == CUBLASLT_EPILOGUE_GELU_BIAS;
+    if (has_bias && op.bias == nullptr) return CUBLAS_STATUS_INVALID_VALUE;
+    const size_t es = lt_type_size(lD.type);
+    if (es == 0) return CUBLAS_STATUS_NOT_SUPPORTED;
+    cublasHandle_t h = handle->blas;
+    cublasStatus_t st = cublasSetStream(h, stream);
+    if (st != CUBLAS_STATUS_SUCCESS) return st;
+    /* the column-major problem: as given, or of the transposes */
+    const bool row = order == CUBLASLT_ORDER_ROW;
+    const int vm = (int)(row ? n : m), vn = (int)(row ? m : n); /* D's column-major view: vm x vn */
+    if (C != D && C != nullptr) {
+        for (int b = 0; b < batch; ++b) {
+            cudaError_t e = cudaMemcpy2DAsync(static_cast<char *>(D) + (size_t)b * lD.stride * es, (size_t)lD.ld * es,
+                                              static_cast<const char *>(C) + (size_t)b * lc.stride * es, (size_t)lc.ld * es,
+                                              (size_t)vm * es, (size_t)vn, cudaMemcpyDeviceToDevice, stream);
+            if (e != cudaSuccess) return from_cuda(e);
+        }
+    }
+    cublasPointerMode_t saved;
+    cublasGetPointerMode(h, &saved);
+    cublasSetPointerMode(h, op.pointer_mode == CUBLASLT_POINTER_MODE_DEVICE ? CUBLAS_POINTER_MODE_DEVICE
+                                                                              : CUBLAS_POINTER_MODE_HOST);
+    if (!row) {
+        st = cublasGemmStridedBatchedEx(h, (cublasOperation_t)op.transa, (cublasOperation_t)op.transb, (int)m, (int)n,
+                                        (int)k, alpha, A, (cudaDataType_t)la.type, (int)la.ld, la.stride, B,
+                                        (cudaDataType_t)lb.type, (int)lb.ld, lb.stride, beta, D,
+                                        (cudaDataType_t)lD.type, (int)lD.ld, lD.stride, batch,
+                                        (cublasComputeType_t)op.compute, CUBLAS_GEMM_DEFAULT);
+    } else {
+        st = cublasGemmStridedBatchedEx(h, (cublasOperation_t)op.transb, (cublasOperation_t)op.transa, (int)n, (int)m,
+                                        (int)k, alpha, B, (cudaDataType_t)lb.type, (int)lb.ld, lb.stride, A,
+                                        (cudaDataType_t)la.type, (int)la.ld, la.stride, beta, D,
+                                        (cudaDataType_t)lD.type, (int)lD.ld, lD.stride, batch,
+                                        (cublasComputeType_t)op.compute, CUBLAS_GEMM_DEFAULT);
+    }
+    cublasSetPointerMode(h, saved);
+    if (st != CUBLAS_STATUS_SUCCESS || op.epilogue == CUBLASLT_EPILOGUE_DEFAULT) return st;
+    const int relu = op.epilogue == CUBLASLT_EPILOGUE_RELU || op.epilogue == CUBLASLT_EPILOGUE_RELU_BIAS;
+    const int gelu = op.epilogue == CUBLASLT_EPILOGUE_GELU || op.epilogue == CUBLASLT_EPILOGUE_GELU_BIAS;
+    const void *bias = has_bias ? op.bias : nullptr;
+    const int bt = op.bias_type < 0 ? lD.type : op.bias_type;
+    const int on_rows = row ? 0 : 1; /* one bias value per row of D */
+    const long long ld = lD.ld, stride = lD.stride, bstride = op.bias_stride;
+    cudaError_t e;
+    if (lD.type == CUDA_R_32F && bt == CUDA_R_32F)
+        e = launch_lt_epilogue<float, float, float>(stream, D, ld, stride, vm, vn, batch, bias, bstride, on_rows, relu, gelu);
+    else if (lD.type == CUDA_R_64F && bt == CUDA_R_64F)
+        e = launch_lt_epilogue<double, double, double>(stream, D, ld, stride, vm, vn, batch, bias, bstride, on_rows, relu, gelu);
+    else if (lD.type == CUDA_R_16F && bt == CUDA_R_16F)
+        e = launch_lt_epilogue<f16, f16, float>(stream, D, ld, stride, vm, vn, batch, bias, bstride, on_rows, relu, gelu);
+    else if (lD.type == CUDA_R_16F && bt == CUDA_R_32F)
+        e = launch_lt_epilogue<f16, float, float>(stream, D, ld, stride, vm, vn, batch, bias, bstride, on_rows, relu, gelu);
+    else if (lD.type == CUDA_R_16BF && bt == CUDA_R_16BF)
+        e = launch_lt_epilogue<bf16, bf16, float>(stream, D, ld, stride, vm, vn, batch, bias, bstride, on_rows, relu, gelu);
+    else if (lD.type == CUDA_R_16BF && bt == CUDA_R_32F)
+        e = launch_lt_epilogue<bf16, float, float>(stream, D, ld, stride, vm, vn, batch, bias, bstride, on_rows, relu, gelu);
+    else
+        return CUBLAS_STATUS_NOT_SUPPORTED;
+    return from_cuda(e);
+}
+
+} /* extern "C" */

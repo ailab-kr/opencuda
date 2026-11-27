@@ -31,7 +31,7 @@ cost: { hours: 3.0, ai_usage: 0 }
 - 아키텍처: `-arch`, `-code`, `-gencode`, `--cuda-gpu-arch`. 기록만 하고, nvidia 대상은 Clang이 아는 가장 낮은 것으로 PTX를 만든다(sm_90보다 새 번호는 sm_90 PTX, 드라이버가 GPU용으로 번역).
 - 그대로 넘김: `-Xcompiler`(쉼표와 공백으로 나눔), `-Xlinker`, 호스트 옵션(`-f*`, `-W*`, `-m*`, `-Wl,`, `-Xclang` 등).
 - 받고 무시(`-v`에서 알림): `-Xptxas`, `-Xnvlink`, `-Xfatbin`, `-Xcudafe`, `-compress-mode`, `--threads` 등.
-- 라이브러리 이름: `-lcudart`·`-lcudart_static`·`-lcudadevrt`·`-lcuda` → 우리 실행 라이브러리, `-lcublas` → `ocu_blas`, `-lcublasLt` → 구현 없음(알림, 함수는 링크에서 미해결).
+- 라이브러리 이름: `-lcudart`·`-lcudart_static`·`-lcudadevrt`·`-lcuda` → 우리 실행 라이브러리, `-lcublas`·`-lcublasLt` → `ocu_blas`(cuBLAS와 cuBLASLt가 한 라이브러리).
 - 거절: 공급사 SDK 안의 `-I`/`-isystem`/`-L`, 모르는 옵션, `-cubin`/`-fatbin`/`-cuda`, nvidia 대상의 장치 링크.
 
 ### 툴킷 폴더

@@ -28,7 +28,7 @@ Date: 2026-11-13 · Card: `cards/compiler/compiler-driver.md` · Checked with CM
 | host tools | `-ccbin`, `-Xcompiler`, `-Xlinker`, `-f*`, `-W*`, `-m*`, `-Wl,`, `-Xclang`, `-pthread` | `-Xcompiler` values are split on commas and spaces |
 | accepted, ignored | `-Xptxas`, `-Xnvlink`, `-Xfatbin`, `-Xcudafe`, `-compress-mode`, `--threads`, `-diag-suppress`, `-maxrregcount`, `-ftz=`, `-prec-div=` ... | `-v` lists them |
 | refused | unknown options, `-cubin`, `-fatbin`, `-cuda`, `-run` | "not supported" |
-| libraries | `-lcudart`, `-lcudart_static`, `-lcudadevrt`, `-lcuda` → our runtime; `-lcublas` → `ocu_blas`; `-lcublasLt` → nothing yet (noted) | `-cudart none` links no runtime |
+| libraries | `-lcudart`, `-lcudart_static`, `-lcudadevrt`, `-lcuda` → our runtime; `-lcublas`, `-lcublasLt` → `ocu_blas` (one library has both APIs) | `-cudart none` links no runtime |
 | other | `--version`, `--help`, `--list-gpu-arch` | |
 
 `--version` prints our name, the host compiler's own version line, and the CUDA API level our headers declare:
@@ -65,7 +65,7 @@ cmake --build <build>
 
 - CMake identifies a CUDA compiler from its `--version` output: nvcc's banner, or "clang version". Ours prints Clang's real version line because LLVM Clang does compile the host and device code. CMake then uses its Clang CUDA rules (`-x cuda`, `--cuda-gpu-arch=sm_NN`, `--cuda-path=`, `-MD -MT -MF`), which the driver accepts next to nvcc's options that projects add themselves.
 - For a Clang CUDA compiler CMake looks for a toolkit: a program named `nvcc` under `CUDAToolkit_ROOT/bin`, `include/cuda_runtime.h`, a `lib` folder and a `nvvm/libdevice` folder. `OcuCUDA.cmake` sets `CUDAToolkit_ROOT` to the toolkit folder, whose `bin/nvcc` is a link to `ocu-nvcc` (it prints nothing of NVIDIA; the name only satisfies the search), and whose `nvvm/libdevice` is empty and never read. Avoiding the name would mean replacing CMake's whole identification step (forced compiler variables), which breaks between CMake versions.
-- `find_package(CUDAToolkit)` loads our `cmake/modules/FindCUDAToolkit.cmake` (first on `CMAKE_MODULE_PATH`): `CUDA::cudart`, `CUDA::cudart_static`, `CUDA::cuda_driver`, `CUDA::cudadevrt` name our runtime, `CUDA::cublas(_static)` names `ocu_blas`. Libraries without an implementation get no target, except names in `OCU_CUDA_PLACEHOLDER_LIBS` (default `cublasLt;cublasLt_static`), which get an empty target and a status line.
+- `find_package(CUDAToolkit)` loads our `cmake/modules/FindCUDAToolkit.cmake` (first on `CMAKE_MODULE_PATH`): `CUDA::cudart`, `CUDA::cudart_static`, `CUDA::cuda_driver`, `CUDA::cudadevrt` name our runtime, `CUDA::cublas(_static)` names `ocu_blas`. `CUDA::cublasLt(_static)` name the same library as `CUDA::cublas`. Libraries without an implementation get no target, except names in `OCU_CUDA_PLACEHOLDER_LIBS` (default `cublasLt;cublasLt_static`, used only when no cuBLAS library was built), which get an empty target and a status line.
 - `OcuCUDARules.cmake` (`CMAKE_USER_MAKE_RULES_OVERRIDE_CUDA`) makes the CUDA runtime that CMake links by itself (`CMAKE_CUDA_RUNTIME_LIBRARY`) ours.
 - Nothing outside the toolkit folder is searched or run: the configured test project's cache is checked for vendor paths.
 

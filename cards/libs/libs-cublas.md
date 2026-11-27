@@ -38,6 +38,8 @@ GEMM 커널: 256스레드 블록, 공유 메모리 타일 두 가지(128×128×1
 
 연산 표 경로(11/13): GEMM은 커널보다 먼저 활성 백엔드의 연산 표(`docs/spec/op-table.md` 8절)에 묻는다. 조건이 모두 맞으면 열 우선 `C(m×n)`을 행 우선 `C'(n×m) = op(B)'·op(A)'`로 옮긴 설명자를 질의 → 계획(핸들마다 32칸 캐시, 설명자 전체가 열쇠) → 스트림의 대기열에서 실행(`ocu_rt_submit`: 실행과 같은 기본 스트림 규칙). 조건: 호스트 모드 스칼라, alpha ≠ 0, k > 0, 간격 배치(포인터 배열 아님, A·B 간격 0은 공유, C 간격 0은 안 됨), A·B 형이 32F·16F·16BF, 표가 알리는 누적형이 binary32. 하나라도 어긋나거나 표가 거절하면(질의·계획 실패, 실행 전 검사 실패) 위의 커널로 간다. 칩 이름은 보지 않는다: CPU 백엔드는 표가 있어 이 길로, NVIDIA 백엔드는 표가 없어 커널로.
 
+cuBLASLt(`cublasLt.h`, 2026-11-28): 같은 라이브러리(`-lcublasLt`·`CUDA::cublasLt`도 이 라이브러리). `cublasLtMatmul`은 D = alpha·op(A)·op(B) + beta·C를 `cublasGemmStridedBatchedEx`로 계산하므로 형·계산형 조합은 그 함수와 같다(FP32·FP64·FP16·BF16·int8→int32). 그 위에: 열·행 우선(네 행렬이 같은 순서일 때. 행 우선은 전치의 열 우선 문제 D^T = op(B)^T·op(A)^T), 간격 배치, C ≠ D(C를 D로 먼저 복사, C는 그대로), 호스트·장치 포인터 모드, 에필로그 DEFAULT·RELU·BIAS·RELU_BIAS·GELU(tanh 근사)·GELU_BIAS(bias는 D의 행마다 하나, `BIAS_DATA_TYPE`이 없으면 D의 형, FP16·BF16 D에 FP32 bias 가능, `BIAS_BATCH_STRIDE`). 설명자·배치·선호 객체는 문서의 불투명 구조체(`cublasLtMatmulDescOpaque_t` 등) 안에 있어 `Create`와 호출자 저장소용 `Init`(Destroy 없음) 둘 다 된다. 속성 설정·조회는 크기를 확인한다(다르면 `INVALID_VALUE`). 휴리스틱은 알고리즘 하나, 작업 공간 0. FP8, AUX·기울기 에필로그, 스케일 포인터(값을 넣으면), 섞인 순서, 포인터 벡터 모드는 `NOT_SUPPORTED`. 차원이 맞지 않으면·bias 에필로그에 bias가 없으면 `INVALID_VALUE`.
+
 ## 경계 조건
 
 - m·n·배치 0: 아무것도 하지 않고 성공. k 0 또는 alpha 0: A·B를 읽지 않고 C = beta·C. beta 0: C를 읽지 않음(NaN이 있어도 됨). 호스트 모드에서 alpha 0·beta 1이면 바로 돌아옴.
@@ -56,6 +58,7 @@ GEMM 커널: 256스레드 블록, 공유 메모리 타일 두 가지(128×128×1
 - [x] `cublas_cpu`, `cublas_cpu_tile64_random`, `cublas_cpu_tile128`, `gpu_cublas_default/64/128` (`tests/libs/cublas_accuracy.cu`): 1395개 확인, CPU·RTX 5070 Ti 모두 통과. 고정밀(long double) 기준, 오차 한계는 파일 머리말. 모양 12가지(타일 배수 아님, k 0, 1×300 등) × 전치 4 × alpha/beta 3, OP_C, 형 조합 12가지, 배치(배열·간격·B 공유·65537개), 장치 포인터 모드(float·half 스칼라), 스트림, 1·2단계, strsm 배치 16조합(잔차 기준), 상태 코드
 - [x] `conformance_cublas_cpu`(+스트림·무작위 순서), `gpu_conformance_cublas`: 기존 기준 사례(conformance/oracle) 중 이 라이브러리 함수 251건 전부 통과(오차/한계 최대 0.495 CPU, 0.472 GPU)
 - [x] 일부러 망가뜨린 커널: beta 0에서 C를 읽게 함 → 252건 실패로 검출, 출력 열 하나 넘게 씀 → 프로그램 중단으로 검출
+- [x] `cublaslt_cpu`(`tests/libs/cublaslt_matmul.cu`): double 기준과 대조 101건. 열·행 우선 × 전치 4, C ≠ D(C 그대로), 간격 배치, FP32·FP16·BF16 저장(FP32 계산), 장치 스칼라, 에필로그 5종(FP16 D에 FP32 bias 포함), `Init` 객체, 속성 왕복과 크기, 휴리스틱, 오류(차원, bias 없음, 스케일 포인터). CPU 경로와 Arc Pro B70(SPIR-V) 모두 101/101. HeCBench mlp-cuda PASS, qkv-cuda 실행(이전 툴킷의 빌드 점검에서는 둘 다 빌드 실패), blas-gemmEx2-cuda는 충돌 대신 180초 시간 초과(chipStar는 빌드 실패).
 
 ### 연산 표 경로(11/13)에서 시험 작성자가 확인할 동작
 
@@ -74,7 +77,7 @@ GEMM 커널: 256스레드 블록, 공유 메모리 타일 두 가지(128×128×1
 - 정밀도: 모든 실수 계산형을 그 형 이상의 정밀도로 누적한다(16F도 32F로 누적 후 한 번 반올림). 문서가 허용하는 오차 안이고 더 정확하다. 그래서 16F_PEDANTIC만 "지원 안 함"이다.
 - math mode·atomics mode·workspace는 받아 두기만 한다. 줄어든 정밀도를 "허용"하는 설정이라 전체 정밀도로 계산해도 맞다.
 - 처리량(RTX 5070 Ti, 정사각, 3회 예열 뒤 10회 중앙값, 90% 구간): 카드 아래 "측정" 절.
-- llama.cpp(docs/llama-cpp-requirements.md)의 cuBLAS 함수 12개는 모두 있다. 없는 것: `cublasLt.h`와 cuBLASLt 12개(CUDART 12030 프로필의 FP8 경로에서만 씀, 별도 카드 일), `cublasLoggerConfigure`(llama.cpp에서 주석 처리됨).
+- llama.cpp(docs/llama-cpp-requirements.md)의 cuBLAS 함수 12개는 모두 있다. 없는 것: `cublasLoggerConfigure`(llama.cpp에서 주석 처리됨). cuBLASLt는 아래.
 - 링크: `ocu-nvcc -lcublas`는 대상에 맞는 `libocu_cublas_<cpu|nvidia>.a`, 툴킷의 `CUDA::cublas`는 `OCU_TARGET`에 맞는 변형.
 - Metal: 커널은 템플릿·람다·구조체 인자를 쓴다. cu2msl이 그대로 받는지는 Apple 장비에서 확인할 일이다.
 

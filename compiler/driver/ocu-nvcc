@@ -80,8 +80,8 @@ LANG_NAMES = {"cu": "cu", "cuda": "cu", "c": "c", "c++": "cpp", "cpp": "cpp"}
 # Libraries a CUDA build names, and what links instead. The runtime set is
 # added once, at the end of the link line.
 RUNTIME_LIBS = ("cudart", "cudart_static", "cudadevrt", "cuda")
-BLAS_LIBS = ("cublas", "cublas_static")
-NO_IMPL_LIBS = ("cublasLt", "cublasLt_static", "culibos")
+BLAS_LIBS = ("cublas", "cublas_static", "cublasLt", "cublasLt_static")  # one library has both APIs
+NO_IMPL_LIBS = ("culibos",)
 CLANG_MAX_SM = 90    # highest sm_ the LLVM 18 NVPTX back end accepts
 NVCC_WERROR_KINDS = {"all-warnings", "cross-execution-space-call", "reorder",
                      "default-stream-launch", "missing-launch-bounds",
