@@ -851,6 +851,25 @@ static ocu_status load_globals(ocu_module *m)
         st = ocl_mem_copy(d, NULL, m->glob + off, bytes, n / 2, OCU_COPY_HOST_TO_DEVICE);
         free(bytes);
     }
+    /* Compiled SPIR-V (cu2spv): "ginit <kernel> <offset> <size>" -- a kernel
+       that copies a variable's initial value into the block, one byte per
+       work-item. Run once, now. */
+    const ocl_api *a = ocl_load();
+    for (const char *l = m->meta; st == OCU_OK && *l; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : l + strlen(l)) {
+        if (strncmp(l, "ginit ", 6) != 0) continue;
+        char name[256];
+        unsigned long long off = 0, size = 0;
+        if (sscanf(l + 6, "%255s %llu %llu", name, &off, &size) != 3 || off + size > m->glob_size) return OCU_ERR_INVALID_VALUE;
+        cl_int err = CL_SUCCESS;
+        cl_kernel ik = a->CreateKernel(m->program, name, &err);
+        if (ik == NULL) return map_err(err) == OCU_OK ? OCU_ERR_NOT_FOUND : map_err(err);
+        size_t local = 256, global = (size_t)(size + 255) / 256 * 256;
+        err = a->SetKernelArgSVMPointer(ik, 0, m->glob + off);
+        if (err == CL_SUCCESS) err = a->EnqueueNDRangeKernel(d->sync_q->q, ik, 1, NULL, &global, &local, 0, NULL, NULL);
+        if (err == CL_SUCCESS) err = a->Finish(d->sync_q->q);
+        a->ReleaseKernel(ik);
+        if (err != CL_SUCCESS) st = map_err(err) == OCU_OK ? OCU_ERR_LAUNCH_FAILED : map_err(err);
+    }
     return st;
 }
 
@@ -1074,6 +1093,8 @@ static void parse_sparams(struct ocu_kernel *k, const char *meta)
         while (*p == ' ' && n < 256) {
             ++p;
             if (strncmp(p, "dyn", 3) == 0) { k->dyn = true; p += 3; continue; }
+            /* the module's variables block is one more parameter, after "dyn" */
+            if (strncmp(p, "glob", 4) == 0) { k->takes_glob = true; p += 4; continue; }
             if (*p != 'p' && *p != 'v') break;
             ptr[n] = *p == 'p';
             char *end;
@@ -1172,7 +1193,7 @@ static ocu_status ocl_module_get_kernel(ocu_module *m, const char *name, ocu_ker
         a->GetKernelInfo(ck, CL_KERNEL_NUM_ARGS, sizeof(nargs), &nargs, NULL);
         pthread_mutex_init(&k->lock, NULL);
         if (m->direct) parse_sparams(k, m->meta); else parse_params(k, m->meta);
-        k->takes_glob = !k->direct && (k->byval ? nargs == 3 : nargs == 4);
+        if (!k->direct) k->takes_glob = k->byval ? nargs == 3 : nargs == 4; /* direct: the "glob" mark */
         if (alt != NULL) {
             k->alt = alt;
             k->tune = 1;
@@ -1428,6 +1449,8 @@ static ocu_status launch_direct(ocu_queue *queue, ocu_queue *q, ocu_kernel *k, c
         }
     }
     if (err == CL_SUCCESS && k->dyn) err = a->SetKernelArg(k->k, p->num_args, dyn < 16 ? 16 : dyn, NULL);
+    if (err == CL_SUCCESS && k->takes_glob)
+        err = a->SetKernelArgSVMPointer(k->k, p->num_args + (k->dyn ? 1u : 0u), k->module->glob);
     HP_E(HP_ARGS); HP_B(HP_SVM);
     if (err == CL_SUCCESS) err = set_svm_ptrs(k, d);
     HP_E(HP_SVM); HP_B(HP_ENQ);

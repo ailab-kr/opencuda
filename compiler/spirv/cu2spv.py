@@ -261,6 +261,195 @@ def rewrite(ll: str) -> tuple[str, list[str]]:
     return out, meta
 
 
+GVAR = re.compile(r'^@("[^"]+"|[\w.$]+) = ((?:[\w()]+ )*?)addrspace\(1\) (externally_initialized )?(global|constant) (.*)$', re.M)
+LABEL = re.compile(r'^[\w.$"-]+:')
+
+
+def split_type(s: str) -> tuple[str, str]:
+    """The leading IR type of s and the rest ('[4 x float] [...]' -> '[4 x float]', '[...]')."""
+    s = s.strip()
+    if s[:1] in "[{<":
+        depth, i = 0, 0
+        while i < len(s):
+            if s[i] in "[{<":
+                depth += 1
+            elif s[i] in "]}>":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        return s[:i + 1], s[i + 1:].strip()
+    t, _, rest = s.partition(" ")
+    return t, rest
+
+
+def globals_to_block(ll: str, meta: list[str]) -> tuple[str, list[str]]:
+    """__device__ / __constant__ variables (addrspace(1), externally initialized
+    or writable) move into one block of the module, which the backend
+    allocates as SVM memory: host code reaches them (cudaMemcpyToSymbol,
+    cudaGetSymbolAddress) through "global <name> <offset> <size>" lines, as
+    for the OpenCL C images. Every function that uses one, and every caller on
+    the way from a kernel, takes the block's address as one more parameter;
+    kernels marked "glob" in their sparam line. The original variables stay
+    and hold the initial values: kernel "__ocu_ginit_<i>" copies variable i
+    into the block when the module loads ("ginit" lines). Anything this does
+    not handle (a function whose address is taken, a constant expression it
+    cannot hoist) leaves the module as it was."""
+    lay = Layout(ll)
+    lines = ll.split("\n")
+    gvars = []  # (name, type, offset, size)
+    off = 0
+    for m in GVAR.finditer(ll):
+        name, ext, kind, rest = m.group(1), m.group(3), m.group(4), m.group(5)
+        bare = name.strip('"')
+        if bare.startswith("llvm.") or bare.startswith("__hip_cuid_"):
+            continue
+        if not ext and kind == "constant":
+            continue  # a constant table: stays a SPIR-V constant
+        ty, init = split_type(rest)
+        try:
+            size, align = lay.size_align(ty)
+        except SystemExit:
+            return ll, meta
+        am = re.search(r", align (\d+)", init)
+        align = max(align, int(am.group(1)) if am else 1, 1)
+        off = (off + align - 1) // align * align
+        gvars.append((name, ty, off, size))
+        off += max(size, 1)
+    if not gvars:
+        return ll, meta
+    funcs, i = {}, 0
+    while i < len(lines):
+        m = re.match(r'^define .*?@("[^"]+"|[\w.$]+)\(', lines[i])
+        if m:
+            j = i
+            while not lines[j].startswith("}"):
+                j += 1
+            funcs[m.group(1)] = (i, j)
+            i = j
+        i += 1
+    refs = {g[0]: re.compile(r"@" + re.escape(g[0]) + r"(?![\w.$])") for g in gvars}
+    body = {f: "\n".join(lines[a + 1:b]) for f, (a, b) in funcs.items()}
+    direct = {f for f in funcs if any(r.search(body[f]) for r in refs.values())}
+    calls = {f: set(re.findall(r"call [^@]*@([\w.$\"]+)\(", body[f])) for f in funcs}
+    need = set(direct)
+    changed = True
+    while changed:
+        changed = False
+        for f in funcs:
+            if f not in need and calls[f] & need:
+                need.add(f)
+                changed = True
+    # a function in `need` whose address is taken cannot get the parameter
+    for f in need:
+        uses = len(re.findall(r"@" + re.escape(f) + r"(?![\w.$])", ll))
+        defs_and_calls = 1 + sum(len(re.findall(r"call [^@]*@" + re.escape(f) + r"\(", body[g])) for g in funcs)
+        if uses > defs_and_calls:
+            return ll, meta
+
+    def close_paren(text, lo):
+        depth, k = 1, lo
+        while depth:
+            if text[k] == "(":
+                depth += 1
+            elif text[k] == ")":
+                depth -= 1
+            k += 1
+        return k - 1
+
+    ce = [0]
+    for f in need:
+        a, b = funcs[f]
+        head = lines[a]
+        lo = head.index("(", head.index("@" + f)) + 1
+        hi = close_paren(head, lo)
+        empty = head[lo:hi].strip() == ""
+        lines[a] = head[:hi] + ("" if empty else ", ") + "ptr addrspace(1) noundef %ocu_glob" + head[hi:]
+        entry = []
+        used = [g for g in gvars if refs[g[0]].search(body[f])] if f in direct else []
+        for gi, (name, ty, goff, size) in enumerate(gvars):
+            if (name, ty, goff, size) in used:
+                entry.append(f"  %ocu_gv.{gi} = getelementptr inbounds i8, ptr addrspace(1) %ocu_glob, i64 {goff}")
+        for k in range(a + 1, b):
+            line = lines[k]
+            for callee in need:  # calls to functions that take the block: pass it on
+                tag = "@" + callee + "("
+                at = 0
+                while True:
+                    c = line.find(tag, at)
+                    if c < 0:
+                        break
+                    q = c + len(tag)
+                    e = close_paren(line, q)
+                    sep = "" if line[q:e].strip() == "" else ", "
+                    line = line[:e] + sep + "ptr addrspace(1) %ocu_glob" + line[e:]
+                    at = e
+            for gi, (name, ty, goff, size) in enumerate(gvars):
+                if not refs[name].search(line):
+                    continue
+                line = refs[name].sub(f"%ocu_gv.{gi}", line)
+            # constant expressions over the block's addresses become instructions at entry
+            while True:
+                m = re.search(r"(getelementptr (?:inbounds |nuw |nusw |inrange\(\S+\) )*)\(([^(),]+), (ptr(?: addrspace\(\d+\))?) (%ocu_(?:gv|ce)\.\d+), ([^()]+)\)", line)
+                if m:
+                    ce[0] += 1
+                    entry.append(f"  %ocu_ce.{ce[0]} = {m.group(1)}{m.group(2)}, {m.group(3)} {m.group(4)}, {m.group(5)}")
+                    line = line[:m.start()] + f"%ocu_ce.{ce[0]}" + line[m.end():]
+                    continue
+                m = re.search(r"addrspacecast \(ptr addrspace\(1\) (%ocu_(?:gv|ce)\.\d+) to (ptr addrspace\(\d+\))\)", line)
+                if m:
+                    ce[0] += 1
+                    entry.append(f"  %ocu_ce.{ce[0]} = addrspacecast ptr addrspace(1) {m.group(1)} to {m.group(2)}")
+                    line = line[:m.start()] + f"%ocu_ce.{ce[0]}" + line[m.end():]
+                    continue
+                break
+            lines[k] = line
+        if entry:
+            first = a + 1
+            if LABEL.match(lines[first]):
+                lines[first] = lines[first] + "\n" + "\n".join(entry)
+            else:
+                lines[first] = "\n".join(entry) + "\n" + lines[first]
+    out = "\n".join(lines)
+    # kernels that copy each variable's initial value into the block
+    init_defs = []
+    for gi, (name, ty, goff, size) in enumerate(gvars):
+        if size == 0:
+            continue
+        init_defs.append(
+            f"define spir_kernel void @__ocu_ginit_{gi}(ptr addrspace(1) noundef %dst) {{\n"
+            f"  %id = call i64 @_Z13get_global_idj(i32 0)\n"
+            f"  %ok = icmp ult i64 %id, {size}\n"
+            f"  br i1 %ok, label %cp, label %end\n"
+            f"cp:\n"
+            f"  %s = getelementptr inbounds i8, ptr addrspace(1) @{name}, i64 %id\n"
+            f"  %v = load i8, ptr addrspace(1) %s, align 1\n"
+            f"  %d = getelementptr inbounds i8, ptr addrspace(1) %dst, i64 %id\n"
+            f"  store i8 %v, ptr addrspace(1) %d, align 1\n"
+            f"  br label %end\n"
+            f"end:\n"
+            f"  ret void\n"
+            f"}}\n")
+    if not re.search(r"^declare i64 @_Z13get_global_idj\(", out, re.M):
+        init_defs.append("declare i64 @_Z13get_global_idj(i32)\n")
+    out += "\n" + "\n".join(init_defs)
+    orig = ll.split("\n")
+    kernels_glob = {f for f in need if " spir_kernel " in orig[funcs[f][0]]}
+    new_meta = []
+    for l in meta:
+        if l.startswith("sparam "):
+            kname = l.split()[1]
+            if kname in kernels_glob:
+                l += " glob"
+        new_meta.append(l)
+    for gi, (name, ty, goff, size) in enumerate(gvars):
+        new_meta.append(f"global {name.strip(chr(34))} {goff} {size}")
+        if size:
+            new_meta.append(f"sparam __ocu_ginit_{gi} p8")
+            new_meta.append(f"ginit __ocu_ginit_{gi} {goff} {size}")
+    return out, new_meta
+
+
 GLOBAL_P2I = re.compile(r"^\s*(%[\w.]+) = ptrtoint ptr addrspace\(1\) (%[\w.]+) to i64$", re.M)
 GENERIC_I2P = re.compile(r"^\s*(%[\w.]+) = inttoptr i64 (%[\w.]+) to ptr addrspace\(4\)$", re.M)
 
@@ -419,6 +608,18 @@ def main(argv):
             return 1
 
         text, meta = rewrite(ll.read_text())
+        if meta and os.environ.get("OCU_SPV_GLOBALS_BLOCK", "1") != "0":
+            moved, moved_meta = globals_to_block(text, meta)
+            if moved is not text:
+                # keep the rewrite only if it is valid IR (a form it does not know,
+                # such as a constant expression it did not hoist, would not be)
+                chk = t / "dev_glob.ll"
+                chk.write_text(moved)
+                r = subprocess.run([llvm_as, str(chk), "-o", os.devnull], capture_output=True, text=True)
+                if r.returncode == 0:
+                    text, meta = moved, moved_meta
+                elif os.environ.get("OCU_SPV_VERBOSE") == "1":
+                    sys.stderr.write("cu2spv: variables left as they are (block rewrite not valid IR):\n" + r.stderr[-1500:])
         if not meta:
             Path(a.o).write_bytes(b"OCUSPV1\n---\n")
             return 0
