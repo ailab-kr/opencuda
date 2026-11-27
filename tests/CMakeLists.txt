@@ -817,6 +817,9 @@ if(TARGET ocu_cublas_cpu)
   # cublasLtMatmul (layouts, transposes, batches, epilogues) against a double reference
   ocu_add_cpu_cu_executable(cublaslt_matmul libs/cublaslt_matmul.cu LIBRARIES ocu_cublas_cpu)
   add_test(NAME cublaslt_cpu COMMAND cublaslt_matmul)
+  # the real-type level 1 / 2 family and cublasDotEx against the reference loops
+  ocu_add_cpu_cu_executable(cublas_level1 libs/cublas_level1.cu LIBRARIES ocu_cublas_cpu)
+  add_test(NAME cublas_level1_cpu COMMAND cublas_level1)
 endif()
 # The reference BLAS cases (conformance/oracle) through the library, for
 # the functions it offers.
