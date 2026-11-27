@@ -401,6 +401,9 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   ocu_add_cpu_cu_executable(rt_gaps_intrin runtime/rt_gaps_intrin.cu)
   add_test(NAME runtime_gaps_intrin COMMAND rt_gaps_intrin)
   add_test(NAME runtime_gaps_intrin_random COMMAND rt_gaps_intrin)
+  # card runtime-llama-gaps: the SIMD intrinsics of the CUDA Math API.
+  ocu_add_cpu_cu_executable(rt_simd runtime/rt_simd.cu)
+  add_test(NAME runtime_simd COMMAND rt_simd)
   set_tests_properties(runtime_gaps_intrin_random PROPERTIES
     ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_THREADS=3;OCU_CPU_SEED=9")
   ocu_add_cpu_cu_executable(rt_gaps_api runtime/rt_gaps_api.cu)
