@@ -277,7 +277,7 @@ static void ref_reduce(long double x, int *q, long double *r)
     *r = x - 0.5L * k;
     long double km = std::fmod(k, 4.0L);
     if (km < 0) km += 4.0L;
-    *q = (int)km;
+    *q = std::isfinite(km) ? (int)km : 0; // inf / NaN: no quadrant (converting NaN to int is undefined)
 }
 static long double ref_sinpi(long double x)
 {

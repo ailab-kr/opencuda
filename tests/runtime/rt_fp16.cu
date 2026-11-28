@@ -130,7 +130,7 @@ static void test_arithmetic()
         bad += !same(__half_as_ushort(__hadd(ha, hb)), nearest(A + B, 24));
         bad += !same(__half_as_ushort(__hsub(ha, hb)), nearest(A - B, 24));
         bad += !same(__half_as_ushort(__hmul(ha, hb)), nearest(A * B, 48));
-        bad += !same(__half_as_ushort(__hfma(ha, hb, hc)), nearest(A * B + (C << 24), 48));
+        bad += !same(__half_as_ushort(__hfma(ha, hb, hc)), nearest(A * B + (C * ((i128)1 << 24)), 48));
         if (B != 0 && i % 4 == 0) {
             // a / b to nearest: compare against neighbours exactly (|q| * b vs a).
             std::uint16_t q = __half_as_ushort(__hdiv(ha, hb));
