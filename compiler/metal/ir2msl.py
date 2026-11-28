@@ -4,8 +4,10 @@
 Clang compiles the CUDA device code (templates, constexpr, member functions
 and namespaces are gone after that); this script turns the textual IR of
 each kernel into one MSL kernel function. It is a feasibility trial, not a
-translator: it handles the instructions the trial kernels use and stops with
-a message at anything else.
+translator: it handles scalar instructions, structs (layouts, by-value
+arguments), __shared__ arrays and a few intrinsics, and stops with a message
+at anything else (alloca, constant tables, vectors, device functions that
+were not inlined).
 
     ir2msl.py <file.cu | file.ll> -o <image> [-I dir] [-D name] [--clang clang++]
 
@@ -18,9 +20,9 @@ makes the exit status 1.
 Control flow is not restructured. Every basic block is a case of a switch
 inside a loop (MSL has no goto) that ends through its condition; phi nodes
 become copies on the edges.
-Pointers are byte pointers in one address space each (device, or
-threadgroup for __shared__ variables), found by following each pointer back
-to where it comes from.
+Pointers are byte pointers in one address space each (device, threadgroup
+for __shared__ variables, constant for a struct passed by value), found by
+following each pointer back to where it comes from.
 
 Image: the format backends/metal/mt_backend.m reads ("OCUMSL1").
 """
@@ -47,16 +49,57 @@ class Unsupported(Exception):
     pass
 
 
-def size_of(t: str) -> int:
+STRUCTS: dict[str, str] = {}   # "%struct.x" -> "{ i8, [3 x float] }" (set by parse)
+
+
+def layout(t: str) -> tuple[int, int]:
+    """(size, alignment) of an IR type: natural alignment, as the nvptx64
+    data layout gives it for the types handled here."""
     t = t.strip()
     if t.startswith("ptr"):
-        return 8
+        return 8, 8
     if t in SIZE:
-        return SIZE[t]
+        return SIZE[t], SIZE[t]
     m = re.fullmatch(r"\[(\d+) x (.+)\]", t)
     if m:
-        return int(m.group(1)) * size_of(m.group(2))
+        sz, al = layout(m.group(2))
+        return int(m.group(1)) * sz, al
+    if t in STRUCTS:
+        return layout(STRUCTS[t])
+    if t.startswith("<{") or t.startswith("{"):
+        packed = t.startswith("<{")
+        off, mx = 0, 1
+        for f in split_top(t[2:-2] if packed else t[1:-1]):
+            sz, al = layout(f)
+            if packed:
+                al = 1
+            off = (off + al - 1) // al * al + sz
+            mx = max(mx, al)
+        return (off + mx - 1) // mx * mx, mx
     raise Unsupported(f"size of type '{t}'")
+
+
+def size_of(t: str) -> int:
+    return layout(t)[0]
+
+
+def field(t: str, index: int) -> tuple[int, str]:
+    """(byte offset, type) of field `index` of a struct type."""
+    t = t.strip()
+    body = STRUCTS.get(t, t)
+    if not (body.startswith("{") or body.startswith("<{")):
+        raise Unsupported(f"getelementptr into '{t}'")
+    packed = body.startswith("<{")
+    off = 0
+    for k, f in enumerate(split_top(body[2:-2] if packed else body[1:-1])):
+        sz, al = layout(f)
+        if packed:
+            al = 1
+        off = (off + al - 1) // al * al
+        if k == index:
+            return off, f
+        off += sz
+    raise Unsupported(f"field {index} of '{t}'")
 
 
 def split_top(s: str) -> list[str]:
@@ -84,7 +127,8 @@ def take_type(s: str) -> tuple[str, str]:
         raise Unsupported(f"operand type in '{s[:40]}'")
     rest = s[m.end():].strip()
     while True:
-        m2 = re.match(FLAGS, rest) or re.match(r"(?:nocapture|readonly|writeonly|align \d+|captures\([^)]*\))\s*", rest)
+        m2 = re.match(FLAGS, rest) or re.match(
+            r"(?:nocapture|readonly|writeonly|readnone|noalias|align \d+|(?:captures|byval|dereferenceable|dereferenceable_or_null|range)\((?:[^()]|\([^()]*\))*\))\s*", rest)
         if not m2:
             break
         rest = rest[m2.end():]
@@ -97,17 +141,35 @@ class Func:
 
 
 def parse(ll: str):
+    STRUCTS.clear()
+    for m in re.finditer(r'^(%(?:"[^"]+"|[\w.$]+)) = type (<?\{.*\}>?)$', ll, re.M):
+        STRUCTS[m.group(1)] = m.group(2)
     globs = {}
-    for m in re.finditer(r"^@([\w.$]+) = .*?addrspace\((\d+)\) (?:global|constant) (\[[^\]]*\]|\w+) (\S+)", ll, re.M):
-        globs[m.group(1)] = (int(m.group(2)), m.group(3), m.group(4))
+    for m in re.finditer(r"^@([\w.$]+) = .*?addrspace\((\d+)\) (?:global|constant) (.*)$", ll, re.M):
+        rest, depth, end = m.group(3), 0, 0
+        for end, ch in enumerate(rest):       # the type: up to the first space outside brackets
+            if ch in "[{<(":
+                depth += 1
+            elif ch in "]}>)":
+                depth -= 1
+            elif ch == " " and depth == 0:
+                break
+        globs[m.group(1)] = (int(m.group(2)), rest[:end], rest[end:].strip())
     kernels = set(re.findall(r'!\{ptr @([\w.$]+), !"kernel", i32 1\}', ll))
     funcs = []
-    for m in re.finditer(r"^define [^@]*@([\w.$]+)\((.*?)\)[^\n]*\{\n(.*?)^\}", ll, re.M | re.S):
-        name, sig, body = m.groups()
+    for m in re.finditer(r"^define [^@\n]*@([\w.$]+)\(", ll, re.M):
+        name, i, depth = m.group(1), m.end(), 1
+        while depth:                 # the parameter list: byval(...) nests parentheses
+            depth += {"(": 1, ")": -1}.get(ll[i], 0)
+            i += 1
+        sig = ll[m.end():i - 1]
+        start = ll.index("{\n", i) + 2
+        body = ll[start:ll.index("\n}", start)]
         params = []
         for p in split_top(sig):
             t, rest = take_type(p)
-            params.append((t, rest.strip()))
+            by = re.search(r"\bbyval\(((?:[^()]|\([^()]*\))*)\)", p)
+            params.append((t, rest.strip(), by.group(1) if by else None))
         blocks, cur = [], None
         for line in body.split("\n"):
             line = re.sub(r",? ![\w.]+ !\d+", "", line.split(";")[0] if not line.lstrip().startswith(";") else "").rstrip()
@@ -142,8 +204,11 @@ class Emit:
             pass
         # the entry block of an unnamed-value function is numbered after the parameters
         self.label = {b[0]: i for i, b in enumerate(fn.blocks)}
+        # An unnamed entry block takes the next number after the unnamed
+        # parameters; branches and phi nodes name it by that number.
+        self.entry_number = str(sum(1 for p in fn.params if re.fullmatch(r"%\d+", p[1]) or not p[1]))
         if fn.blocks[0][0] == "entry":
-            self.label[str(len(fn.params))] = 0
+            self.label[self.entry_number] = 0
 
     def var(self, name: str) -> str:
         return "v_" + re.sub(r"\W", "_", name)
@@ -154,7 +219,8 @@ class Emit:
         if t in FLT:
             return FLT[t]
         if t.startswith("ptr"):
-            return f"{self.space.get(name, 'device')} uchar *"
+            sp = self.space.get(name, 'device')
+            return f"{sp} uchar *" if sp != "constant" else "constant uchar *"
         if t == "double":
             raise Unsupported("double is not available on Apple GPUs")
         raise Unsupported(f"type '{t}'")
@@ -207,12 +273,11 @@ class Emit:
     # -- pointer address spaces ---------------------------------------------------------
     def infer_spaces(self):
         src = {}   # ptr ssa -> list of sources (ssa names or literal space)
-        for t, n in self.fn.params:
+        for t, n, by in self.fn.params:
+            self.types[n[1:]] = t
             if t.startswith("ptr"):
-                self.types[n[1:]] = t
-                src[n[1:]] = ["device"]
-            else:
-                self.types[n[1:]] = t
+                # a struct passed by value sits in the argument block
+                src[n[1:]] = ["constant" if by else "device"]
         for _, insts in self.fn.blocks:
             for ins in insts:
                 m = re.match(r"%([\w.$]+) = (.*)", ins)
@@ -246,9 +311,9 @@ class Emit:
         while changed:
             changed = False
             for n, ss in src.items():
-                got = {s if s in ("device", "threadgroup") else self.space.get(s) for s in ss} - {None}
+                got = {s if s in ("device", "threadgroup", "constant") else self.space.get(s) for s in ss} - {None}
                 if len(got) > 1:
-                    raise Unsupported(f"pointer %{n} may point into device and threadgroup memory")
+                    raise Unsupported(f"pointer %{n} may point into {' and '.join(sorted(got))} memory")
                 if got and self.space.get(n) != next(iter(got)):
                     self.space[n] = next(iter(got))
                     changed = True
@@ -355,8 +420,12 @@ class Emit:
                 it, iv = take_type(a)
                 if k > 0:
                     m = re.fullmatch(r"\[(\d+) x (.+)\]", cur.strip())
-                    if not m:
-                        raise Unsupported(f"getelementptr into '{cur}'")
+                    if not m:   # a struct: the index is a constant field number
+                        if not re.fullmatch(r"-?\d+", iv.strip()):
+                            raise Unsupported(f"getelementptr into '{cur}' with a variable index")
+                        o, cur = field(cur, int(iv))
+                        off.append(str(o))
+                        continue
                     cur = m.group(2)
                 sz = size_of(cur)
                 idx = self.sval(it, iv) if it in SINT else self.val(it, iv)
@@ -367,6 +436,8 @@ class Emit:
             t, r = take_type(rest)
             pt, pv = take_type(split_top(r.lstrip(", "))[0])
             sp = self.ptr_space(pv)
+            if t.startswith("ptr"):   # a stored pointer is a device pointer (no pointers to pointers in MSL)
+                return f"(({sp} ocu_ptr_box<device uchar *> *)({self.val(pt, pv)}))->p"
             return f"(*({sp} {self.mtype(t)} *)({self.val(pt, pv)}))"
         if op == "call":
             return self.call(rest)
@@ -401,6 +472,18 @@ class Emit:
                   "llvm.rint.f32": "rint", "llvm.trunc.f32": "trunc", "llvm.ctpop.i32": "popcount"}
         if fn in ("llvm.smax.i32", "llvm.smin.i32"):
             return f"uint({'max' if 'smax' in fn else 'min'}(int({av[0]}), int({av[1]})))"
+        if fn == "llvm.nvvm.mulhi.ui":
+            return f"mulhi({av[0]}, {av[1]})"
+        if fn == "llvm.nvvm.mulhi.i":
+            return f"uint(mulhi(int({av[0]}), int({av[1]})))"
+        if fn == "llvm.ctlz.i32":
+            return f"clz({av[0]})"
+        if fn == "llvm.cttz.i32":
+            return f"ctz({av[0]})"
+        if fn == "llvm.abs.i32":
+            return f"uint(abs(int({av[0]})))"
+        if fn == "llvm.nvvm.bar.warp.sync":
+            return "simdgroup_barrier(mem_flags::mem_threadgroup)"
         if fn in simple:
             return f"{simple[fn]}({', '.join(av)})"
         if fn.startswith("llvm.lifetime."):
@@ -426,7 +509,7 @@ class Emit:
         def goto(pred, target, ind):
             lines = []
             ps = phis.get(target, [])
-            pkeys = [pred] + ([str(len(fn.params))] if pred == first == "entry" else [])
+            pkeys = [pred] + ([self.entry_number] if pred == first == "entry" else [])
             tmp = []
             for k, (n, t, inc) in enumerate(ps):
                 v = next((inc[p] for p in pkeys if p in inc), None)
@@ -457,6 +540,8 @@ class Emit:
                     v, p = split_top(r)[:2]
                     vt, vv = take_type(v)
                     pt, pv = take_type(p)
+                    if vt.startswith("ptr"):
+                        raise Unsupported("storing a pointer")
                     body.append(f"{ind}*({self.ptr_space(pv)} {self.mtype(vt)} *)({self.val(pt, pv)}) = {self.val(vt, vv)};")
                 elif op.startswith("call "):
                     e = self.call(re.sub(r"^call\s+(?:" + FLAGS + ")*", "", op))
@@ -489,7 +574,7 @@ class Emit:
                     raise Unsupported(f"instruction '{op[:50]}'")
             body.append("            break; }")
 
-        params = [(t, n[1:]) for t, n in fn.params]
+        params = [(t, n[1:], by) for t, n, by in fn.params]
         head = (f"kernel void {fn.name}(constant uchar *ocu_args [[buffer(0)]],\n"
                 "    constant uint *ocu_offs [[buffer(1)]],\n"
                 "    threadgroup uchar *ocu_dyn [[threadgroup(0)]],\n"
@@ -500,18 +585,27 @@ class Emit:
         out = [head]
         for g in self.used_globs:
             _, t, _ = self.globs[g]
-            m = re.fullmatch(r"\[(\d+) x (.+)\]", t)
-            et, cnt = (m.group(2), int(m.group(1))) if m else (t, 1)
-            out.append(f"    threadgroup {self.mtype(et)} g_{re.sub(r'[^A-Za-z0-9_]', '_', g)}[{cnt}];")
+            et = t                      # the innermost element of nested arrays
+            while re.fullmatch(r"\[(\d+) x (.+)\]", et.strip()):
+                et = re.fullmatch(r"\[(\d+) x (.+)\]", et.strip()).group(2)
+            size, al = layout(t)
+            if et.strip() in SIZE and not et.startswith("ptr"):
+                decl, cnt = self.mtype(et.strip()), size // SIZE[et.strip()]
+            else:                       # structs: storage of the right size and alignment
+                decl, cnt = {1: "uchar", 2: "ushort", 4: "uint", 8: "ulong"}[min(al, 8)], (size + al - 1) // al
+            out.append(f"    threadgroup {decl} g_{re.sub(r'[^A-Za-z0-9_]', '_', g)}[{max(cnt, 1)}];")
         sizes = []
-        for i, (t, n) in enumerate(params):
-            if t.startswith("ptr"):
+        for i, (t, n, by) in enumerate(params):
+            if by:
+                out.append(f"    constant uchar *{self.var(n)} = ocu_args + ocu_offs[{i}];")
+                sizes.append(size_of(by))
+            elif t.startswith("ptr"):
                 out.append(f"    device uchar *{self.var(n)} = ocu_ptr<device uchar *>(ocu_args, ocu_offs, {i});")
                 sizes.append(8)
             else:
                 out.append(f"    {self.mtype(t)} {self.var(n)} = ocu_arg<{self.mtype(t)}>(ocu_args, ocu_offs, {i});")
                 sizes.append(SIZE[t])
-        pnames = {n for _, n in params}
+        pnames = {n for _, n, _ in params}
         for n, t in self.types.items():
             if n not in pnames and t != "void":
                 out.append(f"    {self.mtype(t, n)} {self.var(n)};")
