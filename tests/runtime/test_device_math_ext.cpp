@@ -40,6 +40,36 @@ static float fbits(std::uint32_t b) { float x; std::memcpy(&x, &b, 4); return x;
 static bool same(double a, double b) { return (std::isnan(a) && std::isnan(b)) || bd(a) == bd(b); }
 static bool samef(float a, float b) { return (std::isnan(a) && std::isnan(b)) || bf(a) == bf(b); }
 
+// x * 2^n rounded to nearest even, by integer arithmetic. The reference for
+// scalbn / scalbln: a C library may round twice when the result is
+// subnormal (macOS 15 on arm64 returns 0x1.d77ce9fd06ap-1030 for
+// scalbn(0x1.d77ce9fd0697ap-7, -1023); the exact value rounds to
+// 0x1.d77ce9fd069p-1030).
+static double ref_scalbn(double x, long long n)
+{
+    if (x == 0 || !std::isfinite(x)) return x;
+    std::uint64_t b = bd(x), sign = b & 0x8000000000000000ull, m = b & 0x000fffffffffffffull;
+    long long e = (long long)((b >> 52) & 0x7ff);
+    if (e == 0) e = 1; else m |= 1ull << 52;            // value = m * 2^(e - 1075)
+    while (!(m >> 52)) { m <<= 1; --e; }
+    if (n > 5000) n = 5000;
+    if (n < -5000) n = -5000;
+    e += n;
+    if (e >= 2047) return dbits(sign | 0x7ff0000000000000ull);
+    if (e >= 1) return dbits(sign | ((std::uint64_t)e << 52) | (m & 0x000fffffffffffffull));
+    long long shift = 1 - e;                             // subnormal: drop `shift` bits
+    if (shift >= 64) return dbits(sign);
+    std::uint64_t q = m >> shift, rem = m & ((1ull << shift) - 1), half = 1ull << (shift - 1);
+    if (rem > half || (rem == half && (q & 1))) ++q;
+    return dbits(sign | q);
+}
+
+// The double-precision accuracy checks need a reference wider than double.
+// Where long double is not (arm64 macOS, MSVC), they are reported as not
+// checked instead of comparing double against double.
+static const bool g_wide = LDBL_MANT_DIG >= 64;
+static int g_not_checked;
+
 static std::mt19937_64 rng(12345);
 // doubles of all magnitudes and special values
 static double rand_double()
@@ -196,9 +226,9 @@ static void test_exact()
         CHECK(ocu_dm::ilogb(x) == std::ilogb(x), "ilogb(%a) = %d want %d", x, ocu_dm::ilogb(x), std::ilogb(x));
         CHECK(same(ocu_dm::logb(x), std::logb(x)), "logb(%a)", x);
         int n = (int)(rng() % 4400) - 2200;
-        CHECK(same(ocu_dm::scalbn(x, n), std::scalbn(x, n)), "scalbn(%a, %d)", x, n);
+        CHECK(same(ocu_dm::scalbn(x, n), ref_scalbn(x, n)), "scalbn(%a, %d)", x, n);
         long ln = (long)((long long)rng() >> 20);
-        CHECK(same(ocu_dm::scalbln(x, ln), std::scalbln(x, ln)), "scalbln(%a, %ld)", x, ln);
+        CHECK(same(ocu_dm::scalbln(x, ln), ref_scalbn(x, ln)), "scalbln(%a, %ld)", x, ln);
         CHECK(same(ocu_dm::nextafter(x, y), std::nextafter(x, y)), "nextafter(%a, %a)", x, y);
         if (std::isfinite(x) && std::fabs(x) < 0x1p62) {
             CHECK(ocu_dm::llrint(x) == std::llrint(x), "llrint(%a)", x);
@@ -226,8 +256,13 @@ static void note(worst &w, double e, long double at, long double at2 = 0)
     ++w.n;
     if (e > w.e) { w.e = e; w.at = at; w.at2 = at2; }
 }
-static void report(const char *name, const worst &w, double bound)
+static void report(const char *name, const worst &w, double bound, bool needs_wide = false)
 {
+    if (needs_wide && !g_wide) {
+        ++g_not_checked;
+        std::printf("%-10s not checked: long double is no wider than double on this host\n", name);
+        return;
+    }
     bool ok = w.e <= bound;
     if (!ok) ++g_fail;
     ++g_checks;
@@ -324,11 +359,11 @@ static void test_accuracy(bool full)
         }
     }
     const double FB = 0.5 + 0x1p-20;
-    report("sinpi", sp, 1.5); report("cospi", cp, 1.5);
-    report("acosh", ach, 3.0); report("asinh", ash, 2.0); report("atanh", ath, 2.0);
-    report("rcbrt", rc, 1.5); report("rhypot", rh, 1.5);
-    report("norm3d", n3, 1.5); report("norm4d", n4, 1.5); report("rnorm3d", rn3, 1.5); report("rnorm4d", rn4, 1.5);
-    report("norm", nn, 1.5); report("rnorm", rnn, 1.5);
+    report("sinpi", sp, 1.5, true); report("cospi", cp, 1.5, true);
+    report("acosh", ach, 3.0, true); report("asinh", ash, 2.0, true); report("atanh", ath, 2.0, true);
+    report("rcbrt", rc, 1.5, true); report("rhypot", rh, 1.5, true);
+    report("norm3d", n3, 1.5, true); report("norm4d", n4, 1.5, true); report("rnorm3d", rn3, 1.5, true); report("rnorm4d", rn4, 1.5, true);
+    report("norm", nn, 1.5, true); report("rnorm", rnn, 1.5, true);
     report("sinpif", spf, FB); report("cospif", cpf, FB); report("acoshf", achf, FB); report("asinhf", ashf, FB);
     report("atanhf", athf, FB); report("rcbrtf", rcf, FB); report("rhypotf", rhf, FB);
     report("norm3df", n3f, FB); report("norm4df", n4f, FB); report("rnorm3df", rn3f, FB); report("rnorm4df", rn4f, FB);
@@ -356,8 +391,8 @@ static void test_erf(bool full)
         long double rc = std::erfc((long double)x);
         if (rc >= 0x1p-1074L || rc == 0) note(wc, err_d(ocu_dm::erfc(x), rc), x);
     }
-    report("erf", we, 2.0);
-    report("erfc", wc, 5.0);
+    report("erf", we, 2.0, true);
+    report("erfc", wc, 5.0, true);
 }
 
 static void test_special()
@@ -420,6 +455,6 @@ int main()
     test_frsqrt(full);
     test_accuracy(full);
     test_erf(full);
-    std::printf("%s: %lld checks, %d failed\n", g_fail ? "FAIL" : "PASS", g_checks, g_fail);
+    std::printf("%s: %lld checks, %d failed, %d not checked\n", g_fail ? "FAIL" : "PASS", g_checks, g_fail, g_not_checked);
     return g_fail ? 1 : 0;
 }

@@ -86,11 +86,12 @@ static_assert(std::is_same<decltype(CUDART_TWO_TO_31), double>::value, "double")
 static_assert(CUDART_ZERO == 0.0 && CUDART_ONE == 1.0 && CUDART_ZERO_F == 0.0f && CUDART_ONE_F == 1.0f,
               "usable in constant expressions");
 
-// Long double is an 80-bit extended on this host; checked so that a
-// platform with a narrower one fails loudly instead of testing nothing.
-#ifndef __CUDA_ARCH__
-static_assert(LDBL_MANT_DIG >= 64, "need an extended long double");
-#endif
+// "HI + LO is closer to the constant than HI alone" needs a type wider than
+// double. Where long double is not (arm64 macOS), that one check per
+// constant is reported as not checked; HI and LO themselves are still
+// compared bit for bit with the nearest doubles of the reference digits.
+static const bool g_wide = LDBL_MANT_DIG >= 64;
+static int g_not_checked;
 
 static void test_values()
 {
@@ -112,8 +113,9 @@ static void test_hilo()
         long double sum = (long double)CUDART_##n##_HI + (long double)CUDART_##n##_LO;               \
         long double ref = std::strtold(REF_##n, nullptr);                                            \
         long double just_hi = std::fabs((long double)CUDART_##n##_HI - ref);                         \
-        ++g_checks;                                                                                  \
-        if (!(std::fabs(sum - ref) < just_hi)) { ++g_fail; std::printf("FAIL HI+LO of " #n " not closer than HI\n"); } \
+        if (!g_wide) ++g_not_checked;                                                                \
+        else { ++g_checks;                                                                           \
+        if (!(std::fabs(sum - ref) < just_hi)) { ++g_fail; std::printf("FAIL HI+LO of " #n " not closer than HI\n"); } } \
     }
     EACH_HILO(H_)
 #undef H_
@@ -225,6 +227,8 @@ int main(int argc, char **)
     CHECK_D("mutant", CUDART_PI, 3.1415926535897936); // one ulp up: must fail
 #endif
     (void)argc;
+    if (g_not_checked)
+        std::printf("%d HI+LO checks not made: long double is no wider than double on this host\n", g_not_checked);
     std::printf("%s: %d checks, %d failed\n", g_fail ? "FAIL" : "PASS", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }
