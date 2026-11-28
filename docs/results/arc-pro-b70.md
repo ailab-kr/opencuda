@@ -74,7 +74,7 @@ Later commits on this branch, checked on the same GPU with the same
 | relu-cuda, mlp-cuda, streamOrderedAllocation-cuda, streamUM-cuda, moe-cuda | not run yet (build checks failed with the old toolkit) | **pass** | `__half2` compares, cuBLASLt, memory pools, `cublasDgemv`, `cub::KeyValuePair` |
 | qkv-cuda, rayleighBenardConvection-cuda | not run yet | runs | cuBLASLt epilogues, `cublasScopy` |
 
-colorwheel-cuda still fails (with its 100 repetitions; one repetition passed).
+Correction to the run: 16 HeCBench Makefiles do not pass `EXTRA_CFLAGS` on to the compiler, so their OpenCuda builds were CPU-target builds without GPU kernels (colorwheel-cuda failed that way; built for SPIR-V it passes). The run now also sets `OCU_TARGET=spirv` (ocu-nvcc's default-target variable; chipStar needs no flag) and measures the OpenCuda side of those 16 programs again with the same toolkit.
 
 Where OpenCuda does not build, the main causes are libraries it does not
 have yet (Thrust, cuSPARSE, cuSOLVER, cuRAND, cuFFT, NCCL/MPI) and inline

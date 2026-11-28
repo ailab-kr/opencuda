@@ -57,7 +57,7 @@ GPU는 다른 작업과 함께 쓰는 장비라, 측정은 모두 GPU에 다른 
 | relu-cuda, mlp-cuda, streamOrderedAllocation-cuda, streamUM-cuda, moe-cuda | 아직 안 돎(이전 툴킷 빌드 점검에서 실패) | **pass** | `__half2` 비교, cuBLASLt, 메모리 풀, `cublasDgemv`, `cub::KeyValuePair` |
 | qkv-cuda, rayleighBenardConvection-cuda | 아직 안 돎 | 실행 | cuBLASLt 에필로그, `cublasScopy` |
 
-colorwheel-cuda는 여전히 실패한다(반복 100회. 1회는 통과).
+실행 정정: HeCBench Makefile 16개는 `EXTRA_CFLAGS`를 컴파일러에 넘기지 않아, OpenCuda 빌드가 GPU 커널 없는 CPU 대상 빌드였다(colorwheel-cuda가 그렇게 실패. SPIR-V로 빌드하면 통과). 실행은 이제 `OCU_TARGET=spirv`(ocu-nvcc의 기본 대상 변수. chipStar는 플래그가 필요 없음)도 주고, 그 16개의 OpenCuda 쪽을 같은 툴킷으로 다시 잰다.
 OpenCuda가 빌드하지 못하는 주된 이유는 아직 없는 라이브러리(Thrust, cuSPARSE, cuSOLVER, cuRAND, cuFFT, NCCL/MPI)와 인라인 PTX 어셈블리다. 프로그램마다 첫 오류는 실행 기록에 있다.
 
 ## llama.cpp
