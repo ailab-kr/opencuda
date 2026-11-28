@@ -408,5 +408,109 @@ class ByvalBuffers(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr[-2000:])
 
 
+DIV = """define spir_kernel void @k(ptr addrspace(1) %o, i64 %a, i64 %b) {
+  %q = sdiv i64 %a, %b
+  %r = urem i64 %a, %b
+  store i64 %q, ptr addrspace(1) %o, align 8
+  store i64 %r, ptr addrspace(1) %o, align 8
+  ret void
+}
+"""
+
+
+class Div64(unittest.TestCase):
+    """64-bit / and % take a 32-bit division when both operands are small
+    (non-negative and < 2^31 for the signed ones, < 2^32 unsigned); the test
+    is one unsigned compare (a 64-bit shift right there was miscompiled by
+    IGC 2.41 in HeCBench lrn-cuda)"""
+
+    def setUp(self):
+        self.o = cu2spv.bypass_div64(DIV)
+
+    def test_calls_and_helpers(self):
+        o = self.o
+        self.assertIn("%q = call i64 @__ocu_sdiv64(i64 %a, i64 %b)", o)
+        self.assertIn("%r = call i64 @__ocu_urem64(i64 %a, i64 %b)", o)
+        self.assertIn("%s = icmp ult i64 %o, 2147483648", o.split("@__ocu_sdiv64(i64 %a, i64 %b) alwaysinline")[1])
+        self.assertIn("%s = icmp ult i64 %o, 4294967296", o.split("@__ocu_urem64(i64 %a, i64 %b) alwaysinline")[1])
+        self.assertNotIn("lshr i64 %o", o)
+
+    @unittest.skipUnless(LLVM_AS, "OCU_SPV_LLVM_AS not set")
+    def test_valid_ir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ll, bc = Path(tmp) / "d.ll", Path(tmp) / "d.bc"
+            ll.write_text(self.o)
+            r = subprocess.run([LLVM_AS, str(ll), "-o", str(bc)], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+
+LOCALGEP = """@h = internal addrspace(3) global [14 x i32] undef, align 4
+@g = internal addrspace(3) global [4 x i64] undef, align 8
+
+define spir_kernel void @k(ptr addrspace(1) %o, i32 %s, i1 %c) {
+entry:
+  %a = atomicrmw add ptr addrspace(3) getelementptr inbounds nuw (i8, ptr addrspace(3) @h, i64 52), i32 1 syncscope("device") monotonic, align 4
+  %b = load i32, ptr addrspace(3) getelementptr inbounds nuw (i8, ptr addrspace(3) @h, i64 8), align 4
+  store i64 7, ptr addrspace(3) getelementptr inbounds nuw ([8 x i8], ptr addrspace(3) @g, i64 2), align 8
+  call void @f(ptr addrspace(4) addrspacecast (ptr addrspace(3) getelementptr inbounds nuw (i8, ptr addrspace(3) @h, i64 4) to ptr addrspace(4)))
+  call void @f3(ptr addrspace(3) getelementptr inbounds nuw (i8, ptr addrspace(3) @h, i64 12))
+  %x = atomicrmw add ptr addrspace(3) @h, i32 1 syncscope("device") monotonic, align 4
+  br i1 %c, label %t, label %e
+t:
+  br label %e
+e:
+  %p = phi ptr addrspace(3) [ getelementptr inbounds nuw (i8, ptr addrspace(3) @h, i64 16), %t ], [ @h, %entry ]
+  %v = load i32, ptr addrspace(3) %p, align 4
+  %r = add i32 %a, %b
+  store i32 %r, ptr addrspace(1) %o, align 4
+  ret void
+}
+declare void @f(ptr addrspace(4))
+declare void @f3(ptr addrspace(3))
+"""
+
+
+class LocalConstGeps(unittest.TestCase):
+    """constant getelementptrs on shared-memory variables used as operands:
+    LLVM 23's SPIR-V back end scaled their byte offsets by the use's element
+    size (HeCBench segsort), so they become instructions before the use"""
+
+    def setUp(self):
+        self.o = cu2spv.local_const_geps(LOCALGEP)
+
+    def test_operands_become_instructions(self):
+        o = self.o
+        self.assertIn("  %__ocu_lgep1 = getelementptr inbounds i8, ptr addrspace(3) @h, i64 52\n"
+                      "  %a = atomicrmw add ptr addrspace(3) %__ocu_lgep1, i32 1", o)
+        self.assertIn("  %__ocu_lgep2 = getelementptr inbounds i8, ptr addrspace(3) @h, i64 8\n"
+                      "  %b = load i32, ptr addrspace(3) %__ocu_lgep2, align 4", o)
+        self.assertIn("  %__ocu_lgep3 = getelementptr inbounds [8 x i8], ptr addrspace(3) @g, i64 2\n"
+                      "  store i64 7, ptr addrspace(3) %__ocu_lgep3, align 8", o)
+        self.assertIn("call void @f3(ptr addrspace(3) %__ocu_lgep4)", o)  # a call argument
+
+    def test_left_alone(self):
+        o = self.o
+        # inside another constant expression, a phi operand, a plain variable
+        self.assertIn("addrspacecast (ptr addrspace(3) getelementptr inbounds nuw (i8, ptr addrspace(3) @h, i64 4) to", o)
+        self.assertIn("[ getelementptr inbounds nuw (i8, ptr addrspace(3) @h, i64 16), %t ]", o)
+        self.assertIn("%x = atomicrmw add ptr addrspace(3) @h, i32 1", o)
+        self.assertEqual(o.count("__ocu_lgep") , 8)  # 4 definitions, 4 uses
+
+    def test_off(self):
+        os.environ["OCU_SPV_LOCAL_GEP"] = "0"
+        try:
+            self.assertEqual(cu2spv.local_const_geps(LOCALGEP), LOCALGEP)
+        finally:
+            del os.environ["OCU_SPV_LOCAL_GEP"]
+
+    @unittest.skipUnless(LLVM_AS, "OCU_SPV_LLVM_AS not set")
+    def test_valid_ir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ll, bc = Path(tmp) / "g.ll", Path(tmp) / "g.bc"
+            ll.write_text(self.o)
+            r = subprocess.run([LLVM_AS, str(ll), "-o", str(bc)], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
