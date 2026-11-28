@@ -1,6 +1,6 @@
 # Intel Arc Pro B70에서의 결과
 
-[English](arc-pro-b70.md) · **한국어**
+[English](arc-pro-b70.md) · **한국어** · 하루 기록: [2026-11-28](arc-pro-b70-log-2026-11-28.ko.md)
 
 고치지 않은 CUDA 프로그램이 Intel Arc Pro B70에서 OpenCuda의 SPIR-V 경로(`ocu-nvcc --ocu-target=spirv`)로 어떻게 도는지, 2026-11-27/28에 잰 것. 여기 있는 숫자는 모두 아래 기계에서 잰 것이고, 결과가 부분적이거나 실행이 아직 도는 중이면 그렇다고 적었다.
 

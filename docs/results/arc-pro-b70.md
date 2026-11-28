@@ -1,6 +1,6 @@
 # Results on an Intel Arc Pro B70
 
-**English** · [한국어](arc-pro-b70.ko.md)
+**English** · [한국어](arc-pro-b70.ko.md) · day log: [2026-11-28](arc-pro-b70-log-2026-11-28.md)
 
 What unmodified CUDA programs do on an Intel Arc Pro B70 with OpenCuda's
 SPIR-V path (`ocu-nvcc --ocu-target=spirv`), measured 2026-11-27/28. Every
