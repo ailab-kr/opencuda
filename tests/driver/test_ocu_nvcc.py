@@ -5,6 +5,7 @@ system uses it.
 """
 
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -28,6 +29,23 @@ int main() {
     return h[0] + h[1] + h[2] + h[3] == 20 ? 0 : 1;
 }
 """
+
+
+def host_openmp() -> bool:
+    """True when the host compiler the driver picks (the newest
+    /usr/lib/llvm-N clang++, else clang++, else c++) compiles and links an
+    OpenMP program by itself. Without the OpenMP runtime installed, or with
+    a compiler that has no -fopenmp (Apple clang), the driver's OpenMP test
+    cannot say anything about the driver."""
+    cxx = next((p for p in (f"/usr/lib/llvm-{v}/bin/clang++" for v in (20, 19, 18)) if os.path.exists(p)),
+               shutil.which("clang++") or shutil.which("c++"))
+    if not cxx:
+        return False
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "p.cpp"
+        src.write_text("#include <omp.h>\nint main() { return omp_get_max_threads() > 0 ? 0 : 1; }\n")
+        done = subprocess.run([cxx, "-fopenmp", str(src), "-o", str(Path(tmp) / "p")], capture_output=True)
+        return done.returncode == 0
 
 
 def nvcc(*args, cwd=None, check=True):
@@ -143,6 +161,8 @@ class CommandLine(unittest.TestCase):
         # nvcc -Xcompiler -fopenmp: omp.h is found, and the program runs without
         # LD_LIBRARY_PATH with both OpenMP and the GPU working (the OpenMP
         # runtime's directory must not hide the device's libraries).
+        if not host_openmp():
+            self.skipTest("the host compiler has no OpenMP (no -fopenmp or no omp.h / runtime)")
         src = self.dir / "o.cu"
         src.write_text("#include <omp.h>\n" + KERNEL.replace(
             "int main() {", "int main() { int n = 0;\n#pragma omp parallel reduction(+:n)\n"
