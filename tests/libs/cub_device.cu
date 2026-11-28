@@ -1,6 +1,6 @@
 // CUB device-wide algorithms (card libs-cub-subset, test list items 7-11):
 // DeviceReduce, DeviceScan, DeviceRadixSort, DeviceSegmentedRadixSort,
-// DeviceSegmentedSort. Expected results come from host reference
+// DeviceSegmentedSort, DeviceSegmentedReduce. Expected results come from host reference
 // computations and from the public CUB API documentation (two-phase
 // temporary storage, stability of radix sort, floating-point key order).
 // Runs on the CPU path and on the NVIDIA path.
@@ -851,12 +851,91 @@ static void test_segmented()
     }
 }
 
+// ---- segmented reduce -----------------------------------------------------
+
+// Segments from begin/end offset arrays (CUB's two-iterator form and the
+// common "offsets, offsets + 1" form): empty segments (end <= begin) give the
+// initial value; segments may be uneven, overlap or leave items out.
+template <class T>
+static void test_segmented_reduce_type(const char *tn, int mod, int shift)
+{
+    for (int nseg : {0, 1, 3, 100, 1000}) {
+        std::mt19937 g(7 + nseg);
+        std::vector<long long> off(nseg + 1, 0);
+        for (int i = 0; i < nseg; ++i) {
+            const int kind = g() % 10;
+            const long long len = kind == 0 ? 0 : kind == 1 ? 1 : kind == 2 ? 5000 + g() % 3000 : g() % 300;
+            off[i + 1] = off[i] + len;
+        }
+        const size_t n = (size_t)off[nseg];
+        std::vector<T> h = gen_small<T>(n, mod, shift, 300 + nseg);
+        Dev<T> in(n), out(nseg > 0 ? nseg : 1);
+        Dev<long long> doff(nseg + 1);
+        in.up(h);
+        doff.up(off);
+        std::vector<T> rs(nseg), rmx(nseg), rmn(nseg), rred(nseg);
+        for (int i = 0; i < nseg; ++i) {
+            T s = T(0), mx = std::numeric_limits<T>::lowest(), mn = std::numeric_limits<T>::max();
+            for (long long k = off[i]; k < off[i + 1]; ++k) { s = T(s + h[k]); mx = std::max(mx, h[k]); mn = std::min(mn, h[k]); }
+            rs[i] = s; rmx[i] = mx; rmn[i] = mn; rred[i] = T(s + T(3));
+        }
+        auto run = [&](const char *what, const std::vector<T> &want, auto call) {
+            out.fill(T(-77));
+            cudaError_t e = two_phase(call);
+            std::vector<T> got = out.down();
+            int bad = 0;
+            for (int i = 0; i < nseg; ++i) bad += !(got[i] == want[i]);
+            CHECKM(e == cudaSuccess && bad == 0, "%s Segmented %s nseg=%d err %d bad %d", tn, what, nseg, (int)e, bad);
+        };
+        run("Sum", rs, [&](void *t, size_t &b) { return cub::DeviceSegmentedReduce::Sum(t, b, in.p, out.p, nseg, doff.p, doff.p + 1); });
+        run("Max", rmx, [&](void *t, size_t &b) { return cub::DeviceSegmentedReduce::Max(t, b, in.p, out.p, nseg, doff.p, doff.p + 1); });
+        run("Min", rmn, [&](void *t, size_t &b) { return cub::DeviceSegmentedReduce::Min(t, b, in.p, out.p, nseg, doff.p, doff.p + 1); });
+        run("Reduce(Sum,3)", rred, [&](void *t, size_t &b) {
+            return cub::DeviceSegmentedReduce::Reduce(t, b, in.p, out.p, nseg, doff.p, doff.p + 1, cub::Sum(), T(3));
+        });
+        // Separate begin and end arrays: segment i is [begin[i], end[i]) with gaps.
+        if (nseg > 0) {
+            std::vector<int> bg(nseg), en(nseg);
+            std::vector<T> want(nseg);
+            for (int i = 0; i < nseg; ++i) {
+                bg[i] = (int)off[i];
+                en[i] = (int)(off[i + 1] - (off[i + 1] - off[i]) / 2); // first half of each segment
+                T s = T(0);
+                for (int k = bg[i]; k < en[i]; ++k) s = T(s + h[k]);
+                want[i] = s;
+            }
+            Dev<int> dbg(nseg), den(nseg);
+            dbg.up(bg); den.up(en);
+            run("Sum begin/end", want, [&](void *t, size_t &b) { return cub::DeviceSegmentedReduce::Sum(t, b, in.p, out.p, nseg, dbg.p, den.p); });
+            // Reversed bounds are empty.
+            for (int i = 0; i < nseg; ++i) want[i] = T(0);
+            run("Sum end<begin", want, [&](void *t, size_t &b) { return cub::DeviceSegmentedReduce::Sum(t, b, in.p, out.p, nseg, den.p, dbg.p); });
+        }
+        if (nseg == 3) {
+            Dev<T> o3(3);
+            protocol("DeviceSegmentedReduce::Sum", [&](void *t, size_t &b) {
+                return cub::DeviceSegmentedReduce::Sum(t, b, in.p, o3.p, nseg, doff.p, doff.p + 1);
+            }, o3, T(-77));
+        }
+    }
+}
+
+static void test_segmented_reduce()
+{
+    test_segmented_reduce_type<int>("int", 201, 100);
+    test_segmented_reduce_type<unsigned>("uint", 50, 0);
+    test_segmented_reduce_type<long long>("int64", 1000, 500);
+    test_segmented_reduce_type<float>("float", 4, 0);
+    test_segmented_reduce_type<double>("double", 7, 3);
+}
+
 int main()
 {
     test_reduce();
     test_scan();
     test_sort();
     test_segmented();
+    test_segmented_reduce();
     std::printf("cub_device: %s (%d checks, %d failed)\n", g_fail ? "FAIL" : "ok", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

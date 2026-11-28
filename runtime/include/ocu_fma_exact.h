@@ -71,6 +71,14 @@
 #define OCU_DM_FN static inline
 #endif
 
+/* SPIR-V devices (compiler/spirv): OpenCL's fma is correctly rounded, and the
+   target has no 128-bit integers for the software forms. */
+#if defined(OCU_SPIRV_PATH) && defined(__HIP_DEVICE_COMPILE__)
+#ifndef OCU_FMA_BUILTIN
+#define OCU_FMA_BUILTIN 1
+#endif
+#define OCU_FMA_NO_SOFT 1
+#endif
 #ifndef OCU_FMA_BUILTIN
 #if (defined(__NVPTX__) && defined(__CUDA_ARCH__)) || defined(__FP_FAST_FMA) || defined(__FMA__) || \
     defined(__ARM_FEATURE_FMA)

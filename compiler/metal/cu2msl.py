@@ -91,13 +91,9 @@ def clang_env() -> dict:
 def device_cmd(clang: str, flags: list[str], define: str = "OCU_METAL_PATH") -> list[str]:
     rt = REPO / "runtime" / "include"
     return [clang, "-x", "cuda", "--cuda-device-only", "-nocudainc", "-nocudalib",
-            f"--cuda-path={cuda_path()}",
-            # OCU_METAL_ARCH: the architecture device code is read for (the
-            # value __CUDA_ARCH__ takes). A program that picks kernels by
-            # architecture (llama.cpp) needs the one the build was configured
-            # with, e.g. sm_50.
-            f"--cuda-gpu-arch={os.environ.get('OCU_METAL_ARCH') or 'sm_80'}", "-std=c++17",
-            f"-I{rt}", "-include", str(rt / "cuda_runtime.h"),
+            f"--cuda-path={cuda_path()}", f"--cuda-gpu-arch={os.environ.get('OCU_CU_DEVICE_ARCH', 'sm_80')}", "-std=c++17",
+            # nvcc defines __CUDACC__ in both passes; Clang only in its own CUDA headers (-nocudainc)
+            "-D__CUDACC__", f"-I{rt}", "-include", str(rt / "cuda_runtime.h"),
             "-include", str(COMPAT / "ocu_metal_legacy_texture.h"), "-include", str(COMPAT / "helper_cuda.h"), f"-D{define}",
             "-Wno-unknown-cuda-version", *flags, "-idirafter", str(COMPAT)]
 
@@ -158,14 +154,32 @@ def bare(loc: dict) -> dict:
     return loc.get("expansionLoc", loc)
 
 
+ANON_NS = "(anonymous namespace)::"  # names in an anonymous namespace are unique in the file
+
+
 def qtype(n) -> str:
     t = n.get("type") or {}
-    return t.get("qualType", "")
+    return t.get("qualType", "").replace(ANON_NS, "")
 
 
 def dtype(n) -> str:
     t = n.get("type") or {}
-    return t.get("desugaredQualType", t.get("qualType", ""))
+    return t.get("desugaredQualType", t.get("qualType", "")).replace(ANON_NS, "")
+
+
+def cg_member_call(e) -> bool:
+    """A member call on a cooperative_groups object (thread_block,
+    thread_block_tile): the target's prelude provides these classes, so the
+    call is kept as written (only the OpenCL path with 32-wide sub-groups
+    has such a prelude; elsewhere the generated source fails to compile)."""
+    ch = kids(e)
+    callee = ch[0] if ch else None
+    while callee is not None and callee.get("kind") in ("ImplicitCastExpr", "ParenExpr"):
+        callee = kids(callee)[0] if kids(callee) else None
+    if callee is None or callee.get("kind") != "MemberExpr":
+        return False
+    obj = kids(callee)[0] if kids(callee) else None
+    return obj is not None and "cooperative_groups::" in dtype(obj)
 
 
 def strip_qual(t: str) -> str:
@@ -254,6 +268,9 @@ class Instance:
 
 
 class Translator:
+    LAMBDA_OK = False            # C++ for OpenCL has lambdas; MSL does not
+    WRAP_CLASS_TERNARY = False   # wrap class-typed ?: operands (mixed address spaces)
+    PTR_ARRAY_FIELDS = False     # struct fields T **: arrays of device pointers
     """CUDA to MSL. Subclasses for other targets whose kernel language has
     the same address-space model (compiler/opencl/cu2ocl.py) override the
     class attributes and the kernel_head / context_init / vec3_read /
@@ -425,6 +442,9 @@ class Translator:
             if d.get("name"):
                 self.user_names.add(d["name"])
             attrs = {c.get("kind") for c in kids(d)}
+            if k == "NamespaceDecl" and not d.get("name"):
+                self.scan(kids(d))
+                continue
             if k == "NamespaceDecl":
                 self.scan(kids(d), (ns + "::" if ns else "") + (d.get("name") or "(anonymous)"))
                 continue
@@ -659,6 +679,10 @@ class Translator:
             if e.get("isArrow"):
                 return self.ptr_space(ch[0], st) or "device"
             return self.lval_space(ch[0], st)
+        if k in ("CallExpr", "CXXOperatorCallExpr") and is_ref(qtype(e) + " &") and e.get("valueCategory") == "lvalue":
+            inst = self.call(e, st)
+            if inst is not None and inst.ret_space:
+                return inst.ret_space
         if k in ("MaterializeTemporaryExpr", "CompoundLiteralExpr", "CXXTemporaryObjectExpr",
                  "CXXConstructExpr", "InitListExpr") or e.get("valueCategory") == "prvalue":
             return "thread"
@@ -729,6 +753,8 @@ class Translator:
                             raise TranslateError(f"'{st['fname']}': call to '{d['name']}' through a macro is not handled yet")
                         nxt = t[paren + 1:].lstrip()
                         st["edits"].append((paren + 1, paren + 1, "ocu_ctx" + ("" if nxt.startswith(")") else ", ")))
+        elif callee is not None and callee.get("kind") == "MemberExpr" and cg_member_call(e):
+            pass
         elif callee is not None and callee.get("kind") in ("MemberExpr", "CXXDependentScopeMemberExpr"):
             raise TranslateError(f"'{st['fname']}': member function calls are not handled yet")
         elif callee is not None and callee.get("kind") not in ("DeclRefExpr",) and e.get("kind") == "CallExpr":
@@ -774,6 +800,7 @@ class Translator:
                 continue
             if p["kind"] == "TemplateTypeParmDecl":
                 at = (a.get("type") or {}).get("qualType")
+                at = at.replace(ANON_NS, "") if at else at
                 if at is None:
                     raise TranslateError(f"'{d['name']}': template argument for '{name}' is not a type")
                 if is_pointer(at) or is_ref(at) or "(" in at or "[" in at:
@@ -841,6 +868,7 @@ class Translator:
         text = self.text(bf)
         st = {"fname": fname, "vars": {}, "pending": {}, "edits": [], "calls": {}, "callees": set(),
               "callees_inst": [], "body": (bb, be), "text": text, "file": bf, "decls": []}
+        inst.callees_inst = st["callees_inst"]  # the call graph (targets that hoist per-kernel state use it)
         ret = self.return_type(fn)
         for i, p in enumerate(params):
             t = dtype(p)
@@ -874,7 +902,9 @@ class Translator:
                     st["vars"][rid] = (True, merge(old, sp, f"'{fname}': pointer '{lhs['referencedDecl'].get('name')}'"))
             elif k in ("CallExpr", "CXXOperatorCallExpr", "CXXMemberCallExpr"):
                 if k == "CXXMemberCallExpr":
-                    raise TranslateError(f"'{fname}': member function calls are not handled yet")
+                    if not cg_member_call(n):
+                        raise TranslateError(f"'{fname}': member function calls are not handled yet")
+                    continue
                 self.call(n, st)
             elif k in CASTS and is_pointer(dtype(n)):
                 inner = kids(n)[-1]
@@ -918,8 +948,23 @@ class Translator:
                     pass  # variables from the runtime headers: the prelude has them
             elif k == "ReturnStmt" and kids(n) and is_pointer(ret):
                 ret_space = merge(ret_space, self.ptr_space(kids(n)[0], st), f"'{fname}': the returned pointer")
+            elif k == "ReturnStmt" and kids(n) and is_ref(ret):
+                ret_space = merge(ret_space, self.lval_space(kids(n)[0], st), f"'{fname}': the returned reference")
+            elif k == "ConditionalOperator" and self.WRAP_CLASS_TERNARY and len(kids(n)) == 3:
+                rt = strip_qual(dtype(n))
+                vec = re.fullmatch(r"(u?char|u?short|u?int|u?long|half|float|double|bool)[2348]?|(unsigned |signed )?\w+ int|long long|unsigned long long|unsigned|unsigned long|unsigned char|unsigned short|signed char", rt)
+                if rt and not vec and rt not in SCALAR_SIZES and not is_pointer(rt) and not is_ref(rt) and "[" not in rt:
+                    try:
+                        spans = [self.edit_span(br, st, "a ?: operand") for br in kids(n)[1:]]
+                    except TranslateError:
+                        spans = []  # inside a macro: left as written (fine unless the address spaces differ)
+                    for cb, ce in spans:
+                        st["edits"].append((cb, cb, "ocu_rv("))
+                        st["edits"].append((ce, ce, ")"))
             elif k in ("GCCAsmStmt", "MSAsmStmt"):
                 raise TranslateError(f"'{fname}': inline assembly is not available on {self.TARGET}")
+            elif k == "LambdaExpr" and self.LAMBDA_OK:
+                pass
             elif k in ("LambdaExpr", "CXXThisExpr", "CXXNewExpr", "CXXDeleteExpr", "CXXThrowExpr",
                        "CXXTryStmt", "CXXTypeidExpr"):
                 raise TranslateError(f"'{fname}': {k[3:] if k.startswith('CXX') else k} is not handled yet")
@@ -940,7 +985,7 @@ class Translator:
             if len(sps) > 1:
                 raise TranslateError(f"'{fname}': one declaration of pointers into different memory ({', '.join(sorted(sps))}); split it")
             st["edits"].append((pos, pos, f"{sps.pop()} "))
-        inst.ret_space = ret_space or ("device" if is_pointer(ret) else None)
+        inst.ret_space = ret_space or ("device" if is_pointer(ret) else ("thread" if is_ref(ret) else None))
         out = self.apply(text[bb:be], bb, st["edits"], fname)
         inst.head, inst.param_line = self.head(inst, params, ret)
         inject = "".join(f"\n    {line}" for line in inst.tmpl)
@@ -969,7 +1014,8 @@ class Translator:
                 st["edits"].append((b, e, f"threadgroup {base} *{n['name']} = (threadgroup {base} *)ocu_ctx.dyn"))
             else:
                 if not inst.kernel:
-                    raise TranslateError(f"'{fname}': __shared__ in a device function is not handled yet")
+                    self.device_shared(inst, st, n)
+                    return
                 b, e = self.edit_span(n, st, "a __shared__ declaration", True)
                 m = re.search(r"\b__shared__\b", text[b:e])
                 if not m:
@@ -998,6 +1044,9 @@ class Translator:
             if re.search(r"\*\s*(const\s*)?\[", td) or re.search(r"\*\s*(const\s*)?\[", t):
                 raise TranslateError(f"'{fname}': arrays of pointers are not handled yet")
             st["vars"][n["id"]] = (False, "thread")
+
+    def device_shared(self, inst, st, n):
+        raise TranslateError(f"'{st['fname']}': __shared__ in a device function is not handled yet")
 
     @staticmethod
     def return_type(fn) -> str:
@@ -1028,7 +1077,9 @@ class Translator:
             head = self.kernel_head(inst)
             return head, f"param {inst.name} " + " ".join(str(s) for s in sizes)
         if is_ref(ret):
-            raise TranslateError(f"'{fname}': functions returning references are not handled yet")
+            if not ret.rstrip().endswith("&"):
+                raise TranslateError(f"'{fname}': returning a reference typedef is not handled yet")
+            ret = f"{inst.ret_space} {ret}"
         if is_pointer(ret):
             if not ret.rstrip().endswith("*"):
                 raise TranslateError(f"'{fname}': returning a pointer typedef is not handled yet")
@@ -1067,7 +1118,7 @@ class Translator:
     def prologue(self, inst, params) -> str:
         reads = []
         for i, p in enumerate(params):
-            t = no_restrict(dtype(p))
+            t = re.sub(r"\bstruct\s+", "", no_restrict(dtype(p)))
             name = p.get("name") or f"ocu_p{i}"
             if is_pointer(t):
                 reads.append(f"    device {t} {name} = ocu_ptr<device {t}>(ocu_args, ocu_offs, {i});")
@@ -1297,7 +1348,8 @@ class Translator:
                 if is_ref(fd):
                     raise TranslateError(f"{fname}: reference fields are not handled")
                 if "*" in fd:
-                    if not is_pointer(fd) or is_pointer(pointee(fd)) or "(" in fd:
+                    if not is_pointer(fd) or "(" in fd or (is_pointer(pointee(fd)) and
+                                                           (not self.PTR_ARRAY_FIELDS or is_pointer(pointee(pointee(fd))))):
                         raise TranslateError(f"{fname}: this kind of pointer field is not handled yet")
                     if not ft.rstrip().endswith("*") and not is_pointer(ft):
                         raise TranslateError(f"{fname}: pointer typedef fields are not handled yet")

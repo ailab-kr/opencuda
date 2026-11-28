@@ -80,6 +80,9 @@ typedef struct _cl_event         *cl_event;
 #define CL_DEVICE_SVM_CAPABILITIES        0x1053
 #define CL_DEVICE_IL_VERSION              0x105B
 #define CL_DEVICE_GENERIC_ADDRESS_SPACE_SUPPORT 0x1069
+/* cl_intel_device_attribute_query */
+#define CL_DEVICE_NUM_SLICES_INTEL        0x4252
+#define CL_DEVICE_NUM_SUB_SLICES_PER_SLICE_INTEL 0x4253
 
 #define CL_DEVICE_SVM_COARSE_GRAIN_BUFFER (1u << 0)
 #define CL_DEVICE_SVM_FINE_GRAIN_BUFFER   (1u << 1)
@@ -99,15 +102,18 @@ typedef struct _cl_event         *cl_event;
 
 /* programs and kernels */
 #define CL_PROGRAM_BUILD_LOG           0x1183
+#define CL_PROGRAM_BUILD_GLOBAL_VARIABLE_TOTAL_SIZE 0x1185
 #define CL_KERNEL_NUM_ARGS             0x1191
 #define CL_KERNEL_WORK_GROUP_SIZE      0x11B0
 #define CL_KERNEL_LOCAL_MEM_SIZE       0x11B2
+#define CL_KERNEL_SPILL_MEM_SIZE_INTEL 0x4109 /* cl_intel_required_subgroup_size */
 #define CL_KERNEL_EXEC_INFO_SVM_PTRS   0x11B6
 
 /* events */
 #define CL_EVENT_COMMAND_EXECUTION_STATUS 0x11D3
 #define CL_COMPLETE  0x0
 #define CL_PROFILING_COMMAND_END 0x1283
+#define CL_PROFILING_COMMAND_START 0x1282
 
 #define OCL_CALL /* default calling convention on the supported hosts */
 
@@ -159,7 +165,23 @@ typedef struct ocl_api {
     cl_int (*ReleaseEvent)(cl_event);
     /* OpenCL 2.1; NULL when the library does not have it */
     cl_program (*CreateProgramWithIL)(cl_context, const void *, size_t, cl_int *);
+    /* OpenCL 1.2; NULL when the library does not have it */
+    void *(*GetExtensionFunctionAddressForPlatform)(cl_platform_id, const char *);
+    /* OpenCL 1.1 / 2.0; NULL when the library does not have them (by-buffer
+       kernel arguments then copy synchronously) */
+    cl_int (*SetEventCallback)(cl_event, cl_int, void (*)(cl_event, cl_int, void *), void *);
+    cl_int (*EnqueueSVMFree)(cl_command_queue, cl_uint, void *[],
+                             void (*)(cl_command_queue, cl_uint, void *[], void *), void *, cl_uint,
+                             const cl_event *, cl_event *);
 } ocl_api;
+
+/* cl_intel_unified_shared_memory (Khronos extension registry) */
+#define CL_DEVICE_HOST_MEM_CAPABILITIES_INTEL 0x4190
+#define CL_DEVICE_SINGLE_DEVICE_SHARED_MEM_CAPABILITIES_INTEL 0x4192
+#define CL_UNIFIED_SHARED_MEMORY_ACCESS_INTEL (1u << 0)
+typedef void *(*ocl_shared_mem_alloc_intel)(cl_context, cl_device_id, const cl_ulong *, size_t, cl_uint, cl_int *);
+typedef void *(*ocl_host_mem_alloc_intel)(cl_context, const cl_ulong *, size_t, cl_uint, cl_int *);
+typedef cl_int (*ocl_mem_blocking_free_intel)(cl_context, void *);
 
 /* The OpenCL library's entry points, or NULL when there is none (or it is
    missing an entry point of OpenCL 2.0). Loaded once per process. */

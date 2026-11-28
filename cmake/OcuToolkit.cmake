@@ -25,7 +25,7 @@ set(OCU_TOOLKIT_DIR ${PROJECT_BINARY_DIR}/toolkit)
 set(_tk ${OCU_TOOLKIT_DIR})
 file(MAKE_DIRECTORY ${_tk}/bin ${_tk}/include ${_tk}/lib ${_tk}/nvvm/libdevice ${_tk}/cmake/modules)
 file(CREATE_LINK ${PROJECT_SOURCE_DIR}/compiler/driver/ocu-nvcc ${_tk}/bin/ocu-nvcc SYMBOLIC)
-foreach(n nvcc ocu-nvcc-cpu ocu-nvcc-nvidia)
+foreach(n nvcc ocu-nvcc-cpu ocu-nvcc-nvidia ocu-nvcc-opencl ocu-nvcc-intel ocu-nvcc-spirv)
   file(CREATE_LINK ocu-nvcc ${_tk}/bin/${n} SYMBOLIC)
 endforeach()
 
@@ -60,7 +60,7 @@ configure_file(${PROJECT_SOURCE_DIR}/cmake/cuda-modules/FindCUDAToolkit.cmake
 
 # Libraries: links to the built archives, refreshed after every build.
 set(_ocu_tk_libs ocu_cudart ocu_core ocu_blas)
-foreach(t ocu_backend_cpu ocu_backend_nvidia ocu_backend_opencl ocu_backend_metal ocu_backend_npusim ocu_ops_ref ocu_cublas_cpu ocu_cublas_nvidia)
+foreach(t ocu_backend_cpu ocu_backend_nvidia ocu_backend_opencl ocu_backend_metal ocu_backend_npusim ocu_ops_ref ocu_cublas_cpu ocu_cublas_nvidia ocu_cublas_opencl)
   if(TARGET ${t})
     list(APPEND _ocu_tk_libs ${t})
   endif()
@@ -97,7 +97,7 @@ install(CODE "
   file(MAKE_DIRECTORY \"\${_tk}/bin\" \"\${_tk}/nvvm/libdevice\")
   file(REMOVE \"\${_tk}/bin/ocu-nvcc\" \"\${_tk}/include\" \"\${_tk}/lib\")
   file(CREATE_LINK ${_ocu_to_bin} \"\${_tk}/bin/ocu-nvcc\" SYMBOLIC)
-  foreach(n nvcc ocu-nvcc-cpu ocu-nvcc-nvidia)
+  foreach(n nvcc ocu-nvcc-cpu ocu-nvcc-nvidia ocu-nvcc-opencl ocu-nvcc-intel ocu-nvcc-spirv)
     file(REMOVE \"\${_tk}/bin/\${n}\")
     file(CREATE_LINK ocu-nvcc \"\${_tk}/bin/\${n}\" SYMBOLIC)
   endforeach()

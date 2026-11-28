@@ -480,7 +480,9 @@ enum cudaDeviceAttr {
     cudaDevAttrPciDeviceId = 34,
     cudaDevAttrPciDomainId = 50,
     cudaDevAttrCooperativeLaunch = 95,            /* always 0: no co-residency guarantee */
-    cudaDevAttrCooperativeMultiDeviceLaunch = 96  /* always 0 */
+    cudaDevAttrCooperativeMultiDeviceLaunch = 96, /* always 0 */
+    cudaDevAttrMemoryPoolsSupported = 115,        /* 1: cudaMallocAsync and memory pools */
+    cudaDevAttrMemoryPoolSupportedHandleTypes = 119 /* 0: no shareable handles */
 };
 
 /* cudaHostRegister flags. */
@@ -719,6 +721,91 @@ cudaError_t cudaMalloc(void **ptr, size_t size);
 cudaError_t cudaFree(void *ptr);
 cudaError_t cudaMallocManaged(void **ptr, size_t size, unsigned int flags);
 cudaError_t cudaPointerGetAttributes(struct cudaPointerAttributes *attr, const void *ptr);
+
+/* Managed memory hints (the documented values). Prefetching and advice are
+   hints: the calls check their arguments (the range must lie in one managed
+   allocation, the device must exist or be cudaCpuDeviceId) and return;
+   pages move when they are touched. */
+#define cudaCpuDeviceId ((int)-1)
+#define cudaInvalidDeviceId ((int)-2)
+enum cudaMemoryAdvise {
+    cudaMemAdviseSetReadMostly = 1,
+    cudaMemAdviseUnsetReadMostly = 2,
+    cudaMemAdviseSetPreferredLocation = 3,
+    cudaMemAdviseUnsetPreferredLocation = 4,
+    cudaMemAdviseSetAccessedBy = 5,
+    cudaMemAdviseUnsetAccessedBy = 6
+};
+enum cudaMemLocationType {
+    cudaMemLocationTypeInvalid = 0,
+    cudaMemLocationTypeDevice = 1,
+    cudaMemLocationTypeHost = 2,
+    cudaMemLocationTypeHostNuma = 3,
+    cudaMemLocationTypeHostNumaCurrent = 4
+};
+struct cudaMemLocation {
+    enum cudaMemLocationType type;
+    int id;
+};
+cudaError_t cudaMemPrefetchAsync(const void *ptr, size_t count, int dstDevice, cudaStream_t stream);
+cudaError_t cudaMemAdvise(const void *ptr, size_t count, enum cudaMemoryAdvise advice, int device);
+cudaError_t cudaMemPrefetchAsync_v2(const void *ptr, size_t count, struct cudaMemLocation location,
+                                    unsigned int flags, cudaStream_t stream);
+cudaError_t cudaMemAdvise_v2(const void *ptr, size_t count, enum cudaMemoryAdvise advice,
+                             struct cudaMemLocation location);
+
+/* Stream-ordered allocation (cudaMallocAsync, cudaFreeAsync, memory pools).
+   An allocation is made when the call is made (valid from that point in
+   stream order, as documented); a free waits in the pool, with a marker in
+   its stream, and its memory is reused by a later allocation on the same
+   stream at once, or on any stream once the marker has completed. Memory
+   the pool holds above its release threshold (cudaMemPoolAttrReleaseThreshold,
+   default 0) goes back at cudaDeviceSynchronize and cudaMemPoolTrimTo, or
+   when an allocation finds no memory. */
+typedef struct ocu_rt_mempool *cudaMemPool_t;
+enum cudaMemPoolAttr {
+    cudaMemPoolReuseFollowEventDependencies = 1,
+    cudaMemPoolReuseAllowOpportunistic = 2,
+    cudaMemPoolReuseAllowInternalDependencies = 3,
+    cudaMemPoolAttrReleaseThreshold = 4,
+    cudaMemPoolAttrReservedMemCurrent = 5,
+    cudaMemPoolAttrReservedMemHigh = 6,
+    cudaMemPoolAttrUsedMemCurrent = 7,
+    cudaMemPoolAttrUsedMemHigh = 8
+};
+enum cudaMemAllocationType {
+    cudaMemAllocationTypeInvalid = 0,
+    cudaMemAllocationTypePinned = 1,
+    cudaMemAllocationTypeMax = 0x7FFFFFFF
+};
+enum cudaMemAllocationHandleType {
+    cudaMemHandleTypeNone = 0,
+    cudaMemHandleTypePosixFileDescriptor = 1,
+    cudaMemHandleTypeWin32 = 2,
+    cudaMemHandleTypeWin32Kmt = 4,
+    cudaMemHandleTypeFabric = 8
+};
+struct cudaMemPoolProps {
+    enum cudaMemAllocationType allocType;
+    enum cudaMemAllocationHandleType handleTypes;
+    struct cudaMemLocation location;
+    void *win32SecurityAttributes;
+    size_t maxSize;
+    unsigned short usage;
+    unsigned char reserved[54];
+};
+cudaError_t cudaMallocAsync(void **devPtr, size_t size, cudaStream_t stream);
+cudaError_t cudaFreeAsync(void *devPtr, cudaStream_t stream);
+cudaError_t cudaMallocFromPoolAsync(void **ptr, size_t size, cudaMemPool_t memPool, cudaStream_t stream);
+cudaError_t cudaDeviceGetDefaultMemPool(cudaMemPool_t *memPool, int device);
+cudaError_t cudaDeviceGetMemPool(cudaMemPool_t *memPool, int device);
+cudaError_t cudaDeviceSetMemPool(int device, cudaMemPool_t memPool);
+cudaError_t cudaMemPoolCreate(cudaMemPool_t *memPool, const struct cudaMemPoolProps *poolProps);
+cudaError_t cudaMemPoolDestroy(cudaMemPool_t memPool);
+cudaError_t cudaMemPoolSetAttribute(cudaMemPool_t memPool, enum cudaMemPoolAttr attr, void *value);
+cudaError_t cudaMemPoolGetAttribute(cudaMemPool_t memPool, enum cudaMemPoolAttr attr, void *value);
+cudaError_t cudaMemPoolTrimTo(cudaMemPool_t memPool, size_t minBytesToKeep);
+
 cudaError_t cudaHostRegister(void *ptr, size_t size, unsigned int flags);
 cudaError_t cudaHostUnregister(void *ptr);
 cudaError_t cudaHostGetDevicePointer(void **dptr, void *hptr, unsigned int flags);
@@ -934,6 +1021,25 @@ static inline cudaError_t cudaMallocHost(T **ptr, size_t size)
 }
 
 template <class T>
+static inline cudaError_t cudaMallocAsync(T **ptr, size_t size, cudaStream_t stream)
+{
+    return cudaMallocAsync(reinterpret_cast<void **>(ptr), size, stream);
+}
+
+template <class T>
+static inline cudaError_t cudaMallocFromPoolAsync(T **ptr, size_t size, cudaMemPool_t pool, cudaStream_t stream)
+{
+    return cudaMallocFromPoolAsync(reinterpret_cast<void **>(ptr), size, pool, stream);
+}
+
+/* CUDA's C++ form taking the pool before the stream */
+template <class T>
+static inline cudaError_t cudaMallocAsync(T **ptr, size_t size, cudaMemPool_t pool, cudaStream_t stream)
+{
+    return cudaMallocFromPoolAsync(reinterpret_cast<void **>(ptr), size, pool, stream);
+}
+
+template <class T>
 static inline cudaError_t cudaFuncSetAttribute(T *func, cudaFuncAttribute attr, int value)
 {
     return cudaFuncSetAttribute(reinterpret_cast<const void *>(func), attr, value);
@@ -952,6 +1058,19 @@ static inline cudaError_t cudaOccupancyMaxActiveBlocksPerMultiprocessor(int *blo
 {
     return cudaOccupancyMaxActiveBlocksPerMultiprocessor(
         blocks, reinterpret_cast<const void *>(func), block_size, dynamic_smem);
+}
+
+/* CUDA 13's forms of the managed-memory hints take a cudaMemLocation (the
+   _v2 functions of 12.x) */
+static inline cudaError_t cudaMemPrefetchAsync(const void *ptr, size_t count, struct cudaMemLocation location,
+                                               unsigned int flags, cudaStream_t stream = 0)
+{
+    return cudaMemPrefetchAsync_v2(ptr, count, location, flags, stream);
+}
+static inline cudaError_t cudaMemAdvise(const void *ptr, size_t count, enum cudaMemoryAdvise advice,
+                                        struct cudaMemLocation location)
+{
+    return cudaMemAdvise_v2(ptr, count, advice, location);
 }
 
 template <class T>
@@ -1023,6 +1142,17 @@ static inline cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t e
 /* Kernel function pointers, as in the C++ overloads of the documented API
    (variadic: C++11 and later; older host code uses the const void * form). */
 #if __cplusplus >= 201103L
+#if defined(OCU_SPIRV_PATH) && defined(__HIP_DEVICE_COMPILE__)
+/* SPIR-V device pass: kernels carry the device_kernel calling convention in
+   their type there (see cudaLaunchKernel in ocu_cuda_lang_spirv.h) */
+template <typename F>
+static inline cudaError_t cudaLaunchCooperativeKernel(F *func, dim3 grid, dim3 block, void **args,
+                                                      size_t shared_mem = 0, cudaStream_t stream = 0)
+{
+    return cudaLaunchCooperativeKernel(reinterpret_cast<const void *>(func), grid, block, args,
+                                       shared_mem, stream);
+}
+#else
 template <typename... P>
 static inline cudaError_t cudaLaunchCooperativeKernel(void (*func)(P...), dim3 grid, dim3 block,
                                                       void **args, size_t shared_mem = 0,
@@ -1031,6 +1161,7 @@ static inline cudaError_t cudaLaunchCooperativeKernel(void (*func)(P...), dim3 g
     return cudaLaunchCooperativeKernel(reinterpret_cast<const void *>(func), grid, block, args,
                                        shared_mem, stream);
 }
+#endif
 #endif
 
 /* Texture references, channel descriptors and the C++ texture overloads. */

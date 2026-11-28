@@ -12,7 +12,11 @@
  *                                               InclusiveScan, ExclusiveScan
  *                                               (one item or an array per thread)
  *   BlockLoad / BlockStore<T, X, ITEMS, ALG>    blocked and striped arrangements
+ *   BlockReduce<T, BLOCK_DIM_X, ALG, Y, Z>      Reduce, Sum (one item, an array per
+ *                                               thread, or the first num_valid threads)
+ *   WarpReduce<T, LOGICAL_WARP_THREADS>         Reduce, Sum (optionally valid_items)
  *   DeviceReduce                                Sum, Max, Min, Reduce
+ *   DeviceSegmentedReduce                       Sum, Max, Min, Reduce
  *   DeviceScan                                  InclusiveSum, ExclusiveSum,
  *                                               InclusiveScan, ExclusiveScan
  *   DeviceRadixSort                             SortPairs(Descending), SortKeys(Descending)
@@ -77,6 +81,115 @@ struct Min {
     }
 };
 
+/* A key and a value (CUB documentation: KeyValuePair), and the arg max /
+   arg min operators on such pairs: the larger / smaller value, the lower
+   key when the values are equal. Trivially constructible, so it can sit in
+   __shared__ memory. */
+template <typename _Key, typename _Value>
+struct KeyValuePair {
+    typedef _Key Key;
+    typedef _Value Value;
+    Key key;
+    Value value;
+    KeyValuePair() = default;
+    __host__ __device__ __forceinline__ KeyValuePair(Key const &k, Value const &v) : key(k), value(v) {}
+    __host__ __device__ __forceinline__ bool operator!=(const KeyValuePair &b) const
+    {
+        return (value != b.value) || (key != b.key);
+    }
+};
+
+struct ArgMax {
+    template <typename T, typename OffsetT>
+    __host__ __device__ __forceinline__ KeyValuePair<OffsetT, T> operator()(const KeyValuePair<OffsetT, T> &a,
+                                                                             const KeyValuePair<OffsetT, T> &b) const
+    {
+        return ((b.value > a.value) || ((a.value == b.value) && (b.key < a.key))) ? b : a;
+    }
+};
+
+struct ArgMin {
+    template <typename T, typename OffsetT>
+    __host__ __device__ __forceinline__ KeyValuePair<OffsetT, T> operator()(const KeyValuePair<OffsetT, T> &a,
+                                                                             const KeyValuePair<OffsetT, T> &b) const
+    {
+        return ((b.value < a.value) || ((a.value == b.value) && (b.key < a.key))) ? b : a;
+    }
+};
+
+/* ---- input iterators (CUB documentation: CountingInputIterator,
+   TransformInputIterator): random access, on the host and in device code,
+   for the device-wide algorithms and BlockLoad ------------------------- */
+
+template <typename ValueType, typename OffsetT = ptrdiff_t>
+class CountingInputIterator {
+public:
+    typedef CountingInputIterator self_type;
+    typedef OffsetT difference_type;
+    typedef ValueType value_type;
+    typedef ValueType *pointer;
+    typedef ValueType reference;
+    typedef std::random_access_iterator_tag iterator_category;
+
+    __host__ __device__ __forceinline__ CountingInputIterator(const ValueType &val) : val_(val) {}
+    __host__ __device__ __forceinline__ self_type operator++(int) { self_type r = *this; ++val_; return r; }
+    __host__ __device__ __forceinline__ self_type &operator++() { ++val_; return *this; }
+    __host__ __device__ __forceinline__ reference operator*() const { return val_; }
+    template <typename Distance>
+    __host__ __device__ __forceinline__ self_type operator+(Distance n) const { return self_type(val_ + (ValueType)n); }
+    template <typename Distance>
+    __host__ __device__ __forceinline__ self_type &operator+=(Distance n) { val_ += (ValueType)n; return *this; }
+    template <typename Distance>
+    __host__ __device__ __forceinline__ self_type operator-(Distance n) const { return self_type(val_ - (ValueType)n); }
+    template <typename Distance>
+    __host__ __device__ __forceinline__ self_type &operator-=(Distance n) { val_ -= (ValueType)n; return *this; }
+    __host__ __device__ __forceinline__ difference_type operator-(self_type other) const { return (difference_type)(val_ - other.val_); }
+    template <typename Distance>
+    __host__ __device__ __forceinline__ reference operator[](Distance n) const { return val_ + (ValueType)n; }
+    __host__ __device__ __forceinline__ bool operator==(const self_type &rhs) const { return val_ == rhs.val_; }
+    __host__ __device__ __forceinline__ bool operator!=(const self_type &rhs) const { return val_ != rhs.val_; }
+
+private:
+    ValueType val_;
+};
+
+/* conversion_op(*input) for each element */
+template <typename ValueType, typename ConversionOp, typename InputIteratorT, typename OffsetT = ptrdiff_t>
+class TransformInputIterator {
+public:
+    typedef TransformInputIterator self_type;
+    typedef OffsetT difference_type;
+    typedef ValueType value_type;
+    typedef ValueType *pointer;
+    typedef ValueType reference;
+    typedef std::random_access_iterator_tag iterator_category;
+
+    __host__ __device__ __forceinline__ TransformInputIterator(InputIteratorT input_itr, ConversionOp conversion_op)
+        : op_(conversion_op), it_(input_itr)
+    {
+    }
+    __host__ __device__ __forceinline__ self_type operator++(int) { self_type r = *this; ++it_; return r; }
+    __host__ __device__ __forceinline__ self_type &operator++() { ++it_; return *this; }
+    __host__ __device__ __forceinline__ reference operator*() const { return op_(*it_); }
+    template <typename Distance>
+    __host__ __device__ __forceinline__ self_type operator+(Distance n) const { return self_type(it_ + n, op_); }
+    template <typename Distance>
+    __host__ __device__ __forceinline__ self_type &operator+=(Distance n) { it_ += n; return *this; }
+    template <typename Distance>
+    __host__ __device__ __forceinline__ self_type operator-(Distance n) const { return self_type(it_ - n, op_); }
+    template <typename Distance>
+    __host__ __device__ __forceinline__ self_type &operator-=(Distance n) { it_ -= n; return *this; }
+    __host__ __device__ __forceinline__ difference_type operator-(self_type other) const { return (difference_type)(it_ - other.it_); }
+    template <typename Distance>
+    __host__ __device__ __forceinline__ reference operator[](Distance n) const { return op_(it_[n]); }
+    __host__ __device__ __forceinline__ bool operator==(const self_type &rhs) const { return it_ == rhs.it_; }
+    __host__ __device__ __forceinline__ bool operator!=(const self_type &rhs) const { return it_ != rhs.it_; }
+
+private:
+    ConversionOp op_;
+    InputIteratorT it_;
+};
+
 struct NullType {};
 
 /* ---- algorithm selectors (they change speed, not results) ------------ */
@@ -117,7 +230,7 @@ __device__ __forceinline__ int linear_tid()
 /* Uninitialised storage for N values of T (usable as a __shared__ member). */
 template <typename T, int N>
 struct raw_array {
-    alignas(T) unsigned char bytes[sizeof(T) * N];
+    alignas(alignof(T) > 16 ? alignof(T) : 16) unsigned char bytes[sizeof(T) * N];
     __device__ __forceinline__ T *data() { return reinterpret_cast<T *>(bytes); }
 };
 
@@ -146,6 +259,22 @@ __device__ __forceinline__ T block_inclusive(T *buf0, T *buf1, int threads, int 
     }
     last = a;
     return a[tid];
+}
+
+/*
+ * The global side of a transposing load/store: the tile moved between global
+ * and shared memory in 16-byte pieces, neighbouring threads taking
+ * neighbouring pieces, so each access instruction covers whole cache lines
+ * (item-wide accesses of 1- or 2-byte types cover a fraction of one, and
+ * thread-contiguous wide ones leave gaps between lanes). True when done.
+ */
+template <int BYTES, int THREADS>
+__device__ __forceinline__ bool copy_striped16(void *dst, const void *src, int tid)
+{
+    if (BYTES % 16 != 0 || (((uintptr_t)dst | (uintptr_t)src) & 15) != 0) return false;
+    for (int c = tid; c < BYTES / 16; c += THREADS)
+        reinterpret_cast<uint4 *>(dst)[c] = reinterpret_cast<const uint4 *>(src)[c];
+    return true;
 }
 
 } // namespace ocu_detail
@@ -378,9 +507,16 @@ private:
             }
         } else if (TRANSPOSE) {
             T *sm = s_.buf.data();
-            for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
-                int k = i * BLOCK_THREADS + tid_;
-                if (k < valid) sm[k] = it[k];
+            bool wide = false;
+            if constexpr (std::is_pointer<It>::value && std::is_trivially_copyable<T>::value) {
+                if (valid >= TILE)
+                    wide = ocu_detail::copy_striped16<(int)sizeof(T) * TILE, BLOCK_THREADS>(sm, (const void *)it, tid_);
+            }
+            if (!wide) {
+                for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+                    int k = i * BLOCK_THREADS + tid_;
+                    if (k < valid) sm[k] = it[k];
+                }
             }
             __syncthreads();
             for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
@@ -448,9 +584,16 @@ private:
             T *sm = s_.buf.data();
             for (int i = 0; i < ITEMS_PER_THREAD; ++i) sm[tid_ * ITEMS_PER_THREAD + i] = items[i];
             __syncthreads();
-            for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
-                int k = i * BLOCK_THREADS + tid_;
-                if (k < valid) it[k] = sm[k];
+            bool wide = false;
+            if constexpr (std::is_pointer<It>::value && std::is_trivially_copyable<T>::value) {
+                if (valid >= TILE)
+                    wide = ocu_detail::copy_striped16<(int)sizeof(T) * TILE, BLOCK_THREADS>((void *)it, sm, tid_);
+            }
+            if (!wide) {
+                for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+                    int k = i * BLOCK_THREADS + tid_;
+                    if (k < valid) it[k] = sm[k];
+                }
             }
         } else {
             for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
@@ -483,6 +626,15 @@ inline size_t align_bytes(size_t x) { return (x + 255) & ~(size_t)255; }
 
 template <typename It>
 using value_of = typename std::remove_cv<typename std::iterator_traits<It>::value_type>::type;
+
+/* As the CUB documentation describes DeviceReduce: Sum starts from the
+   output's value type (the input's when the output has none), and the
+   accumulator is the type the operator gives for (initial value, input):
+   a bool iterator summed into int64_t counts. */
+template <typename Out, typename In>
+using init_of = typename std::conditional<std::is_void<value_of<Out>>::value, value_of<In>, value_of<Out>>::type;
+template <typename Op, typename Init, typename In>
+using accum_of = typename std::decay<decltype(std::declval<Op>()(std::declval<Init>(), std::declval<value_of<In>>()))>::type;
 
 /* Bump allocator over the caller's temporary storage. */
 struct carve {
@@ -572,6 +724,41 @@ __global__ void reduce_final(InIt partial, long long count, OutIt out, Op op, In
     if (t == 0) {
         Acc r = fs[0] ? (Acc)op((Acc)init, v[0]) : (Acc)init;
         *out = r;
+    }
+}
+
+/* One block per segment (grid-stride over segments): segment s is
+   [begin[s], end[s]); out[s] = op(init, items), or init when empty. */
+template <typename InIt, typename OutIt, typename BeginIt, typename EndIt, typename Acc,
+          typename Op, typename Init>
+__global__ void reduce_segments(InIt in, OutIt out, long long nseg, BeginIt begin, EndIt end,
+                                Op op, Init init)
+{
+    __shared__ raw_array<Acc, kThreads> vs;
+    __shared__ int fs[kThreads];
+    Acc *v = vs.data();
+    const int t = threadIdx.x;
+    for (long long seg = blockIdx.x; seg < nseg; seg += gridDim.x) {
+        const long long b = (long long)begin[seg], e = (long long)end[seg];
+        Acc acc{};
+        int have = 0;
+        for (long long i = b + t; i < e; i += kThreads) {
+            Acc x = (Acc)in[i];
+            acc = have ? (Acc)op(acc, x) : x;
+            have = 1;
+        }
+        v[t] = acc;
+        fs[t] = have;
+        __syncthreads();
+        for (int s = kThreads / 2; s > 0; s >>= 1) {
+            if (t < s && fs[t + s]) {
+                v[t] = fs[t] ? (Acc)op(v[t], v[t + s]) : v[t + s];
+                fs[t] = 1;
+            }
+            __syncthreads();
+        }
+        if (t == 0) out[seg] = fs[0] ? (Acc)op((Acc)init, v[0]) : (Acc)init;
+        __syncthreads(); /* v and fs are reused by the next segment */
     }
 }
 
@@ -1087,7 +1274,7 @@ struct DeviceReduce {
                               ReductionOpT reduction_op, T init, cudaStream_t stream = 0)
     {
         using namespace ocu_detail;
-        using Acc = value_of<InputIteratorT>;
+        using Acc = accum_of<ReductionOpT, T, InputIteratorT>;
         const long long n = (long long)num_items;
         /* Small inputs: one block, one launch. */
         const bool single = n <= (long long)kThreads * kReduceSingleItems;
@@ -1117,9 +1304,9 @@ struct DeviceReduce {
     static cudaError_t Sum(void *d_temp_storage, size_t &temp_storage_bytes, InputIteratorT d_in,
                            OutputIteratorT d_out, NumItemsT num_items, cudaStream_t stream = 0)
     {
-        using Acc = ocu_detail::value_of<InputIteratorT>;
+        using Init = ocu_detail::init_of<OutputIteratorT, InputIteratorT>;
         return Reduce(d_temp_storage, temp_storage_bytes, d_in, d_out, num_items, cub::Sum(),
-                      Acc(0), stream);
+                      Init(0), stream);
     }
 
     /* Max and Min start from the lowest / highest value of the type
@@ -1152,6 +1339,74 @@ private:
     static T highest()
     {
         return std::numeric_limits<T>::max();
+    }
+};
+
+/* ---- DeviceSegmentedReduce ------------------------------------------- */
+
+/* Segment i is [d_begin_offsets[i], d_end_offsets[i]); an empty one
+   (end <= begin) gives the initial value: 0 for Sum, the lowest / highest
+   value of the type for Max / Min. No temporary storage is used (the query
+   still answers at least 1 byte). ArgMin / ArgMax are not here. */
+struct DeviceSegmentedReduce {
+    template <typename InputIteratorT, typename OutputIteratorT, typename BeginOffsetIteratorT,
+              typename EndOffsetIteratorT, typename ReductionOpT, typename T>
+    static cudaError_t Reduce(void *d_temp_storage, size_t &temp_storage_bytes,
+                              InputIteratorT d_in, OutputIteratorT d_out, long long num_segments,
+                              BeginOffsetIteratorT d_begin_offsets,
+                              EndOffsetIteratorT d_end_offsets, ReductionOpT reduction_op,
+                              T initial_value, cudaStream_t stream = 0)
+    {
+        using namespace ocu_detail;
+        using Acc = value_of<InputIteratorT>;
+        if (d_temp_storage == nullptr) return finish_query(temp_storage_bytes, 0);
+        cudaError_t e = check_space(temp_storage_bytes, 0);
+        if (e != cudaSuccess) return e;
+        if (num_segments <= 0) return cudaSuccess;
+        const unsigned grid = (unsigned)(num_segments < 65535 ? num_segments : 65535);
+        reduce_segments<InputIteratorT, OutputIteratorT, BeginOffsetIteratorT, EndOffsetIteratorT,
+                        Acc, ReductionOpT, T><<<grid, kThreads, 0, stream>>>(
+            d_in, d_out, num_segments, d_begin_offsets, d_end_offsets, reduction_op,
+            initial_value);
+        return cudaPeekAtLastError();
+    }
+
+    template <typename InputIteratorT, typename OutputIteratorT, typename BeginOffsetIteratorT,
+              typename EndOffsetIteratorT>
+    static cudaError_t Sum(void *d_temp_storage, size_t &temp_storage_bytes, InputIteratorT d_in,
+                           OutputIteratorT d_out, long long num_segments,
+                           BeginOffsetIteratorT d_begin_offsets, EndOffsetIteratorT d_end_offsets,
+                           cudaStream_t stream = 0)
+    {
+        using Acc = ocu_detail::value_of<InputIteratorT>;
+        return Reduce(d_temp_storage, temp_storage_bytes, d_in, d_out, num_segments,
+                      d_begin_offsets, d_end_offsets, cub::Sum(), Acc(0), stream);
+    }
+
+    template <typename InputIteratorT, typename OutputIteratorT, typename BeginOffsetIteratorT,
+              typename EndOffsetIteratorT>
+    static cudaError_t Max(void *d_temp_storage, size_t &temp_storage_bytes, InputIteratorT d_in,
+                           OutputIteratorT d_out, long long num_segments,
+                           BeginOffsetIteratorT d_begin_offsets, EndOffsetIteratorT d_end_offsets,
+                           cudaStream_t stream = 0)
+    {
+        using Acc = ocu_detail::value_of<InputIteratorT>;
+        return Reduce(d_temp_storage, temp_storage_bytes, d_in, d_out, num_segments,
+                      d_begin_offsets, d_end_offsets, cub::Max(),
+                      std::numeric_limits<Acc>::lowest(), stream);
+    }
+
+    template <typename InputIteratorT, typename OutputIteratorT, typename BeginOffsetIteratorT,
+              typename EndOffsetIteratorT>
+    static cudaError_t Min(void *d_temp_storage, size_t &temp_storage_bytes, InputIteratorT d_in,
+                           OutputIteratorT d_out, long long num_segments,
+                           BeginOffsetIteratorT d_begin_offsets, EndOffsetIteratorT d_end_offsets,
+                           cudaStream_t stream = 0)
+    {
+        using Acc = ocu_detail::value_of<InputIteratorT>;
+        return Reduce(d_temp_storage, temp_storage_bytes, d_in, d_out, num_segments,
+                      d_begin_offsets, d_end_offsets, cub::Min(),
+                      std::numeric_limits<Acc>::max(), stream);
     }
 };
 
@@ -1208,6 +1463,134 @@ struct DeviceScan {
         using Acc = ocu_detail::value_of<InputIteratorT>;
         return ExclusiveScan(d_temp_storage, temp_storage_bytes, d_in, d_out, cub::Sum(), Acc(0),
                              num_items, stream);
+    }
+};
+
+/* ---- DeviceSelect ------------------------------------------------------
+ * Flagged, If, Unique (CUB documentation): the selected items, in their
+ * input order (stable), and their count. Done as marks (1 / 0 per item), an
+ * exclusive sum of the marks (each selected item's output position), a
+ * scatter, and the count from the last position and mark. Temporary
+ * storage: two long long per item plus the scan's. */
+
+namespace ocu_detail {
+
+template <typename FlagIt>
+__global__ void select_mark_flags(FlagIt flags, long long n, long long *mark)
+{
+    for (long long i = (long long)blockIdx.x * kThreads + threadIdx.x; i < n; i += (long long)gridDim.x * kThreads)
+        mark[i] = flags[i] ? 1 : 0;
+}
+
+template <typename InIt, typename Pred>
+__global__ void select_mark_if(InIt in, long long n, Pred pred, long long *mark)
+{
+    for (long long i = (long long)blockIdx.x * kThreads + threadIdx.x; i < n; i += (long long)gridDim.x * kThreads)
+        mark[i] = pred(in[i]) ? 1 : 0;
+}
+
+template <typename InIt>
+__global__ void select_mark_unique(InIt in, long long n, long long *mark)
+{
+    for (long long i = (long long)blockIdx.x * kThreads + threadIdx.x; i < n; i += (long long)gridDim.x * kThreads)
+        mark[i] = (i == 0 || !(in[i] == in[i - 1])) ? 1 : 0;
+}
+
+template <typename InIt, typename OutIt>
+__global__ void select_scatter(InIt in, const long long *mark, const long long *pos, long long n, OutIt out)
+{
+    for (long long i = (long long)blockIdx.x * kThreads + threadIdx.x; i < n; i += (long long)gridDim.x * kThreads)
+        if (mark[i]) out[pos[i]] = in[i];
+}
+
+template <typename NumIt>
+__global__ void select_count(const long long *mark, const long long *pos, long long n, NumIt num)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0) *num = n > 0 ? pos[n - 1] + mark[n - 1] : 0;
+}
+
+inline unsigned select_grid(long long n)
+{
+    long long b = (n + kThreads - 1) / kThreads;
+    return (unsigned)(b < 1 ? 1 : (b > 65535 ? 65535 : b));
+}
+
+/* marks already written: positions, scatter, count */
+template <typename InIt, typename OutIt, typename NumIt>
+inline cudaError_t select_finish(void *temp, InIt in, OutIt out, NumIt num, long long n, cudaStream_t stream)
+{
+    carve c{static_cast<unsigned char *>(temp), 0};
+    long long *mark = c.take<long long>((size_t)n);
+    long long *pos = c.take<long long>((size_t)n);
+    void *scan_temp = c.base + c.used;
+    cudaError_t e = scan_run<true, long long>(scan_temp, (const long long *)mark, pos, n, Sum(), 0LL, stream);
+    if (e != cudaSuccess) return e;
+    select_scatter<<<select_grid(n), kThreads, 0, stream>>>(in, mark, pos, n, out);
+    select_count<<<1, 1, 0, stream>>>(mark, pos, n, num);
+    return cudaPeekAtLastError();
+}
+
+inline size_t select_temp_bytes(long long n)
+{
+    return 2 * align_bytes((size_t)(n > 0 ? n : 1) * sizeof(long long)) + scan_temp_bytes<long long>(n);
+}
+
+template <typename NumIt>
+inline cudaError_t select_empty(NumIt num, cudaStream_t stream)
+{
+    select_count<<<1, 1, 0, stream>>>((const long long *)nullptr, (const long long *)nullptr, 0, num);
+    return cudaPeekAtLastError();
+}
+
+} // namespace ocu_detail
+
+struct DeviceSelect {
+    template <typename InputIteratorT, typename FlagIterator, typename OutputIteratorT, typename NumSelectedIteratorT,
+              typename NumItemsT>
+    static cudaError_t Flagged(void *d_temp_storage, size_t &temp_storage_bytes, InputIteratorT d_in,
+                               FlagIterator d_flags, OutputIteratorT d_out, NumSelectedIteratorT d_num_selected_out,
+                               NumItemsT num_items, cudaStream_t stream = 0)
+    {
+        using namespace ocu_detail;
+        const long long n = (long long)num_items;
+        if (d_temp_storage == nullptr) return finish_query(temp_storage_bytes, select_temp_bytes(n));
+        cudaError_t e = check_space(temp_storage_bytes, select_temp_bytes(n));
+        if (e != cudaSuccess) return e;
+        if (n <= 0) return select_empty(d_num_selected_out, stream);
+        select_mark_flags<<<select_grid(n), kThreads, 0, stream>>>(d_flags, n, static_cast<long long *>(d_temp_storage));
+        return select_finish(d_temp_storage, d_in, d_out, d_num_selected_out, n, stream);
+    }
+
+    template <typename InputIteratorT, typename OutputIteratorT, typename NumSelectedIteratorT, typename NumItemsT,
+              typename SelectOp>
+    static cudaError_t If(void *d_temp_storage, size_t &temp_storage_bytes, InputIteratorT d_in, OutputIteratorT d_out,
+                          NumSelectedIteratorT d_num_selected_out, NumItemsT num_items, SelectOp select_op,
+                          cudaStream_t stream = 0)
+    {
+        using namespace ocu_detail;
+        const long long n = (long long)num_items;
+        if (d_temp_storage == nullptr) return finish_query(temp_storage_bytes, select_temp_bytes(n));
+        cudaError_t e = check_space(temp_storage_bytes, select_temp_bytes(n));
+        if (e != cudaSuccess) return e;
+        if (n <= 0) return select_empty(d_num_selected_out, stream);
+        select_mark_if<<<select_grid(n), kThreads, 0, stream>>>(d_in, n, select_op, static_cast<long long *>(d_temp_storage));
+        return select_finish(d_temp_storage, d_in, d_out, d_num_selected_out, n, stream);
+    }
+
+    /* the first item of each run of equal consecutive items */
+    template <typename InputIteratorT, typename OutputIteratorT, typename NumSelectedIteratorT, typename NumItemsT>
+    static cudaError_t Unique(void *d_temp_storage, size_t &temp_storage_bytes, InputIteratorT d_in,
+                              OutputIteratorT d_out, NumSelectedIteratorT d_num_selected_out, NumItemsT num_items,
+                              cudaStream_t stream = 0)
+    {
+        using namespace ocu_detail;
+        const long long n = (long long)num_items;
+        if (d_temp_storage == nullptr) return finish_query(temp_storage_bytes, select_temp_bytes(n));
+        cudaError_t e = check_space(temp_storage_bytes, select_temp_bytes(n));
+        if (e != cudaSuccess) return e;
+        if (n <= 0) return select_empty(d_num_selected_out, stream);
+        select_mark_unique<<<select_grid(n), kThreads, 0, stream>>>(d_in, n, static_cast<long long *>(d_temp_storage));
+        return select_finish(d_temp_storage, d_in, d_out, d_num_selected_out, n, stream);
     }
 };
 
@@ -1376,6 +1759,127 @@ struct DeviceSegmentedSort {
     OCU_CUB_SEGSORT_KEYS(StableSortKeysDescending, true)
 #undef OCU_CUB_SEGSORT_PAIRS
 #undef OCU_CUB_SEGSORT_KEYS
+};
+
+/* ---- BlockReduce, WarpReduce ------------------------------------------ */
+
+/*
+ * As documented: the aggregate is returned to thread 0 (lane 0 of each
+ * logical warp for WarpReduce); other threads' return values are
+ * undefined (here: also the aggregate). Inputs combine in thread order,
+ * op(lower, higher), so the operator need only be associative. Every
+ * thread of the block (warp) must call; TempStorage may be reused after a
+ * __syncthreads() (__syncwarp()).
+ */
+enum BlockReduceAlgorithm {
+    BLOCK_REDUCE_RAKING_COMMUTATIVE_ONLY,
+    BLOCK_REDUCE_RAKING,
+    BLOCK_REDUCE_WARP_REDUCTIONS
+};
+
+template <typename T, int BLOCK_DIM_X, BlockReduceAlgorithm ALGORITHM = BLOCK_REDUCE_WARP_REDUCTIONS,
+          int BLOCK_DIM_Y = 1, int BLOCK_DIM_Z = 1, int LEGACY_PTX_ARCH = 0>
+class BlockReduce {
+    static constexpr int BLOCK_THREADS = BLOCK_DIM_X * BLOCK_DIM_Y * BLOCK_DIM_Z;
+
+public:
+    struct TempStorage {
+        ocu_detail::raw_array<T, BLOCK_THREADS> buf;
+    };
+
+    __device__ __forceinline__ BlockReduce(TempStorage &temp_storage)
+        : s_(temp_storage), tid_(ocu_detail::linear_tid<BLOCK_DIM_X, BLOCK_DIM_Y, BLOCK_DIM_Z>())
+    {
+    }
+
+    template <typename ReductionOp>
+    __device__ __forceinline__ T Reduce(T input, ReductionOp op)
+    {
+        return reduce(input, op, BLOCK_THREADS);
+    }
+
+    template <typename ReductionOp>
+    __device__ __forceinline__ T Reduce(T input, ReductionOp op, int num_valid)
+    {
+        return reduce(input, op, num_valid < BLOCK_THREADS ? num_valid : BLOCK_THREADS);
+    }
+
+    template <int ITEMS_PER_THREAD, typename ReductionOp>
+    __device__ __forceinline__ T Reduce(T (&inputs)[ITEMS_PER_THREAD], ReductionOp op)
+    {
+        T v = inputs[0];
+        for (int i = 1; i < ITEMS_PER_THREAD; ++i) v = op(v, inputs[i]);
+        return reduce(v, op, BLOCK_THREADS);
+    }
+
+    __device__ __forceinline__ T Sum(T input) { return Reduce(input, cub::Sum()); }
+    __device__ __forceinline__ T Sum(T input, int num_valid) { return Reduce(input, cub::Sum(), num_valid); }
+    template <int ITEMS_PER_THREAD>
+    __device__ __forceinline__ T Sum(T (&inputs)[ITEMS_PER_THREAD]) { return Reduce(inputs, cub::Sum()); }
+
+private:
+    TempStorage &s_;
+    int tid_;
+
+    template <typename ReductionOp>
+    __device__ __forceinline__ T reduce(T v, ReductionOp op, int n)
+    {
+        T *b = s_.buf.data();
+        b[tid_] = v;
+        __syncthreads();
+        for (int d = 1; d < BLOCK_THREADS; d *= 2) {
+            if (tid_ % (2 * d) == 0 && tid_ + d < n) b[tid_] = op(b[tid_], b[tid_ + d]);
+            __syncthreads();
+        }
+        return b[0];
+    }
+};
+
+template <typename T, int LOGICAL_WARP_THREADS = 32, int LEGACY_PTX_ARCH = 0>
+class WarpReduce {
+public:
+    struct TempStorage {
+        ocu_detail::raw_array<T, LOGICAL_WARP_THREADS> buf;
+    };
+
+    __device__ __forceinline__ WarpReduce(TempStorage &temp_storage)
+        : s_(temp_storage), lane_((int)(ocu_detail::linear_tid<1024, 1, 1>() % LOGICAL_WARP_THREADS))
+    {
+        /* linear thread id over x, y, z (the block's dims are not template parameters here) */
+        lane_ = (int)((threadIdx.x + blockDim.x * (threadIdx.y + blockDim.y * threadIdx.z)) % LOGICAL_WARP_THREADS);
+    }
+
+    template <typename ReductionOp>
+    __device__ __forceinline__ T Reduce(T input, ReductionOp op) { return reduce(input, op, LOGICAL_WARP_THREADS); }
+
+    template <typename ReductionOp>
+    __device__ __forceinline__ T Reduce(T input, ReductionOp op, int valid_items)
+    {
+        return reduce(input, op, valid_items < LOGICAL_WARP_THREADS ? valid_items : LOGICAL_WARP_THREADS);
+    }
+
+    __device__ __forceinline__ T Sum(T input) { return Reduce(input, cub::Sum()); }
+    __device__ __forceinline__ T Sum(T input, int valid_items) { return Reduce(input, cub::Sum(), valid_items); }
+
+private:
+    TempStorage &s_;
+    int lane_;
+
+    template <typename ReductionOp>
+    __device__ __forceinline__ T reduce(T v, ReductionOp op, int n)
+    {
+        T *b = s_.buf.data();
+        b[lane_] = v;
+        __syncwarp();
+        for (int d = 1; d < LOGICAL_WARP_THREADS; d *= 2) {
+            T mine = b[lane_];
+            T other = lane_ + d < LOGICAL_WARP_THREADS ? b[lane_ + d] : mine;
+            __syncwarp();
+            if (lane_ % (2 * d) == 0 && lane_ + d < n) b[lane_] = op(mine, other);
+            __syncwarp();
+        }
+        return b[0];
+    }
 };
 
 } // namespace cub

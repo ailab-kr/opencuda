@@ -34,7 +34,7 @@ cmake -S llama.cpp -B build -DCMAKE_TOOLCHAIN_FILE=<toolkit>/cmake/OcuCUDA.cmake
 - 기본 프로필(`CUDART_VERSION` 12030)로 빌드한다. llama.cpp가 이 값으로 켜는 PDL(`cudaLaunchKernelEx`), CUB(`<cub/cub.cuh>`: argsort, cumsum, mean, ssm-scan, sum, top-k), FP8, cublasLt 경로가 모두 컴파일된다. PDL 선언과 CUB 부분집합은 `cards/libs/cub-subset.md`. 장치가 보고하는 `ptxVersion`이 90 미만이라 llama.cpp는 PDL 실행을 고르지 않는다(계산 능력을 9.0으로 보고하게 하면 고르며, 그때도 스트림 순서대로 실행된다). CCCL 판 매크로가 없어 `DeviceTopK`·`strided_iterator` 경로는 꺼진 채 대체 경로를 쓴다.
 - `"-DCMAKE_CUDA_FLAGS=-DOCU_CUDART_VERSION=11060"`을 주면 예전 프로필: 위 네 경로를 끈다(조사 문서 6.1). 헤더의 함수는 그대로다. 비교용으로 남겨 둔다.
 - 아키텍처 50: 장치가 보고하는 계산 능력 5.0과 `__CUDA_ARCH_LIST__=500`이 맞물려, 호스트가 고르는 커널과 장치 코드에 든 본문이 일치한다. 텐서 코어·cp.async PTX는 컴파일되지 않는다. 남는 인라인 PTX `prefetch.global.L2`도 이 llama.cpp 판에서는 부르는 곳(`mmvq.cu`, `mmq-few.cu`)이 특정 아키텍처(`__CUDA_ARCH__ ==` DGX Spark) 조건 안에 있어, 아키텍처 50에서는 어느 경로에도 들어가지 않는다.
-- 이 작업에서 고친 것: CPU 경로 실행 람다가 복사 캡처(`[=]`)라 함수 포인터 변수·템플릿 인자로 실행 가능, `__restrict` 포인터 인자 복사, `__shared__ alignas(N)`·`const alignas(N)` 순서, CPU 경로에서 `__CUDA_ARCH__=500`·`__CUDA_ARCH_LIST__=500`(NO_DEVICE_CODE가 `__trap`으로 멈춤), NVIDIA 경로의 `__CUDA_ARCH_LIST__`, NVPTX 1·2바이트 셔플, `cuda_fp8.h`, `__half2_raw`, `<limits.h>`, `__frcp_rn` 등, `cublasLt.h`(객체만, 행렬곱은 지원 안 함), 툴킷 include의 `cooperative_groups/` 폴더.
+- 이 작업에서 고친 것: CPU 경로 실행 람다가 복사 캡처(`[=]`)라 함수 포인터 변수·템플릿 인자로 실행 가능, `__restrict` 포인터 인자 복사, `__shared__ alignas(N)`·`const alignas(N)` 순서, CPU 경로에서 `__CUDA_ARCH__=500`·`__CUDA_ARCH_LIST__=500`(NO_DEVICE_CODE가 `__trap`으로 멈춤), NVIDIA 경로의 `__CUDA_ARCH_LIST__`, NVPTX 1·2바이트 셔플, `cuda_fp8.h`, `__half2_raw`, `<limits.h>`, `__frcp_rn` 등, `cublasLt.h`(2026-11-28부터 `cublasLtMatmul` 구현, FP8은 지원 안 함), 툴킷 include의 `cooperative_groups/` 폴더.
 
 ## 경계 조건
 
@@ -44,7 +44,7 @@ cmake -S llama.cpp -B build -DCMAKE_TOOLCHAIN_FILE=<toolkit>/cmake/OcuCUDA.cmake
 
 ## 오류 코드
 
-- 지원하지 않는 cublasLt 행렬곱: `CUBLAS_STATUS_NOT_SUPPORTED`(알고리즘 0개).
+- cublasLt 행렬곱: FP8 형은 `CUBLAS_STATUS_NOT_SUPPORTED`(llama.cpp의 FP8 경로는 그때 다른 경로를 쓴다). 그 밖은 `cards/libs/libs-cublas.md`.
 - 잘못 고른 커널(장치 코드 없음): CPU 경로는 `__trap()` 메시지 후 프로세스 중단, NVIDIA 경로는 실행 실패.
 
 ## 시험 목록
@@ -59,7 +59,7 @@ cmake -S llama.cpp -B build -DCMAKE_TOOLCHAIN_FILE=<toolkit>/cmake/OcuCUDA.cmake
 6. NVPTX 셔플: `unsigned char`, `signed char`, `short`, `__half`를 `__shfl_sync`/`_up`/`_down`/`_xor`로 옮긴 값이 CPU 경로와 같음.
 7. `cuda_fp8.h`: E4M3·E5M2 각 256개 비트 → double → 비트 왕복(NaN 제외), 0x38 = 1.0, 448 → 0x7e, 464 → 0x7e(짝수 쪽), 480 → NOSAT 0x7f / SATFINITE 0x7e, E5M2 61440 → NOSAT 0x7c / SATFINITE 0x7b, 부호 있는 0, 무한대 입력(SATFINITE는 최대 유한값), NaN → 0x7f, 가장 작은 비정규수 근처의 반올림(0.75·2^-9 → 0x01), double 입력이 float를 거치지 않음(동률 바로 옆 double). 클래스의 생성자(정수 포함)·변환 연산자, x2·x4 형의 바이트 순서(.x가 하위). 커널 안에서 같은 비트.
 8. `OCU_CUDART_VERSION=11060`이면 `CUDART_VERSION == 11060`, 없으면 12030. `<cuda_runtime.h>`만으로 `INT_MAX` 사용 가능.
-9. `cublasLt.h`: C와 C++에서 포함됨, Create/Destroy/SetAttribute 성공, NULL 인자는 `CUBLAS_STATUS_INVALID_VALUE`, `cublasLtMatmulAlgoGetHeuristic`은 결과 0개와 NOT_SUPPORTED, `cublasLtMatmul`은 NOT_SUPPORTED.
+9. `cublasLt.h`: C와 C++에서 포함됨, Create/Destroy/SetAttribute 성공, NULL 인자는 `CUBLAS_STATUS_INVALID_VALUE`, (2026-11-28 전 동작: 휴리스틱 결과 0개와 NOT_SUPPORTED, `cublasLtMatmul` NOT_SUPPORTED. 지금은 `tests/libs/cublaslt_matmul.cu`.)
 10. 툴킷 폴더에 `include/cooperative_groups/reduce.h`가 있고 `-I<toolkit>/include`만으로 포함됨.
 11. 응용 시험(자동화 후보): 위 구성으로 llama.cpp를 CPU·NVIDIA 대상 각각 빌드(모든 `.cu` 컴파일·링크), Qwen2.5-0.5B-Instruct Q8_0로 탐욕 생성 64토큰이 의미 있는 문장, CPU 경로와 NVIDIA 경로의 토큰 일치율, test-backend-ops 통과 수(아래 메모의 값보다 줄지 않음). 기본 프로필(12030)과 11060 프로필 둘 다.
 12. 기본 프로필에서 CUB를 쓰는 연산(ARGSORT 큰 행, TOP_K, CUMSUM 긴 행, SUM, MEAN 한 행 65537 이상, SSM_SCAN)이 두 경로에서 통과하고, ARGSORT가 "지원 안 함" 없이 98건. `OCU_COMPUTE_CAPABILITY=9.0`으로 PDL 실행 경로를 탄 test-backend-ops가 통과(CUB·PDL 자체의 동작 시험은 `cards/libs/cub-subset.md`).

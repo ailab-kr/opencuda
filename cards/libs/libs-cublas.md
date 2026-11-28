@@ -27,14 +27,18 @@ cost: { hours: 1, ai_usage: 0 }
 |---|---|
 | 핸들·스트림 | `cublasCreate_v2`, `cublasDestroy_v2`, `cublasSetStream_v2`, `cublasGetStream_v2`, `cublasSetWorkspace_v2`(받아 둠), `cublasSetPointerMode_v2`/`Get`(호스트·장치 스칼라), `cublasSetMathMode`/`Get`, `cublasSetAtomicsMode`/`Get`, `cublasGetStatusName`, `cublasGetStatusString`, `cublasGetVersion_v2`, `cublasGetProperty`, `cublasGetCudartVersion`. 평이한 이름(`cublasCreate` 등)은 `cublas_v2.h`의 매크로 |
 | GEMM | `cublasSgemm`, `cublasDgemm`, `cublasHgemm`, `cublasSgemmBatched`, `cublasDgemmBatched`, `cublasHgemmBatched`, `cublasSgemmStridedBatched`, `cublasDgemmStridedBatched`, `cublasHgemmStridedBatched`, `cublasGemmEx`, `cublasGemmBatchedEx`, `cublasGemmStridedBatchedEx` |
-| 1·2단계 | `cublasSaxpy`, `cublasSscal`, `cublasSdot`, `cublasSnrm2`, `cublasSgemv` |
+| 1·2단계 | `cublasSaxpy`, `cublasSscal`, `cublasSdot`, `cublasSnrm2`, `cublasSgemv`; 2026-11-28부터 `cublasDaxpy`, `cublasDscal`, `cublasDdot`, `cublasDnrm2`(slassq 방식, 1e±200 근처도 넘침·아래넘침 없음), `cublasS/Dcopy`, `cublasS/Dswap`, `cublasS/Dasum`, `cublasIs/Idamax`·`Is/Idamin`(참조 루프 규칙: 처음 값이 후보이고 엄격히 크거나 작을 때만 바뀜 → 같은 값이면 첫 위치, 뒤의 NaN은 무시, 첫 값이 NaN이면 1), `cublasDgemv`, `cublasDotEx`·`cublasDotcEx`(x·y 같은 형 16F·16BF·32F·64F, 실행형 32F(64F 자료는 64F), 결과는 x의 형이나 32F; 실수만이라 Dotc는 Dot과 같음). incx ≤ 0이면 asum·nrm2·iamax는 0, scal은 아무것도 안 함. copy의 incy 0·swap의 inc 0(n > 1)은 `NOT_SUPPORTED`(결과가 순서에 달림) |
 | 3단계 그 밖 | `cublasStrsmBatched`(llama.cpp의 solve_tri가 씀, 오른쪽 항마다 스레드 하나인 단순 구현) |
+| BLAS 확장·LAPACK 비슷 | `cublasSgeam`, `cublasDgeam`(C = αop(A) + βop(B), α 0이면 A를, β 0이면 B를 읽지 않음, C가 A·B와 같아도 됨: op N·같은 ld일 때만), `cublasSgetrfBatched`(부분 피벗 LU, LAPACK getf2 순서, 행렬마다 블록 하나: 작은 행렬용. 피벗 0이면 첫 번째 것을 info에, P가 NULL이면 피벗 없음) |
+| 호스트↔장치 복사(핸들 없음) | `cublasSetMatrix`, `cublasGetMatrix`, `cublasSetVector`, `cublasGetVector`와 각 `Async`(cudaMemcpy2D로, 실패하면 `MAPPING_ERROR`) |
 
-`*Ex`의 형 조합: COMPUTE_32F(`_PEDANTIC` 포함)에서 A=B=32F→C 32F, 16F→16F·32F, 16BF→16BF·32F. COMPUTE_16F에서 16F→16F(스칼라 half). COMPUTE_32F_FAST_16F/16BF/TF32에서 32F→32F. COMPUTE_64F(`_PEDANTIC`)에서 64F→64F. 예전 방식의 `CUDA_R_16F/32F/64F` 계산형 값도 받는다.
+`*Ex`의 형 조합: COMPUTE_32F(`_PEDANTIC` 포함)에서 A=B=32F→C 32F, 16F→16F·32F, 16BF→16BF·32F. COMPUTE_16F에서 16F→16F(스칼라 half). COMPUTE_32F_FAST_16F/16BF/TF32에서 32F→32F. COMPUTE_64F(`_PEDANTIC`)에서 64F→64F. COMPUTE_32I(`_PEDANTIC`)에서 8I→32I(스칼라 int32, 합은 int32로 정확: 어떤 int8 값이든 k ≤ 2^17이면 넘치지 않음). 예전 방식의 `CUDA_R_16F/32F/64F/32I` 계산형 값도 받는다.
 
 GEMM 커널: 256스레드 블록, 공유 메모리 타일 두 가지(128×128×16·스레드당 8×8, 64×64×16·4×4), 다음 타일을 레지스터에 미리 읽음, 전치별로 이웃 스레드가 이웃 주소를 읽는 순서. 큰 타일이 다중처리기 절반 이상을 채우면 큰 타일(`OCU_CUBLAS_TILE=64|128`로 강제 가능). 배치는 grid z(65535 넘으면 나눠 실행).
 
 연산 표 경로(11/13): GEMM은 커널보다 먼저 활성 백엔드의 연산 표(`docs/spec/op-table.md` 8절)에 묻는다. 조건이 모두 맞으면 열 우선 `C(m×n)`을 행 우선 `C'(n×m) = op(B)'·op(A)'`로 옮긴 설명자를 질의 → 계획(핸들마다 32칸 캐시, 설명자 전체가 열쇠) → 스트림의 대기열에서 실행(`ocu_rt_submit`: 실행과 같은 기본 스트림 규칙). 조건: 호스트 모드 스칼라, alpha ≠ 0, k > 0, 간격 배치(포인터 배열 아님, A·B 간격 0은 공유, C 간격 0은 안 됨), A·B 형이 32F·16F·16BF, 표가 알리는 누적형이 binary32. 하나라도 어긋나거나 표가 거절하면(질의·계획 실패, 실행 전 검사 실패) 위의 커널로 간다. 칩 이름은 보지 않는다: CPU 백엔드는 표가 있어 이 길로, NVIDIA 백엔드는 표가 없어 커널로.
+
+cuBLASLt(`cublasLt.h`, 2026-11-28): 같은 라이브러리(`-lcublasLt`·`CUDA::cublasLt`도 이 라이브러리). `cublasLtMatmul`은 D = alpha·op(A)·op(B) + beta·C를 `cublasGemmStridedBatchedEx`로 계산하므로 형·계산형 조합은 그 함수와 같다(FP32·FP64·FP16·BF16·int8→int32). 그 위에: 열·행 우선(네 행렬이 같은 순서일 때. 행 우선은 전치의 열 우선 문제 D^T = op(B)^T·op(A)^T), 간격 배치, C ≠ D(C를 D로 먼저 복사, C는 그대로), 호스트·장치 포인터 모드, 에필로그 DEFAULT·RELU·BIAS·RELU_BIAS·GELU(tanh 근사)·GELU_BIAS(bias는 D의 행마다 하나, `BIAS_DATA_TYPE`이 없으면 D의 형, FP16·BF16 D에 FP32 bias 가능, `BIAS_BATCH_STRIDE`). 설명자·배치·선호 객체는 문서의 불투명 구조체(`cublasLtMatmulDescOpaque_t` 등) 안에 있어 `Create`와 호출자 저장소용 `Init`(Destroy 없음) 둘 다 된다. 속성 설정·조회는 크기를 확인한다(다르면 `INVALID_VALUE`). 휴리스틱은 알고리즘 하나, 작업 공간 0. FP8, AUX·기울기 에필로그, 스케일 포인터(값을 넣으면), 섞인 순서, 포인터 벡터 모드는 `NOT_SUPPORTED`. 차원이 맞지 않으면·bias 에필로그에 bias가 없으면 `INVALID_VALUE`.
 
 ## 경계 조건
 
@@ -46,7 +50,7 @@ GEMM 커널: 256스레드 블록, 공유 메모리 타일 두 가지(128×128×1
 ## 오류 코드
 
 - 핸들 NULL: `NOT_INITIALIZED`. 크기 음수, ld 부족, 잘못된 연산·측·삼각·대각 값, 배치 음수, 잘못된 algo 값, 스칼라 NULL: `INVALID_VALUE`.
-- 계산하지 않는 조합은 `CUBLAS_STATUS_NOT_SUPPORTED`: 복소수와 정수 형(`CUDA_C_*`, `CUDA_R_8I`→`32I`, `COMPUTE_32I`), FP8, `COMPUTE_16F_PEDANTIC`(반정밀도 산술을 요구하는데 여기서는 32F로 누적), A와 B 형이 다른 경우, 문서에 없는 형 조합, axpy의 incy 0(n > 1), grid y 한도(n/타일 > 65535). `OCU_CUBLAS_NO_FP64`로 빌드한 변형에서 64F 전부.
+- 계산하지 않는 조합은 `CUBLAS_STATUS_NOT_SUPPORTED`: 복소수 형(`CUDA_C_*`), 8I→32I 밖의 정수 조합(예: 8I→32F), FP8, `COMPUTE_16F_PEDANTIC`(반정밀도 산술을 요구하는데 여기서는 32F로 누적), A와 B 형이 다른 경우, 문서에 없는 형 조합, axpy의 incy 0(n > 1), grid y 한도(n/타일 > 65535). `OCU_CUBLAS_NO_FP64`로 빌드한 변형에서 64F 전부.
 - 실행 실패: `EXECUTION_FAILED`, 메모리 부족: `ALLOC_FAILED`.
 
 ## 시험 목록
@@ -54,6 +58,8 @@ GEMM 커널: 256스레드 블록, 공유 메모리 타일 두 가지(128×128×1
 - [x] `cublas_cpu`, `cublas_cpu_tile64_random`, `cublas_cpu_tile128`, `gpu_cublas_default/64/128` (`tests/libs/cublas_accuracy.cu`): 1395개 확인, CPU·RTX 5070 Ti 모두 통과. 고정밀(long double) 기준, 오차 한계는 파일 머리말. 모양 12가지(타일 배수 아님, k 0, 1×300 등) × 전치 4 × alpha/beta 3, OP_C, 형 조합 12가지, 배치(배열·간격·B 공유·65537개), 장치 포인터 모드(float·half 스칼라), 스트림, 1·2단계, strsm 배치 16조합(잔차 기준), 상태 코드
 - [x] `conformance_cublas_cpu`(+스트림·무작위 순서), `gpu_conformance_cublas`: 기존 기준 사례(conformance/oracle) 중 이 라이브러리 함수 251건 전부 통과(오차/한계 최대 0.495 CPU, 0.472 GPU)
 - [x] 일부러 망가뜨린 커널: beta 0에서 C를 읽게 함 → 252건 실패로 검출, 출력 열 하나 넘게 씀 → 프로그램 중단으로 검출
+- [x] `cublas_level1_cpu`(`tests/libs/cublas_level1.cu`): 참조 루프와 대조 301건(S·D copy·swap·asum·iamax·iamin을 n 0·1·7·300·5000 × 증가폭 1·3·-2 조합, 동률·NaN 규칙, D axpy·scal·음수 증가폭 dot·1e±200 근처 nrm2·장치 포인터 모드 dot·gemv N/T와 lda 오류, DotEx 32F·16F(16F·32F 결과)·16BF·64F와 형 섞임·n 0). CPU 경로와 Arc Pro B70 모두 301/301. HeCBench streamUM-cuda PASS, rayleighBenardConvection-cuda 실행, blas-dot-cuda는 빌드되고 180초 시간 초과(chipStar는 빌드 실패).
+- [x] `cublaslt_cpu`(`tests/libs/cublaslt_matmul.cu`): double 기준과 대조 101건. 열·행 우선 × 전치 4, C ≠ D(C 그대로), 간격 배치, FP32·FP16·BF16 저장(FP32 계산), 장치 스칼라, 에필로그 5종(FP16 D에 FP32 bias 포함), `Init` 객체, 속성 왕복과 크기, 휴리스틱, 오류(차원, bias 없음, 스케일 포인터). CPU 경로와 Arc Pro B70(SPIR-V) 모두 101/101. HeCBench mlp-cuda PASS, qkv-cuda 실행(이전 툴킷의 빌드 점검에서는 둘 다 빌드 실패), blas-gemmEx2-cuda는 충돌 대신 180초 시간 초과(chipStar는 빌드 실패).
 
 ### 연산 표 경로(11/13)에서 시험 작성자가 확인할 동작
 
@@ -72,7 +78,7 @@ GEMM 커널: 256스레드 블록, 공유 메모리 타일 두 가지(128×128×1
 - 정밀도: 모든 실수 계산형을 그 형 이상의 정밀도로 누적한다(16F도 32F로 누적 후 한 번 반올림). 문서가 허용하는 오차 안이고 더 정확하다. 그래서 16F_PEDANTIC만 "지원 안 함"이다.
 - math mode·atomics mode·workspace는 받아 두기만 한다. 줄어든 정밀도를 "허용"하는 설정이라 전체 정밀도로 계산해도 맞다.
 - 처리량(RTX 5070 Ti, 정사각, 3회 예열 뒤 10회 중앙값, 90% 구간): 카드 아래 "측정" 절.
-- llama.cpp(docs/llama-cpp-requirements.md)의 cuBLAS 함수 12개는 모두 있다. 없는 것: `cublasLt.h`와 cuBLASLt 12개(CUDART 12030 프로필의 FP8 경로에서만 씀, 별도 카드 일), `cublasLoggerConfigure`(llama.cpp에서 주석 처리됨).
+- llama.cpp(docs/llama-cpp-requirements.md)의 cuBLAS 함수 12개는 모두 있다. 없는 것: `cublasLoggerConfigure`(llama.cpp에서 주석 처리됨). cuBLASLt는 아래.
 - 링크: `ocu-nvcc -lcublas`는 대상에 맞는 `libocu_cublas_<cpu|nvidia>.a`, 툴킷의 `CUDA::cublas`는 `OCU_TARGET`에 맞는 변형.
 - Metal: 커널은 템플릿·람다·구조체 인자를 쓴다. cu2msl이 그대로 받는지는 Apple 장비에서 확인할 일이다.
 

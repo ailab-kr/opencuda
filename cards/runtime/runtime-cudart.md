@@ -23,7 +23,7 @@ cost: { hours: 5.0, ai_usage: 0 }
 - 오류: 스레드별 마지막 오류. `cudaGetLastError`는 읽고 지움, `cudaPeekAtLastError`는 남김. "아직 안 끝남"은 기록하지 않음.
 - 메모리: 할당·해제·고정 메모리·남은 양, 1차원·2차원 복사와 채우기(동기·비동기), 기호 복사(`__constant__`·`__device__`).
   `cudaMemcpyDefault`는 런타임이 할당한 포인터로 방향을 정한다(시작 주소 기준, 범위 검사는 그대로).
-- 포인터 종류 조회(`cudaPointerGetAttributes`: 장치·고정 호스트·통합·일반), 통합 메모리(`cudaMallocManaged`, 호스트와 메모리를 공유하는 장치에서만. 아니면 "지원 안 함"), 장치 속성 개별 조회(`cudaDeviceGetAttribute`, 자주 쓰는 27개. 모르는 값은 오류).
+- 포인터 종류 조회(`cudaPointerGetAttributes`: 장치·고정 호스트·통합·일반), 통합 메모리(`cudaMallocManaged`: 호스트와 메모리를 공유하는 장치, 백엔드가 공유 할당을 주는 장치(OpenCL: fine-grained SVM 또는 Intel USM 공유 할당 `cl_intel_unified_shared_memory`)에서. 아니면 "지원 안 함"), 통합 메모리 힌트(`cudaMemPrefetchAsync`·`cudaMemAdvise`와 `_v2`, CUDA 13의 `cudaMemLocation` 형 C++ 오버로드: 범위가 통합 할당 하나 안에 있고 장치가 있거나 `cudaCpuDeviceId`인지만 확인하고 돌아옴. 페이지는 쓸 때 옮겨짐. 아니면 `cudaErrorInvalidValue`·`cudaErrorInvalidDevice`, flags는 0), 장치 속성 개별 조회(`cudaDeviceGetAttribute`, 자주 쓰는 27개. 모르는 값은 오류).
 - 스트림: 막는 스트림·안 막는 스트림, 동기화·조회, 사건 기다리기.
   예전 기본 스트림 규칙: 기본 스트림 작업은 막는 스트림을 먼저 끝내고, 막는 스트림 작업은 기본 스트림을 먼저 끝낸다.
 - 사건: 만들기(시간 재기 끄기 포함)·기록·동기화·조회·경과 시간.
@@ -35,6 +35,10 @@ cost: { hours: 5.0, ai_usage: 0 }
 - 컴파일 경로: `.cu`는 전처리 뒤 바꾸기 때문에 포함한 파일·매크로 안의 실행 구문도 처리. 띄어 쓴 `<< <`·`>> >`, 인자의 리터럴 `0`·`NULL`도 처리.
 
 - 고정 안 된(일반) 호스트 메모리와의 비동기 복사는 돌아오기 전에 끝난다(문서 동작: 원본을 그 자리에서 읽고, 장치→호스트는 돌아올 때 완료). `cudaMallocHost`·`cudaHostAlloc` 메모리만 나중에 읽힌다.
+- CUDA 컴파일이 따로 포함하지 않아도 주는 것: `assert()`(호스트·장치 코드, `<assert.h>`)와 C++의 `std::chrono`(`<chrono>`). nvcc로 빌드되는 프로그램이 포함 없이 쓴다(HeCBench moe-align-cuda, ccsd-trpdrv-cuda, nonzero-cuda).
+- 스트림 순서 할당(`cudaMallocAsync`·`cudaFreeAsync`·`cudaMallocFromPoolAsync`, 기본 풀과 만든 풀, `cudaDeviceGet/SetMemPool`, `cudaMemPoolSet/GetAttribute`·`TrimTo`·`Create`·`Destroy`, `cudaDevAttrMemoryPoolsSupported` = 1): 할당은 부를 때 한다(그 스트림 순서부터 유효, 문서대로). 해제는 블록을 풀에 두고 그 스트림에 표시를 기록한다. 비슷한 크기(요청 이상, 두 배 + 4KB 이하) 할당이 같은 스트림이면 바로, 다른 스트림이면 표시가 끝난 뒤 다시 쓴다. 풀이 방출 임계값(기본 0) 넘게 쥔 메모리는 `cudaDeviceSynchronize`·`cudaMemPoolTrimTo`·`Destroy`·`cudaDeviceReset`에서, 할당이 메모리를 못 얻으면 장치 동기화 뒤에 돌려준다. `cudaMalloc` 메모리의 `cudaFreeAsync`(기본 풀로 감)와 스트림 순서 메모리의 `cudaFree`도 된다. 스트림을 없애면 그 스트림이 해제한 블록은 그 작업을 기다린 뒤 아무 스트림에나 쓰일 수 있다. 공유 핸들 풀은 "지원 안 함". 재사용 스위치 셋은 기록만 한다.
+- 고정 호스트 메모리를 커널이 바로 쓰기(zero-copy): 백엔드가 `pinned_is_mapped`를 알리면(OpenCL: Intel USM 호스트 할당) `cudaHostGetDevicePointer`가 같은 주소를 주고, 호스트 포인터를 그대로 커널 인자로 써도 된다. 아니면 그 호출은 "지원 안 함"이고 복사만 된다.
+- 기호(`__constant__`·`__device__`) 복사·주소·크기는 백엔드의 `module_get_global`로. SPIR-V 경로는 cu2spv가 변수를 모듈 블록 하나로 옮겨 이름·위치를 알린다(백엔드 카드).
 - 커널 실패는 장치에 남는다: 이후의 동기화·제출 호출이 같은 오류를 내고, `cudaDeviceReset`이 지운다.
 - 기본 스트림·막는 스트림에 넣는 일은 순서 확인부터 대기열에 넣기까지 잠금을 쥔다(여러 호스트 스레드에서도 순서 규칙 유지).
 
@@ -42,12 +46,17 @@ cost: { hours: 5.0, ai_usage: 0 }
 - 호스트 메모리 등록·해제·장치 주소(호스트와 메모리를 공유하는 장치에서만), 장치 플래그(값 확인, 힌트), 피어 접근 조회(지금은 늘 불가).
 - 함수 속성: 동적 공유 메모리 상한은 장치의 opt-in 한도까지 받음, 조회는 장치 한도로 답함. 점유율: 블록 크기·동적 공유 메모리 대 장치 한도.
 
-- 반정밀도(`cuda_fp16.h`): `__half`·`__half2`, 변환(가장 가까운 짝수·0쪽·아래·위 반올림, 정수 변환은 넘치면 포화·NaN은 0), 사칙·fma(넓은 형에서 계산해 한 번 반올림 = 정확한 반올림), 순서·비순서 비교, 연산자, 수학 함수(float로 계산 후 반올림), `__half2` 묶음 연산.
+- 반정밀도(`cuda_fp16.h`): `__half`·`__half2`, 변환(가장 가까운 짝수·0쪽·아래·위 반올림, 정수 변환은 넘치면 포화·NaN은 0), 사칙·fma(넓은 형에서 계산해 한 번 반올림 = 정확한 반올림), 순서·비순서 비교, 연산자, 수학 함수(float로 계산 후 반올림), `__half2` 묶음 연산. `__half2` 비교: `__heq2`…`__hgeu2`(레인마다 1.0/0.0), `_mask` 형(레인마다 0xFFFF/0, 아래 레인이 아래 비트), `__hbeq2`…(두 레인 모두), `__hisnan2`, `__half2` 연산자(`==`은 `__hbeq2`, `!=`은 `__hbneu2`, `<`…`>=`, 단항 `-`, `-=`·`/=`).
+  - 수학 API 추가분(`ocu_device_math_ext.h`, 모든 경로; C 라이브러리에 있는 이름은 GPU 경로만): 정확한 결과 — `modf`·`logb`·`ilogb`(0·NaN은 INT_MIN, inf는 INT_MAX)·`scalbn`·`scalbln`·`nextafter`·`remainder`·`remquo`(몫 아래 3비트와 부호)·`lrintf`·`llrint`·`llroundf`·`nan`(f 형 포함), 반올림 방향 연산 `__fadd/__fsub/__fmul/__fdiv/__frcp/__fsqrt/__fmaf_{rz,ru,rd}`와 `__dadd/__dsub/__dmul/__ddiv/__drcp/__dsqrt_{rz,ru,rd}`·`__dsub_rn`·`__ddiv_rn`(IEEE 결과, 0 합의 부호 포함), 64비트 정수 변환 `__double2ll/__double2ull/__float2ll/__float2ull_{rn,rz,ru,rd}`(범위 밖은 포화, NaN은 0)와 `__ll2float/__ull2float/__ll2double/__ull2double_{rn,rz,ru,rd}`, double의 32비트 두 쪽 `__double2hiint`·`__double2loint`·`__hiloint2double`, 32비트 변환 `__double2uint_{rn,rz,ru,rd}`(포화, NaN은 0)·`__int2float/__uint2float_{rz,ru,rd}`·`__double2float_{rn,rz,ru,rd}`·`__int2double_rn`·`__uint2double_rn`(경로마다 없던 `__int2float_rn`·`__uint2float_rn`·`__float2uint_*`도), `__frsqrt_rn`(정확한 반올림), `__finitef`·`__signbitf`, `fdividef`(보통 나눗셈). 근사 — `sinpi`·`cospi`·`sincospi`(정확한 범위 축소, `cospi(n+1/2)` = +0, `sinpi(정수)` = x 부호의 0), `acosh`·`asinh`·`atanh`(fdlibm 공식), `rcbrt`, `rhypot`, `norm3d`·`norm4d`·`rnorm3d`·`rnorm4d`·`norm`·`rnorm`(2의 거듭제곱으로 스케일, 하나가 inf면 NaN이 있어도 inf). float 형은 double 결과를 한 번 반올림. double `erf`·`erfc`(2026-11-28: |x| < 1.5는 두 double로 더한 테일러 급수(그래서 erfc = 1 − erf도 정확), 그 위는 바닥부터 두 double로 계산한 연분수와 x² = h + l로 나눈 exp(−x²). 잰 최대 erf 0.86, erfc 3.22ulp(문서 한도 2, 5), 특수값은 C 라이브러리와 같음). 남은 것: `erfinv`·`erfcinv`·`erfcx`·`normcdf`·`normcdfinv`, `lgamma`·`tgamma`, 베셀(`j0`·`j1`·`jn`·`y0`·`y1`·`yn`·`cyl_bessel_i0`·`cyl_bessel_i1`), 방향 반올림 double `__fma_rz/_ru/_rd`(NVPTX 경로 외).
+  - 복소수(`cuComplex.h`, 호스트·장치): `cuFloatComplex` = `float2`, `cuDoubleComplex` = `double2`, `cuComplex` = `cuFloatComplex`(x 실수부, y 허수부). `make_cuFloatComplex`·`make_cuComplex`·`make_cuDoubleComplex`, `cuCreal(f)`·`cuCimag(f)`·`cuConj(f)`·`cuCadd(f)`·`cuCsub(f)`·`cuCmul(f)`(교과서 공식), `cuCdiv(f)`(Smith 알고리즘: 큰 성분으로 먼저 나눠 중간 넘침·아래넘침 없음), `cuCabs(f)`(큰 성분으로 스케일), `cuCfma(f)`(x·y + d), `cuComplexFloatToDouble`·`cuComplexDoubleToFloat`.
+  - SPIR-V 장치 패스: `cudaLaunchKernel(kernel, ...)`·`cudaLaunchCooperativeKernel(kernel, ...)`의 템플릿 형이 커널 형식의 `device_kernel` 호출 규약을 받는다(그 패스의 호스트 코드는 파싱만 되고 생성되지 않음). 패치하지 않은 Clang에서도 이런 호출이 빌드된다.
+  - 16비트 부동소수 원자 덧셈: `atomicAdd(__half *, __half)`, `atomicAdd(__half2 *, __half2)`, `atomicAdd(__nv_bfloat16 *, ...)`, `atomicAdd(__nv_bfloat162 *, ...)`. 옛 값을 돌려주고, 합은 그 형의 `__hadd`(가장 가까운 짝수로 한 번 반올림). 두 원소 형은 원소마다 원자적(32비트 한 번이 아님). 16비트 값은 32비트 워드의 어느 쪽에 있어도 된다. 헤더 순서(`cuda_fp16.h`·`cuda_bf16.h`와 `cuda_runtime.h`)에 상관없이 선언된다(`ocu_half_atomics.h`).
 
 - 작은 추가 (실제 프로그램 조사 뒤, 11/13; 응용 결과는 카드 `apps-app-corpus`):
   - 3차원 메모리: `cudaMalloc3D`, `cudaMemset3D`·`Async`, `cudaMemcpy3D`·`Async`(피치 있는 원본·대상, `srcPos`·`dstPos`, `ysize`; 배열이 얽히면 `cudaErrorNotSupported`), `cudaMemset2DAsync`, 형식 `cudaExtent`·`cudaPos`·`cudaPitchedPtr`·`cudaMemcpy3DParms`와 `make_cudaExtent` 등.
   - `cudaDeviceGetLimit`·`cudaDeviceSetLimit`: 스택 크기·printf FIFO·말록 힙은 기록해 돌려줌(효과 없음, 0은 `cudaErrorInvalidValue`). 장치 런타임 한도 둘과 L2 상주 한도는 `cudaErrorUnsupportedLimit`. L2 가져오기 단위는 힌트라 0.
   - `cuda_profiler_api.h`의 `cudaProfilerStart`·`cudaProfilerStop`: 붙은 도구가 없으므로 효과 없이 `cudaSuccess`.
+  - 진단: 환경변수 `OCU_MALLOC_FILL=B`(0~255, 10진수나 0x..)이면 새 장치 할당(`cudaMalloc` 계열)을 모두 바이트 B로 채운다. 아무도 쓰지 않은 메모리를 읽는 곳을 찾는 용도(0xff면 f32·f16·bf16 값이 NaN). 없거나 바이트 값이 아니면 할당을 건드리지 않는다. 값은 프로세스당 한 번 읽는다.
   - `math_constants.h`: `CUDART_*` 단·배정밀도 상수와 `_HI`/`_LO`.
   - 장치 쪽: 캐시 힌트 적재·저장 9개(`__ldcg` 등), 범위 지정 원자(`atomicAdd_block`/`_system` 등; NVIDIA 경로의 `_system`은 컴파일 때 지원 안 함), 무동기 워프 함수(`__shfl` 등)는 컴파일 때 지원 안 함과 대체 함수 안내. Cooperative Groups 타일의 `meta_group_rank`·`meta_group_size`.
 
@@ -74,6 +83,12 @@ cost: { hours: 5.0, ai_usage: 0 }
 - [x] `tests/runtime/rt_mem.cu`: 포인터 종류(할당 안쪽 주소, 해제 뒤), `cudaMemcpyDefault` 네 방향과 범위 초과 오류, 통합 메모리를 호스트·커널이 함께 씀, 장치 속성과 속성 구조체 일치·잘못된 값
 - [x] `tests/runtime/rt_misc.cu`: 우선순위·플래그·캡처 상태, 호스트 함수 순서, 호스트 메모리 등록과 그 메모리에서 커널 실행·중복 등록·해제 오류, 장치 플래그·피어, 함수 속성 상한, 점유율
 - [x] `tests/runtime/rt_fp16.cu`: 구현과 독립인 정확한 기준(모든 유한 half를 2^-24 단위 정수로, 합·곱은 128비트 정수로 계산하고 정렬한 전체 표에서 가장 가까운 값). 65,536개 왕복, 이웃 사이 중간값 6만여 개와 그 바로 위아래, 넘침 경계·특수값, 20만 개 무작위 조합의 덧셈·뺄셈·곱셈·fma와 5만 개 나눗셈, 커널 안 `__half2` fma. 결함 두 가지(동률 올림, 자리올림 경계)를 넣으면 실패함을 확인
+- [x] `tests/runtime/rt_managed.cu`: 통합 메모리를 호스트가 쓰고 커널이 읽고 쓰고 동기화 뒤 호스트가 읽음, 통합 메모리 양쪽 복사·채우기(H2D·D2H·D2D·Default), 포인터 속성, 힌트의 올바른 인자(장치·호스트·`_v2`·CUDA 13 형)와 틀린 인자(통합이 아님, 끝을 넘음, 0바이트, 없는 장치, 잘못된 advice, flags ≠ 0), 64 MiB 할당을 양쪽에서 만짐. CPU 경로 45개, Arc Pro B70(USM 공유 할당) 45개 통과
+- [x] `tests/runtime/rt_cucomplex.cu`: 형식이 `float2`·`double2`, 더하기·빼기·켤레·실수부·허수부는 공식 그대로, 곱·fma는 |a||b| 기준 몇 ulp, 나눗셈·절댓값은 long double 기준 몇 ulp, 1e30·1e300 크기에서 넘침 없음, 1e-30·1e-300에서 아래넘침 없음, 큰 허수부 분기, 변환, inf·NaN 절댓값. 호스트와 장치(CPU 경로 131개 통과, Arc Pro B70 통과)
+- [x] `tests/runtime/rt_math_ext_gpu.cu`(+ `rt_math_ext_ref.cpp`): 장치에서 정확한 결과(반올림 방향 연산 27종, 64비트 변환, remquo·remainder·modf·nextafter·ilogb·scalbn·llrint, `__frsqrt_rn`)가 같은 코드의 호스트 결과와 비트까지 같고, 근사 함수 18종이 호스트 시험과 같은 상한 안(26만 입력). Arc Pro B70: 71개 검사 통과, 근사 최대 sinpi 0.96·cospi 0.67·acosh 1.83·asinh 1.48·atanh 1.40·rcbrt 0.50·rnorm4d 0.74ulp, float 형 0.50ulp
+- [x] `tests/runtime/test_device_math_ext.cpp`(ctest `device_math_ext`, 호스트): 정확한 함수는 C 라이브러리와 비트까지 같음(200만 쌍), 반올림 방향 연산·64비트 정수 변환·32비트 정수와 double의 float 변환·double의 unsigned 변환은 같은 반올림 모드(`fesetround`)의 호스트 FPU와 비트까지 같음(모드마다 40만 건, 0의 부호·넘침·아래넘침 포함), `__frsqrt_rn`은 양수 float 61개마다 하나(`OCU_MATH_EXT_FULL=1`이면 전부)가 정확한 반올림, 근사 함수는 long double 기준으로 double 형 1.5ulp(`acosh` 3, `asinh`·`atanh` 2) 이내·float 형 0.5ulp + 2^-20 이내, 특수값. 잰 최대: sinpi 0.95, cospi 0.78, acosh 2.46, asinh 1.87, atanh 1.91, rcbrt 0.50, rhypot·rnorm 0.75, norm 0.50ulp; float 형 모두 0.50ulp
+- [x] `tests/runtime/rt_half_atomics.cu`: 16비트 카운터 4개(32비트 워드 두 개의 양쪽)에 스레드마다 1을 더해 합이 정확하고 돌려받은 옛 값이 0..N-1의 순열(half 512개, bf16 256개씩), `__half2`·`__nv_bfloat162` 두 원소가 따로 쌓임, 한 번 더하기의 가장 가까운 짝수 반올림(동률 4건, 넘침 경계 아래, 0). CPU 경로에서 통과
+- [x] `tests/runtime/rt_malloc_fill.cu`: `OCU_MALLOC_FILL` 없음·0xff·7·잘못된 값("x", "300")에서 1바이트·4 KiB·3 MiB 할당이 채워지거나(값 일치) 건드려지지 않음(쓴 값 그대로 읽힘). CPU 경로와 OpenCL(Arc Pro B70)에서 통과
 - [x] `tests/runtime/rt_launch_api.cu`: 구조체 인자 포함 실행, 호출 뒤 값을 바꿔도 영향 없음, 동적 공유 메모리, 설정 오류와 인자 없음 오류
 - [x] `tests/runtime/rt_review.cu`(다섯째 검토 회귀): 바쁜 스트림에 일반 메모리 비동기 복사, 템플릿 커널의 리터럴 0(형 추론 int), `<<<g, b, 0, NULL>>>`, 동적 공유 메모리 바이트 배열의 형 변환, `operator<< <>`, 커널 실패 유지와 초기화
 
