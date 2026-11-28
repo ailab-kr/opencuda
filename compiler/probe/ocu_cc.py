@@ -380,6 +380,10 @@ def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
             elif p in ("-I", "-D", "-isystem", "-iquote") and i + 1 < len(pre):
                 flags.append(("-I" if p != "-D" else "-D") + pre[i + 1])
         flags += [f"-I{d}" for d in dirs[1:]]
+        # -use_fast_math: the documented mapping of single-precision functions to
+        # their intrinsics (expf -> __expf, ...), done by the SPIR-V language header
+        if "-fcuda-approx-transcendentals" in device and os.environ.get("OCU_SPV_FAST_MATH", "1") != "0":
+            flags.append("-DOCU_FAST_MATH=1")
         return [[sys.executable, str(REPO / "compiler" / "spirv" / "cu2spv.py"), "--arch", dev_arch,
                  *flags, str(dev_src), "-o", str(img)],
                 ["<container>", str(fat), "opencl", str(img)],

@@ -597,17 +597,38 @@ OCU_D long long llabs(long long x) { return x < 0 ? -x : x; }
 #define OCU_LIB1(name)                                                                \
     OCU_D double name(double x) { return ocu_dm::name(x); }                           \
     OCU_D float name##f(float x) { return ocu_dm::name##f(x); }
-OCU_LIB1(exp)
+/* -use_fast_math (OCU_FAST_MATH, set by ocu-nvcc): the single-precision
+   functions the CUDA Programming Guide lists for it become their intrinsics
+   (expf -> __expf, sinf -> __sinf, ...; also powf, sincosf); double ones
+   do not change */
+OCU_D float __expf(float);
+OCU_D float __exp10f(float);
+OCU_D float __logf(float);
+OCU_D float __log2f(float);
+OCU_D float __log10f(float);
+OCU_D float __sinf(float);
+OCU_D float __cosf(float);
+OCU_D float __tanf(float);
+OCU_D float __powf(float, float);
+#if defined(OCU_FAST_MATH)
+#define OCU_LIB1_FAST(name)                                                           \
+    OCU_D double name(double x) { return ocu_dm::name(x); }                           \
+    OCU_D float name##f(float x) { return __##name##f(x); }
+#else
+#define OCU_LIB1_FAST(name) OCU_LIB1(name)
+#endif
+OCU_LIB1_FAST(exp)
 OCU_LIB1(expm1)
 OCU_LIB1(exp2)
-OCU_LIB1(exp10)
-OCU_LIB1(log)
-OCU_LIB1(log2)
-OCU_LIB1(log10)
+OCU_LIB1_FAST(exp10)
+OCU_LIB1_FAST(log)
+OCU_LIB1_FAST(log2)
+OCU_LIB1_FAST(log10)
 OCU_LIB1(log1p)
-OCU_LIB1(sin)
-OCU_LIB1(cos)
-OCU_LIB1(tan)
+OCU_LIB1_FAST(sin)
+OCU_LIB1_FAST(cos)
+OCU_LIB1_FAST(tan)
+#undef OCU_LIB1_FAST
 OCU_LIB1(asin)
 OCU_LIB1(acos)
 OCU_LIB1(atan)
@@ -623,7 +644,11 @@ OCU_D double pow(int x, int y) { return ocu_dm::pow((double)x, (double)y); }
 OCU_D double pow(int x, double y) { return ocu_dm::pow((double)x, y); }
 OCU_D double pow(double x, float y) { return ocu_dm::pow(x, (double)y); }
 OCU_D double pow(float x, double y) { return ocu_dm::pow((double)x, y); }
+#if defined(OCU_FAST_MATH)
+OCU_D float powf(float x, float y) { return __powf(x, y); }
+#else
 OCU_D float powf(float x, float y) { return ocu_dm::powf(x, y); }
+#endif
 OCU_D double atan2(double y, double x) { return ocu_dm::atan2(y, x); }
 OCU_D float atan2f(float y, float x) { return ocu_dm::atan2f(y, x); }
 OCU_D double hypot(double x, double y) { return ocu_dm::hypot(x, y); }
@@ -631,7 +656,11 @@ OCU_D float hypotf(float x, float y) { return ocu_dm::hypotf(x, y); }
 OCU_D double fmod(double x, double y) { return ocu_dm::fmod(x, y); }
 OCU_D float fmodf(float x, float y) { return ocu_dm::fmodf(x, y); }
 OCU_D void sincos(double x, double *s, double *c) { *s = ocu_dm::sin(x); *c = ocu_dm::cos(x); }
+#if defined(OCU_FAST_MATH)
+OCU_D void sincosf(float x, float *s, float *c) { *s = __sinf(x); *c = __cosf(x); }
+#else
 OCU_D void sincosf(float x, float *s, float *c) { ocu_dm::sincosf(x, s, c); }
+#endif
 OCU_D float erff(float x) { return ocu_dm::erff(x); }
 OCU_D float erfcf(float x) { return ocu_dm::erfcf(x); }
 

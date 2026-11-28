@@ -67,3 +67,5 @@ CMake 사용: `-DCMAKE_TOOLCHAIN_FILE=<toolkit>/cmake/OcuCUDA.cmake [-DOCU_TARGE
 - 시험과 구현을 같은 세션이 썼다(카드 backend-cpu와 같은 사정). 다른 세션의 검토가 필요하다.
 
 ## 이의
+
+- -use_fast_math(SPIR-V 경로, 2026-11-28): 장치 쪽에 OCU_FAST_MATH=1을 넘긴다(OCU_SPV_FAST_MATH=0이면 끔). 언어 헤더가 CUDA Programming Guide의 표대로 단정밀도 expf·exp10f·logf·log2f·log10f·sinf·cosf·	anf·powf·sincosf를 내장 함수(__expf ...)로 바꾸고, cu2spv가 -fno-hip-fp32-correctly-rounded-divide-sqrt(-prec-div=false -prec-sqrt=false)를 준다. double 함수는 그대로. 잰 것(Arc Pro B70, 켬·끔 A/B, -use_fast_math를 쓰는 HeCBench 17개 모두 PASS 유지): aidw 50.7 → 8.9초, minkowski 27.4 → 20.6초(chipStar 23.2), aobench 0.08 → 0.05초, 나머지 같음. t_fast_math: 4만 건 모두 내장 함수와 비트까지 같음.

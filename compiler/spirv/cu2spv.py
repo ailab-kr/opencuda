@@ -807,6 +807,10 @@ def main(argv):
                "-DOCU_SPIRV_PATH=1", "-D__CUDACC__", "-D__CUDA__=1", f"-DOCU_SPV_CUDA_ARCH={arch}", f"-D__CUDA_ARCH_LIST__={arch}",
                f"-I{RT}", "-include", str(RT / "cuda_runtime.h"), "-Wno-unknown-cuda-version",
                *[f"-I{i}" for i in a.I], *[f"-D{d}" for d in a.D], a.src, "-o", str(ll)]
+        if "OCU_FAST_MATH=1" in a.D:
+            # -use_fast_math implies -prec-div=false -prec-sqrt=false: float division
+            # and square root need not be correctly rounded
+            cmd.insert(-3, "-fno-hip-fp32-correctly-rounded-divide-sqrt")
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode:
             sys.stderr.write(r.stderr[-6000:])
