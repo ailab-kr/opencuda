@@ -64,8 +64,19 @@ __global__ void k_block_sum(const float *x, float *out)
     }
 }
 
+// A struct passed by value (it arrives in the argument block) and fields of
+// an array of structs. All values are small integers, so the result is exact.
+struct triple { unsigned a, b, c; };
+struct rec { unsigned char tag; float w[3]; };
+__global__ void k_struct(int n, triple p, const rec *r, float *y)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = r[i].w[i % 3] * (float)p.b + (float)(r[i].tag + p.c) - (float)p.a;
+}
+
 void host(int n, float *x, int *idx, float *y)
 {
+    k_struct<<<1, 32>>>(n, triple{1, 2, 3}, (const rec *)x, y);
     k_saxpy<<<1, 32>>>(n, 2.0f, x, y);
     k_hard<0, false><<<1, 32>>>(n, x, idx, y);
     k_hard<1, true><<<1, 32>>>(n, x, idx, y);

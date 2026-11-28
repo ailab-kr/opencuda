@@ -114,6 +114,29 @@ int main(int argc, char **argv)
     CHECK(bad == 0);
     printf("k_block_sum        %s (%d of %d blocks wrong)\n", bad ? "WRONG" : "ok", bad, BLOCKS);
 
+    /* struct by value and an array of structs */
+    {
+        struct triple { unsigned a, b, c; } tp = {5, 7, 11};
+        struct rec { unsigned char tag; float w[3]; };
+        enum { M = 4096 };
+        struct rec *hr = calloc(M, sizeof *hr);
+        for (int i = 0; i < M; ++i) { hr[i].tag = (unsigned char)(i % 251); for (int j = 0; j < 3; ++j) hr[i].w[j] = (float)((i * 3 + j) % 97); }
+        void *dr = NULL;
+        OK(b->mem_alloc(d, M * sizeof *hr, &dr));
+        OK(b->mem_copy(d, NULL, dr, hr, M * sizeof *hr, OCU_COPY_HOST_TO_DEVICE));
+        k = NULL;
+        OK(b->module_get_kernel(m, "_Z8k_structi6triplePK3recPf", &k));
+        int mm = M;
+        void *args[] = {&mm, &tp, &dr, &dy}; size_t sz[] = {4, sizeof tp, 8, 8};
+        ocu_launch_params p = {{M / 128, 1, 1}, {128, 1, 1}, 0, args, sz, 4};
+        OK(b->kernel_launch(NULL, k, &p));
+        OK(b->mem_copy(d, NULL, hy, dy, M * sizeof(float), OCU_COPY_DEVICE_TO_HOST));
+        bad = 0;
+        for (int i = 0; i < M; ++i) bad += hy[i] != hr[i].w[i % 3] * (float)tp.b + (float)(hr[i].tag + tp.c) - (float)tp.a;
+        CHECK(bad == 0);
+        printf("k_struct           %s (%d of %d differ)\n", bad ? "WRONG" : "ok", bad, M);
+    }
+
     printf("%s: %d checks, %d failed\n", g_fail ? "FAIL" : "PASS", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }
