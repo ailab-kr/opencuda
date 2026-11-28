@@ -74,7 +74,17 @@ Two are OpenCuda errors:
 - lrn-cuda: the checksums differ (forward 0.0025 against 0.005, backward 0
   against 0.500008).
 
-Both are being looked into.
+Both were compiler problems, now worked around (`main`, same GPU):
+
+- segsort-cuda: LLVM 23's SPIR-V back end gives a constant
+  `getelementptr (i8, @shared_array, byte offset)` used directly by an
+  instruction as an access chain over the use's element type with the byte
+  offset as index, so the bin kernel's histogram atomics landed four times
+  too far. cu2spv now turns those operands into instructions; segsort-cuda
+  passes all three checks.
+- lrn-cuda: IGC 2.41 compiled the 64-bit division shortcut wrongly in the
+  form `lshr` then `== 0`; with one unsigned compare instead, both checksums
+  match the CPU path's and chipStar's (0.005000, 0.500008).
 ### Performance work after the run
 
 Measured on the same GPU as same-session A/B runs (the setting on and off),
@@ -104,6 +114,12 @@ not reach the device compiler. 17 HeCBench programs that use it and ran all
 still pass; aidw-cuda 50.7 -> 8.9 s, minkowski-cuda 27.4 -> 20.6 s (chipStar
 23.2 s), aobench-cuda 0.08 -> 0.05 s, the others unchanged.
 
+**binary16 on the device**: float -> half and `__hfma` now use the device's
+own binary16 operations instead of double and 64-bit integer emulation (same
+bits; half -> float stays integer code, see the runtime card for why).
+llama.cpp pp512 11,339 / 11,474 -> 14,726 / 14,247 t/s, tg128 245 / 241 ->
+258 / 256 t/s (alternating rounds); nlll-cuda 1.47 -> 0.62 s, fma-cuda 10.05 ->
+8.20 s, gelu-cuda 7.71 -> 6.52 s; test-backend-ops all pass.
 Measured and not taken: IGC's built-in math functions exceed the CUDA Math
 API error bounds (expf 2.54 ulp, sin 3.38 ulp, tanhf 4.84 ulp against 2, 2,
 2) and are mostly slower than OpenCuda's own.

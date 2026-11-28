@@ -48,7 +48,10 @@ GPU는 다른 작업과 함께 쓰는 장비라, 측정은 모두 GPU에 다른 
 - segsort-cuda: OpenCuda 실행이 `[NOT PASSED] checking keys: #err = 11360688 (33.86% #nnz)`를 찍었는데, 상태 규칙이 그 안의 `PASSED`를 통과로 읽었다. 위 표에서는 `fail`로 센다(이 확인 전에는 `pass`). 규칙은 이제 `NOT PASS`를 실패로 본다.
 - lrn-cuda: 체크섬이 다르다(forward 0.0025 대 0.005, backward 0 대 0.500008).
 
-둘 다 원인을 보고 있다.
+둘 다 컴파일러 문제였고 지금은 우회했다(`main`, 같은 GPU):
+
+- segsort-cuda: LLVM 23의 SPIR-V 백엔드는 명령어가 바로 쓰는 상수 `getelementptr (i8, @shared 배열, 바이트 오프셋)`을 쓰임새의 원소 형 위 access chain에 바이트 오프셋을 인덱스로 넣어 내보낸다. 그래서 bin 커널의 히스토그램 atomic이 네 배 먼 곳에 더해졌다. cu2spv가 이제 그런 피연산자를 명령어로 바꾼다. segsort-cuda는 세 검사를 모두 통과한다.
+- lrn-cuda: IGC 2.41이 64비트 나눗셈 지름길의 `lshr` 뒤 `== 0` 꼴을 틀리게 컴파일했다. 부호 없는 비교 하나로 바꾸니 두 체크섬이 CPU 경로·chipStar와 같다(0.005000, 0.500008).
 ### 실행 뒤의 성능 작업
 
 같은 GPU에서 같은 세션 A/B(설정 켬·끔)로, 실행과 같이 `make run`을 쟀다. 두 변경 모두 `main`에 있다.
@@ -70,6 +73,7 @@ divergence-cuda는 실행에서 격차가 가장 컸던 프로그램이다(chipS
 
 **`-use_fast_math`**가 SPIR-V 경로에서 nvcc 문서대로 동작한다(단정밀도 `expf`, `sinf`, `powf` ...가 내장 함수로). 전에는 플래그가 장치 컴파일러에 닿지 않았다. 이 플래그를 쓰고 실행된 HeCBench 17개 모두 통과 유지. aidw-cuda 50.7 → 8.9초, minkowski-cuda 27.4 → 20.6초(chipStar 23.2초), aobench-cuda 0.08 → 0.05초, 나머지 같음.
 
+**장치의 binary16**: float → half와 `__hfma`가 double·64비트 정수 흉내 대신 장치 자체의 binary16 연산을 쓴다(같은 비트. half → float는 정수 코드 그대로, 까닭은 런타임 카드). llama.cpp pp512 11,339 / 11,474 → 14,726 / 14,247 t/s, tg128 245 / 241 → 258 / 256 t/s(번갈아 잰 두 회차). nlll-cuda 1.47 → 0.62초, fma-cuda 10.05 → 8.20초, gelu-cuda 7.71 → 6.52초. test-backend-ops 모두 통과.
 재고 채택하지 않은 것: IGC 내장 수학 함수는 CUDA Math API 오차 한도를 넘고(expf 2.54 ulp, sin 3.38 ulp, tanhf 4.84 ulp, 한도 2·2·2) 대부분 OpenCuda 자체 함수보다 느리다.
 
 ### 나중 커밋으로 고친 프로그램
