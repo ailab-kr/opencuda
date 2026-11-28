@@ -25,6 +25,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 #define WRAPPER_MAGIC 0x466243b1u /* what the compiler stores in the wrapper */
 
@@ -46,6 +49,7 @@ typedef struct image {
     ocu_module          *module;      /* loaded on first use */
     const ocu_backend   *module_backend;
     ocu_status           load_status; /* OCU_OK until a load failed */
+    bool                 loading;     /* a thread is in module_load for it (g_lock released) */
     struct image        *next;
 } image;
 
@@ -268,30 +272,132 @@ int __cudaPopCallConfiguration(dim3 *grid, dim3 *block, size_t *shared, void *st
 
 /* ---- lookups --------------------------------------------------------------- */
 
-/* Caller holds g_lock. Loads the image's entry for the active backend. */
+/* ---- module loading, and building the other modules ahead ------------------
+
+   A module is loaded (for the OpenCL backend: compiled by the driver) when a
+   kernel of its image is first needed. The first time that happens, the
+   images not loaded yet are loaded by background threads, so that a program
+   with many device-code files (llama.cpp: tens of modules, minutes of driver
+   compilation the first time) compiles them side by side instead of one
+   after the other as its kernels come up (OpenCL backend). OCU_PREBUILD_THREADS=0
+   turns that off; =N uses N threads (default: half the processors, at most 8). Loading
+   happens with g_lock released; a thread that needs an image another thread
+   is loading waits for it. At exit no new load starts and the ones under way
+   are waited for (the driver must not be torn down under them). */
+
+static pthread_cond_t g_load_cond = PTHREAD_COND_INITIALIZER;
+static bool           g_prebuild_started, g_prebuild_stop;
+static int            g_prebuild_active;
+
+static const fat_entry *image_entry(const image *img, const ocu_backend *b)
+{
+    for (uint32_t i = 0; i < img->count; ++i)
+        if (strncmp(img->entries[i].backend, b->name, sizeof(img->entries[i].backend)) == 0) return &img->entries[i];
+    return NULL;
+}
+
+/* Caller holds g_lock; img is not loaded, not failed, not being loaded. The
+   lock is released during the backend's load. */
+static void load_unlocked(image *img, const ocu_backend *b, ocu_device *dev, const fat_entry *e)
+{
+    img->loading = true;
+    pthread_mutex_unlock(&g_lock);
+    ocu_module *m = NULL;
+    ocu_status st = b->module_load(dev, img->base + e->offset, (size_t)e->size, &m);
+    pthread_mutex_lock(&g_lock);
+    img->loading = false;
+    if (st == OCU_OK) {
+        img->module = m;
+        img->module_backend = b;
+    } else {
+        img->load_status = st;
+    }
+    pthread_cond_broadcast(&g_load_cond);
+}
+
+static void *prebuild_worker(void *arg)
+{
+    (void)arg;
+    const ocu_backend *b = ocu_rt_backend();
+    ocu_device *dev = ocu_rt_device();
+    pthread_mutex_lock(&g_lock);
+    while (!g_prebuild_stop) {
+        image *img = g_images;
+        const fat_entry *e = NULL;
+        for (; img != NULL; img = img->next)
+            if (img->module == NULL && !img->loading && img->load_status == OCU_OK && (e = image_entry(img, b)) != NULL) break;
+        if (img == NULL) break;
+        load_unlocked(img, b, dev, e);
+    }
+    g_prebuild_active--;
+    pthread_cond_broadcast(&g_load_cond);
+    pthread_mutex_unlock(&g_lock);
+    return NULL;
+}
+
+static void prebuild_at_exit(void)
+{
+    pthread_mutex_lock(&g_lock);
+    g_prebuild_stop = true;
+    while (g_prebuild_active > 0) pthread_cond_wait(&g_load_cond, &g_lock);
+    pthread_mutex_unlock(&g_lock);
+}
+
+/* Caller holds g_lock: start the background loads once, if other images wait. */
+static void prebuild_start(const ocu_backend *b)
+{
+    if (g_prebuild_started) return;
+    g_prebuild_started = true;
+    /* the OpenCL backend only: there a load is a driver compilation, and its
+       module_load is safe to call from several threads */
+    if (strcmp(b->name, "opencl") != 0) return;
+    const char *env = getenv("OCU_PREBUILD_THREADS");
+    long n = env != NULL && *env ? strtol(env, NULL, 10) : -1;
+    if (n == 0) return;
+    int waiting = 0;
+    for (image *img = g_images; img != NULL; img = img->next)
+        if (img->module == NULL && !img->loading && img->load_status == OCU_OK && image_entry(img, b) != NULL) waiting++;
+    if (waiting == 0) return;
+    if (n < 0) {
+#if defined(_SC_NPROCESSORS_ONLN)
+        long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+#else
+        long cpus = 8;
+#endif
+        n = cpus > 1 ? cpus / 2 : 1;
+        if (n > 8) n = 8;
+    }
+    if (n > waiting) n = waiting;
+    atexit(prebuild_at_exit);
+    pthread_attr_t at;
+    pthread_attr_init(&at);
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    for (long i = 0; i < n; ++i) {
+        pthread_t t;
+        if (pthread_create(&t, &at, prebuild_worker, NULL) == 0) g_prebuild_active++;
+    }
+    pthread_attr_destroy(&at);
+}
+
+/* Caller holds g_lock (released while loading). Loads the image's entry for the active backend. */
 static ocu_status image_module(image *img, ocu_module **out)
 {
     const ocu_backend *b = ocu_rt_backend();
     ocu_device *dev = ocu_rt_device();
     if (b == NULL || dev == NULL) return OCU_ERR_INVALID_DEVICE;
+    while (img->loading) pthread_cond_wait(&g_load_cond, &g_lock);
     if (img->module != NULL && img->module_backend == b) {
         *out = img->module;
         return OCU_OK;
     }
     if (img->load_status != OCU_OK) return img->load_status;
-    for (uint32_t i = 0; i < img->count; ++i) {
-        const fat_entry *e = &img->entries[i];
-        if (strncmp(e->backend, b->name, sizeof(e->backend)) != 0) continue;
-        ocu_status st = b->module_load(dev, img->base + e->offset, (size_t)e->size, &img->module);
-        if (st != OCU_OK) {
-            img->load_status = st;
-            return st;
-        }
-        img->module_backend = b;
-        *out = img->module;
-        return OCU_OK;
-    }
-    return OCU_ERR_NOT_FOUND; /* no device code for this backend */
+    const fat_entry *e = image_entry(img, b);
+    if (e == NULL) return OCU_ERR_NOT_FOUND; /* no device code for this backend */
+    load_unlocked(img, b, dev, e);
+    if (img->load_status != OCU_OK) return img->load_status;
+    prebuild_start(b);
+    *out = img->module;
+    return OCU_OK;
 }
 
 ocu_status ocu_rt_find_kernel(const void *stub, ocu_kernel **kernel, uint32_t *nargs,
@@ -308,8 +414,11 @@ ocu_status ocu_rt_find_kernel(const void *stub, ocu_kernel **kernel, uint32_t *n
         ocu_module *m = NULL;
         st = image_module(f->img, &m);
         const ocu_backend *b = ocu_rt_backend();
-        if (st == OCU_OK) st = b->module_get_kernel(m, f->name, &f->kernel);
-        if (st == OCU_OK) {
+        /* image_module may have released g_lock: another thread may have
+           looked the kernel up meanwhile */
+        bool done = st == OCU_OK && f->kernel != NULL;
+        if (st == OCU_OK && !done) st = b->module_get_kernel(m, f->name, &f->kernel);
+        if (st == OCU_OK && !done) {
             if (b->kernel_arg_sizes == NULL) {
                 st = OCU_ERR_NOT_SUPPORTED;
             } else {
