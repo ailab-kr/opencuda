@@ -40,9 +40,26 @@
 #define OCU_F16
 #endif
 
+/* SPIR-V device code: float -> half (round to nearest even) and fma by the
+   device's own binary16 operations, much faster there than the double and
+   64-bit emulation below, which stays for host code and the other rounding
+   modes. Results are the same bits. half -> float stays the integer code
+   below for both: with the device's own conversion, and with two other
+   loop-free forms of the same code, IGC 2.41 and 2.42 compiled some of
+   llama.cpp's kernels wrongly (q3_K / q6_K matrix-vector products, flash
+   attention; right with -cl-opt-disable), though each form gave the right
+   bits on its own (tests/runtime/rt_half_convert.cu). */
+#if defined(OCU_SPIRV_PATH) && defined(__HIP_DEVICE_COMPILE__) && !defined(OCU_F16_SOFT)
+#define OCU_F16_NATIVE 1
+#endif
+
 namespace ocu_fp16 {
 
 enum class round { nearest_even, toward_zero, down, up };
+
+#if defined(OCU_F16_NATIVE)
+OCU_F16 inline std::uint16_t native_from_float(float f) { return __builtin_bit_cast(std::uint16_t, (_Float16)f); }
+#endif
 
 /*
  * binary16 bits from a double, with the given rounding: integer operations
@@ -50,6 +67,9 @@ enum class round { nearest_even, toward_zero, down, up };
  */
 OCU_F16 inline std::uint16_t from_double(double v, round mode)
 {
+#if defined(OCU_F16_NATIVE)
+    if (mode == round::nearest_even && (double)(float)v == v) return native_from_float((float)v);
+#endif
     std::uint64_t b = __builtin_bit_cast(std::uint64_t, v);
     std::uint16_t sign = static_cast<std::uint16_t>((b >> 48) & 0x8000u);
     bool neg = sign != 0;
@@ -236,6 +256,11 @@ OCU_F16_FN __half __hmul(__half a, __half b) { return __float2half(__half2float(
 OCU_F16_FN __half __hdiv(__half a, __half b) { return __float2half(__half2float(a) / __half2float(b)); }
 OCU_F16_FN __half __hfma(__half a, __half b, __half c)
 {
+#if defined(OCU_F16_NATIVE)
+    return __ushort_as_half(__builtin_bit_cast(unsigned short,
+        __builtin_fmaf16(__builtin_bit_cast(_Float16, a.__x), __builtin_bit_cast(_Float16, b.__x),
+                         __builtin_bit_cast(_Float16, c.__x))));
+#endif
     return __double2half(double(__half2float(a)) * double(__half2float(b)) + double(__half2float(c)));
 }
 OCU_F16_FN __half __hneg(__half a) { return __ushort_as_half(static_cast<unsigned short>(a.__x ^ 0x8000u)); }
