@@ -446,6 +446,48 @@ _LATE_ALIGNAS = re.compile(
 # the CUDA compiler takes): after preprocessing it reads `} alignas(8);`, which
 # C++ rejects, so it becomes the equivalent attribute.
 _TRAILING_ALIGNAS = re.compile(r"\}\s*alignas\s*\(((?:[^()]|\([^()]*\))*)\)")
+# `asm volatile("prefetch.global.L2 [%0];" :: "l"(p));`: a PTX cache hint with
+# no outputs. A hint has no effect on the result, so on the CPU path it
+# becomes an empty statement. Without this, a host compiler whose target
+# does not know the PTX operand constraint ("l" on arm64) rejects the file
+# even when the function is never called. Only prefetch instructions without
+# outputs are matched; any other inline PTX is left for the compiler to
+# report.
+_PTX_PREFETCH = re.compile(
+    r"\b(?:__asm__|asm)\s*(?:(?:__volatile__|volatile)\s*)?\(\s*\"prefetch\.[^\"]*\"\s*:\s*:")
+
+
+def _drop_ptx_prefetch(src: str) -> str:
+    """Replace each `asm("prefetch...." :: operands)` by `((void)0)`. The
+    end of the statement's parentheses is found by counting (operands may
+    nest parentheses to any depth); string literals are skipped."""
+    out, pos = [], 0
+    for m in _PTX_PREFETCH.finditer(src):
+        if m.start() < pos:
+            continue
+        i, depth, end = src.index("(", m.start()), 0, -1
+        while i < len(src):
+            c = src[i]
+            if c == '"':
+                i += 1
+                while i < len(src) and src[i] != '"':
+                    i += 2 if src[i] == "\\" else 1
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+            elif c in ";{}":
+                break
+            i += 1
+        if end < 0:
+            continue  # not a complete statement: leave it for the compiler
+        out += [src[pos:m.start()], "((void)0)"]
+        pos = end
+    out.append(src[pos:])
+    return "".join(out)
 
 
 def rewrite(src: str, preprocessed: bool = False) -> tuple[str, dict]:
@@ -460,6 +502,7 @@ def rewrite(src: str, preprocessed: bool = False) -> tuple[str, dict]:
         src = _SHARED_MARK.sub("static thread_local", src)
         src = _LATE_ALIGNAS.sub(lambda m: m.group(2) + " " + m.group(1), src)
         src = _TRAILING_ALIGNAS.sub(lambda m: "} __attribute__((aligned(" + m.group(1) + "))) ", src)
+        src = _drop_ptx_prefetch(src)
     return src, {"launches": launches, "extern_shared": shared}
 
 
