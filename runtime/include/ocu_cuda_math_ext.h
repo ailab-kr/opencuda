@@ -78,7 +78,9 @@ OCU_MX_Q float rnormf(int n, const float *a) { return ocu_dm::rnormf(n, a); }
 /* fdividef: the regular division (the documented default; -use_fast_math maps it to __fdividef) */
 OCU_MX_Q float fdividef(float x, float y) { return x / y; }
 OCU_MX_Q int __finitef(float x) { return (ocu_dm::isnanf_(x) || ocu_dm::isinff_(x)) ? 0 : 1; }
+#if !defined(__MINGW32__) /* MinGW-w64's math.h has its own __signbitf (nonzero for a set sign bit, as here) */
 OCU_MX_Q int __signbitf(float x) { return (int)(ocu_dm::bitsf(x) >> 31); }
+#endif
 OCU_MX_Q float __frsqrt_rn(float x) { return ocu_dm::frsqrt_rn(x); }
 
 /* ---- rounding-mode arithmetic ---------------------------------------------------------- */
