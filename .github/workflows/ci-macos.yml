@@ -3,13 +3,21 @@
 # here proves the build, the CPU backend and the translator host checks, not
 # GPU execution. GPU runs are done on real Macs (see cards/backend).
 #
-# MANUAL ONLY (workflow_dispatch). No push or pull_request trigger on purpose:
-# the repository is private and macOS runner minutes are billed at a higher
-# rate. Enabling automatic triggers is the maintainers' decision.
+# Runs on pushes to main and on pull requests (not for changes to Markdown,
+# cards or docs only), and by hand; a newer push cancels the run before it.
 name: ci-macos
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore: ["**/*.md", "cards/**", "docs/**"]
+  pull_request:
+    paths-ignore: ["**/*.md", "cards/**", "docs/**"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

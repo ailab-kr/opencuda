@@ -2,13 +2,21 @@
 # undefined-behaviour and thread sanitizers, AArch64 under qemu, harness
 # tests, the compiler probe for NVIDIA and AMD targets, the clean-room guard.
 #
-# Manual only for now: the repository is private and runner minutes count
-# against the organisation's quota. Add push/pull_request triggers when the
-# maintainers decide.
+# Runs on pushes to main and on pull requests (not for changes to Markdown,
+# cards or docs only), and by hand.
 name: check
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore: ["**/*.md", "cards/**", "docs/**"]
+  pull_request:
+    paths-ignore: ["**/*.md", "cards/**", "docs/**"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

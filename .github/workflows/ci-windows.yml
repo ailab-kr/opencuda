@@ -9,14 +9,21 @@
 # the log and the scoreboard. Remove `continue-on-error` once a clean Wine run
 # is confirmed.
 #
-# MANUAL ONLY (workflow_dispatch). No push or pull_request trigger on purpose:
-# the repository is private and runner minutes count against the
-# organisation's quota. Enabling automatic triggers is the maintainers'
-# decision.
+# Runs on pushes to main and on pull requests (not for changes to Markdown,
+# cards or docs only), and by hand; a newer push cancels the run before it.
 name: ci-windows
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore: ["**/*.md", "cards/**", "docs/**"]
+  pull_request:
+    paths-ignore: ["**/*.md", "cards/**", "docs/**"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
