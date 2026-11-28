@@ -9,7 +9,7 @@
 #
 # Rules: `make` with the toolchain (300 s), then `make run` twice (180 s
 # each); the second run is timed. Status: build_fail, timeout, crash
-# (non-zero exit), fail (printed FAIL), pass (printed PASS), ran (finished,
+# (non-zero exit), fail (printed FAIL or NOT PASSED), pass (printed PASS), ran (finished,
 # printed neither). The two toolchains alternate per program, so a change in
 # the machine's state affects both. Only logs are kept (OUT/logs/<tool>/),
 # each work copy is deleted. Resumable: programs already in the CSV are
@@ -45,7 +45,7 @@ for b in $(ls $H | grep -- '-cuda$'); do
       s=$(echo "$t1 - $t0" | bc)
       if [ $rc = 124 ]; then st=timeout
       elif [ $rc != 0 ]; then st=crash
-      elif grep -qiE "\bFAIL" run.log; then st=fail
+      elif grep -qiE "\bFAIL|NOT PASS" run.log; then st=fail
       elif grep -qiE "\bPASS" run.log; then st=pass
       else st=ran; fi
       echo "$b,$tool,$st,$s" ) >> $CSV
