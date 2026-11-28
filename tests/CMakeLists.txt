@@ -485,6 +485,20 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
       -DIMG=${CMAKE_CURRENT_BINARY_DIR}/cu2msl_features.metal.img
       -DRUN=$<TARGET_FILE:test_metal_features>
       -P ${CMAKE_CURRENT_SOURCE_DIR}/backend/metal_cu2msl_test.cmake)
+    # Trial: MSL made from LLVM IR (compiler/metal/ir2msl.py) instead of
+    # from the source text. The trial kernels use what cu2msl refuses (a
+    # constexpr function that calls itself, if constexpr, a member function,
+    # a function chosen by a constexpr function); results are compared with
+    # the host's on the GPU.
+    add_executable(test_metal_ir2msl metal/test_metal_ir2msl.c)
+    target_link_libraries(test_metal_ir2msl PRIVATE ocu_backend_metal m)
+    add_test(NAME metal_ir2msl_trial COMMAND ${CMAKE_COMMAND}
+      -DPY=${Python3_EXECUTABLE} -DCLANG=${CMAKE_CXX_COMPILER}
+      -DTOOL=${PROJECT_SOURCE_DIR}/compiler/metal/ir2msl.py
+      -DSRC=${CMAKE_CURRENT_SOURCE_DIR}/metal/ir2msl_trial.cu
+      -DIMG=${CMAKE_CURRENT_BINARY_DIR}/ir2msl_trial.metal.img
+      -DRUN=$<TARGET_FILE:test_metal_ir2msl>
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/backend/metal_cu2msl_test.cmake)
   endif()
 
   # Device math library, compiled for the host, against long double.
