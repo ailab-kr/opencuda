@@ -14,7 +14,7 @@ or a run is still going, it says so.
 | GPU | Intel Arc Pro B70, 32 GB (OpenCL reports 256 compute units, 30.3 GiB) |
 | Driver | Intel compute-runtime (NEO) 26.35.39758.21, IGC 2.41.16 (IGC 2.42 where noted) |
 | Host | Intel Xeon Silver 4510, 61 GB, Ubuntu 26.04.1, Linux 7.0.0-30 |
-| OpenCuda | branch `intel-arc-train` (PR #2); Clang/LLVM 23.1.6 for the device code |
+| OpenCuda | `main` (the HeCBench run: commit 4f9930a); Clang/LLVM 23.1.6 for the device code |
 | Compared with | chipStar 1.3.0 (`cucc`), the other open CUDA-on-Intel toolchain |
 
 The GPU is shared with other work, so each measurement ran with nothing else on it.
@@ -38,24 +38,57 @@ by `tools/bench/hecbench_summary.py`):
 The run used the OpenCuda toolkit as it was at its start (commit 4f9930a)
 for every program, so that all of them are measured with one toolkit.
 
-**Interim, 356 of 570 programs done (the run is still going):**
+**All 570 programs (run finished 2026-11-28 04:29 UTC):**
 
 | status | OpenCuda | chipStar 1.3.0 |
 |---|---|---|
-| pass | 127 | 96 |
-| ran | 72 | 67 |
-| fail | 10 | 6 |
-| crash | 22 | 13 |
-| timeout | 14 | 14 |
-| build_fail | 83 | 137 |
-| no_data | 28 | 23 |
+| pass | **206** | 161 |
+| ran | 118 | 111 |
+| fail | 17 | 9 |
+| crash | 25 | 18 |
+| timeout | 16 | 15 |
+| build_fail | **153** | 228 |
+| no_data | 35 | 28 |
 
-- Programs that run to the end (pass or ran): OpenCuda 199, chipStar 163.
-  Both: 148; only OpenCuda: 51; only chipStar: 15.
-- Speed where both run to the end (146 programs above 0.05 s): the geometric
-  mean of chipStar time / OpenCuda time is 0.98. OpenCuda is more than 10%
-  faster on 38, more than 10% slower on 55, within 10% on 53.
+- Programs that run to the end (pass or ran): **OpenCuda 324, chipStar 272**.
+  Both: 252; only OpenCuda: 72; only chipStar: 20.
+- Speed where both run to the end (247 programs above 0.05 s): the geometric
+  mean of chipStar time / OpenCuda time is 0.98 (above 1: OpenCuda faster).
+  OpenCuda is more than 10% faster on 71, more than 10% slower on 90, within
+  10% on 86. This is the toolkit at the start of the run; see the next two
+  sections for what changed since.
+### Performance work after the run
 
+Measured on the same GPU as same-session A/B runs (the setting on and off),
+`make run` timed as in the run. Both changes are on `main`.
+
+**Device memory as Intel USM device allocations** (`cudaMalloc`; before:
+coarse-grained SVM buffers; `OCU_OPENCL_DEVICE_USM=0` gives the old
+behaviour). The B70 reaches about twice the bandwidth with them:
+
+| | before | now | chipStar |
+|---|---|---|---|
+| BabelStream Copy (GB/s) | 547 | 906 | 891 |
+| BabelStream Triad (GB/s) | 535 | 1101 | 1114 |
+| divergence-cuda (s) | 38.4 | **1.2** | 1.34 |
+| collision-cuda (s) | 33.9 | 2.4 | build_fail |
+| nonzero-cuda (s) | 65.8 | 39.6 | |
+| memtest-cuda (s) | 53.9 | 25.3 | |
+| perlin-cuda (s) | 18.2 | 12.5 | |
+| streamOrderedAllocation-cuda (s) | 41.4 | 28.2 | |
+
+divergence-cuda was the program with the largest gap in the run (28.8x
+slower than chipStar): it allocates and frees five buffers per iteration.
+
+**`-use_fast_math`** now does on the SPIR-V path what nvcc documents (single-precision
+`expf`, `sinf`, `powf` ... become their intrinsics); before, the flag did
+not reach the device compiler. 17 HeCBench programs that use it and ran all
+still pass; aidw-cuda 50.7 -> 8.9 s, minkowski-cuda 27.4 -> 20.6 s (chipStar
+23.2 s), aobench-cuda 0.08 -> 0.05 s, the others unchanged.
+
+Measured and not taken: IGC's built-in math functions exceed the CUDA Math
+API error bounds (expf 2.54 ulp, sin 3.38 ulp, tanhf 4.84 ulp against 2, 2,
+2) and are mostly slower than OpenCuda's own.
 ### Programs fixed by later commits
 
 The run measures every program with the toolkit as it was at its start.
@@ -115,7 +148,7 @@ at most 0.58 / 3.25 ulp, documented bounds 2 / 5), large kernel arguments
 iterators (`rt_cub_kvp` 120/120, `rt_cub_iter` 13/13), cuBLAS accuracy
 (`cublas_accuracy` 1959/1959, int8 GEMM exact), cuBLASLt
 (`cublaslt_matmul` 101/101), cuBLAS level 1 / 2 (`cublas_level1` 301/301).
-The CPU path suite (`ctest`) passes 207/207.
+The CPU path suite (`ctest`) passes 209/209.
 
 ## Known limits
 
