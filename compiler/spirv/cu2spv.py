@@ -658,11 +658,14 @@ def _div_helper(op: str) -> str:
     # 32-bit fast path when both operands are small and non-negative (the
     # signed ops need < 2^31), as NVPTX's BypassSlowDivision does: Intel GPUs
     # have no 64-bit divide, the driver emulates it.
+    # The test is one unsigned compare (or of both < 2^32, or < 2^31): with a
+    # 64-bit shift right instead (lshr 31 / 32, then == 0), IGC 2.41 compiled
+    # HeCBench lrn-cuda's kernels wrongly (right with -cl-opt-disable).
     u = op[0] == "u"
-    shift = 32 if u else 31
+    limit = 1 << (32 if u else 31)
     op32 = "udiv" if op.endswith("div") else "urem"
     return (f"define internal i64 @__ocu_{op}64(i64 %a, i64 %b) alwaysinline {{\n"
-            f"  %o = or i64 %a, %b\n  %h = lshr i64 %o, {shift}\n  %s = icmp eq i64 %h, 0\n"
+            f"  %o = or i64 %a, %b\n  %s = icmp ult i64 %o, {limit}\n"
             f"  br i1 %s, label %f, label %l\nf:\n  %a32 = trunc i64 %a to i32\n  %b32 = trunc i64 %b to i32\n"
             f"  %q32 = {op32} i32 %a32, %b32\n  %q = zext i32 %q32 to i64\n  ret i64 %q\n"
             f"l:\n  %q2 = {op} i64 %a, %b\n  ret i64 %q2\n}}\n")
@@ -718,6 +721,51 @@ def spin_loads(ll: str) -> str:
             return f"{ind}{dst} = load atomic volatile {ty}, ptr{asp or ''} {ptr} seq_cst, align {align}{md}"
         parts[n] = SPIN_LOAD.sub(repl, f)
     return "".join(parts)
+
+
+LOCAL_CONST_GEP = re.compile(r"ptr addrspace\(3\) (getelementptr (?:inbounds |nuw |nusw )*\((i8|\[\d+ x i8\]), "
+                             r"ptr addrspace\(3\) (@[\w.$\"]+), i64 (-?\d+)\))")
+
+
+def local_const_geps(ll: str) -> str:
+    """A constant getelementptr on a shared-memory variable, used directly
+    as an instruction's pointer operand (atomicrmw add ptr addrspace(3)
+    getelementptr inbounds nuw (i8, ptr addrspace(3) @h, i64 52), ...):
+    LLVM 23's SPIR-V back end gives it as an OpInBoundsPtrAccessChain over
+    the element type the use implies (i32) with the byte offset as index,
+    four times too far (HeCBench segsort's bin kernel counted its histogram
+    out of the array). The same getelementptr as an instruction is given
+    right, so each such operand becomes one, placed before its use. Operands
+    of phi nodes and of other constant expressions are left as they are."""
+    if os.environ.get("OCU_SPV_LOCAL_GEP", "1") == "0":
+        return ll
+    out, n = [], 0
+    for line in ll.split("\n"):
+        s = line.lstrip()
+        if (line.startswith("  ") and "getelementptr" in line and "addrspace(3)" in line
+                and not re.match(r"%[\w.$\"-]+ = phi ", s) and not s.startswith(("@", ";", "!"))):
+            def sub(m):
+                nonlocal n
+                # inside another constant expression (the innermost open
+                # parenthesis is not a call's argument list): leave it
+                depth, k = 0, m.start()
+                while k > 0:
+                    k -= 1
+                    if line[k] == ")":
+                        depth += 1
+                    elif line[k] == "(":
+                        if depth == 0:
+                            break
+                        depth -= 1
+                if line[k] == "(" and not re.search(r"@[\w.$\"]+$", line[:k]):
+                    return m.group(0)
+                n += 1
+                name = f"%__ocu_lgep{n}"
+                out.append(f"  {name} = getelementptr inbounds {m.group(2)}, ptr addrspace(3) {m.group(3)}, i64 {m.group(4)}")
+                return f"ptr addrspace(3) {name}"
+            line = LOCAL_CONST_GEP.sub(sub, line)
+        out.append(line)
+    return "\n".join(out)
 
 
 def legalize_intrinsics(ll: str) -> str:
@@ -867,7 +915,7 @@ def main(argv):
             r = subprocess.run([opt, "-passes=always-inline,infer-address-spaces,instcombine<no-verify-fixpoint>,simplifycfg", "-S", str(ll2), "-o", str(ll3)],
                                capture_output=True, text=True)
             if r.returncode == 0:
-                ll3.write_text(legalize_intrinsics(byval_direct(ll3.read_text())))
+                ll3.write_text(legalize_intrinsics(local_const_geps(byval_direct(ll3.read_text()))))
                 r = subprocess.run([llvm_as, str(ll3), "-o", str(bc)], capture_output=True, text=True)
         else:
             r = subprocess.run([llvm_as, str(ll2), "-o", str(bc)], capture_output=True, text=True)
