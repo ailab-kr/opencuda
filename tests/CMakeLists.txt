@@ -225,6 +225,12 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   endforeach()
   ocu_add_cpu_cu_executable(rt_mem runtime/rt_mem.cu)
   add_test(NAME runtime_memory COMMAND rt_mem)
+  # also run on the B70 (SPIR-V path) by hand: device variables, mapped pinned
+  # memory, __half2 comparisons, large kernel arguments, memory pools
+  foreach(t rt_symbols rt_pinned_mapped rt_half2_cmp rt_big_args rt_mempool rt_implicit_headers rt_cub_kvp rt_cub_iter rt_erf_gpu rt_cub_select)
+    ocu_add_cpu_cu_executable(${t} runtime/${t}.cu)
+    add_test(NAME runtime_${t} COMMAND ${t})
+  endforeach()
   ocu_add_cpu_cu_executable(rt_misc runtime/rt_misc.cu)
   add_test(NAME runtime_misc COMMAND rt_misc)
   ocu_add_cpu_cu_executable(rt_apps_gaps runtime/rt_apps_gaps.cu)
@@ -401,6 +407,9 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   ocu_add_cpu_cu_executable(rt_gaps_intrin runtime/rt_gaps_intrin.cu)
   add_test(NAME runtime_gaps_intrin COMMAND rt_gaps_intrin)
   add_test(NAME runtime_gaps_intrin_random COMMAND rt_gaps_intrin)
+  # card runtime-llama-gaps: the SIMD intrinsics of the CUDA Math API.
+  ocu_add_cpu_cu_executable(rt_simd runtime/rt_simd.cu)
+  add_test(NAME runtime_simd COMMAND rt_simd)
   set_tests_properties(runtime_gaps_intrin_random PROPERTIES
     ENVIRONMENT "OCU_CPU_ORDER=random;OCU_CPU_THREADS=3;OCU_CPU_SEED=9")
   ocu_add_cpu_cu_executable(rt_gaps_api runtime/rt_gaps_api.cu)
@@ -490,6 +499,14 @@ if(OCU_BACKEND_CPU AND Python3_FOUND)
   target_compile_options(test_device_mathf PRIVATE -O2 -ffp-contract=off)
   target_link_libraries(test_device_mathf PRIVATE Threads::Threads m)
   add_test(NAME device_mathf COMMAND test_device_mathf)
+  # ocu_device_math_ext.h: exact functions and rounding modes bit for bit
+  # against the C library / the host FPU (fesetround), the rest against long
+  # double (OCU_MATH_EXT_FULL=1: every positive float for __frsqrt_rn).
+  add_executable(test_device_math_ext runtime/test_device_math_ext.cpp)
+  target_include_directories(test_device_math_ext PRIVATE ${PROJECT_SOURCE_DIR}/runtime/include)
+  target_compile_options(test_device_math_ext PRIVATE -O2 -frounding-math -ffp-contract=off)
+  target_link_libraries(test_device_math_ext PRIVATE Threads::Threads m)
+  add_test(NAME device_math_ext COMMAND test_device_math_ext)
 
   # The installed package works for a project outside this tree, built
   # with the same compilers and flags (sanitizers included). Not when
@@ -797,6 +814,12 @@ if(TARGET ocu_cublas_cpu)
     ENVIRONMENT "OCU_CUBLAS_TILE=64;OCU_CPU_ORDER=random;OCU_CPU_SEED=9")
   add_test(NAME cublas_cpu_tile128 COMMAND cublas_accuracy)
   set_tests_properties(cublas_cpu_tile128 PROPERTIES ENVIRONMENT "OCU_CUBLAS_TILE=128")
+  # cublasLtMatmul (layouts, transposes, batches, epilogues) against a double reference
+  ocu_add_cpu_cu_executable(cublaslt_matmul libs/cublaslt_matmul.cu LIBRARIES ocu_cublas_cpu)
+  add_test(NAME cublaslt_cpu COMMAND cublaslt_matmul)
+  # the real-type level 1 / 2 family and cublasDotEx against the reference loops
+  ocu_add_cpu_cu_executable(cublas_level1 libs/cublas_level1.cu LIBRARIES ocu_cublas_cpu)
+  add_test(NAME cublas_level1_cpu COMMAND cublas_level1)
 endif()
 # The reference BLAS cases (conformance/oracle) through the library, for
 # the functions it offers.
@@ -1079,4 +1102,11 @@ if(OCU_BACKEND_CPU AND OCU_CPU_LOOPS_PLUGIN)
       set_tests_properties(cpu_forms_golden cpu_forms_variants PROPERTIES TIMEOUT 1200)
     endif()
   endif()
+endif()
+
+# ---- compiler/spirv/cu2spv.py IR rewrites, host only (card compiler-driver) ----
+if(Python3_FOUND)
+  add_test(NAME spirv_cu2spv_host
+    COMMAND ${Python3_EXECUTABLE} -m unittest test_cu2spv
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/opencl)
 endif()

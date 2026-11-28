@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ocu-nvcc: a CUDA compiler driver with nvcc's documented command line.
 
-    ocu-nvcc [--ocu-target=cpu|nvidia] [nvcc options] inputs...
+    ocu-nvcc [--ocu-target=cpu|nvidia|opencl|intel] [nvcc options] inputs...
 
 Build systems call it where they would call nvcc: compile (-c), preprocess
 (-E), dependencies (-M, -MD, -MF, -MT), link (default), shared libraries
@@ -80,8 +80,8 @@ LANG_NAMES = {"cu": "cu", "cuda": "cu", "c": "c", "c++": "cpp", "cpp": "cpp"}
 # Libraries a CUDA build names, and what links instead. The runtime set is
 # added once, at the end of the link line.
 RUNTIME_LIBS = ("cudart", "cudart_static", "cudadevrt", "cuda")
-BLAS_LIBS = ("cublas", "cublas_static")
-NO_IMPL_LIBS = ("cublasLt", "cublasLt_static", "culibos")
+BLAS_LIBS = ("cublas", "cublas_static", "cublasLt", "cublasLt_static")  # one library has both APIs
+NO_IMPL_LIBS = ("culibos",)
 CLANG_MAX_SM = 90    # highest sm_ the LLVM 18 NVPTX back end accepts
 NVCC_WERROR_KINDS = {"all-warnings", "cross-execution-space-call", "reorder",
                      "default-stream-launch", "missing-launch-bounds",
@@ -227,7 +227,7 @@ def default_target() -> str:
     was called by (ocu-nvcc-cpu, ocu-nvcc-nvidia: links in the toolkit
     folder, so a build system's compiler path fixes the target), else the
     environment variable OCU_TARGET, else cpu."""
-    m = re.fullmatch(r"ocu-nvcc-(cpu|nvidia)", SELF.name)
+    m = re.fullmatch(r"ocu-nvcc-(cpu|nvidia|opencl|intel|spirv)", SELF.name)
     if m:
         return m.group(1)
     return os.environ.get("OCU_TARGET") or "cpu"
@@ -450,11 +450,24 @@ def parse(argv: list[str]) -> SimpleNamespace:
             raise UsageError(f"internal: unhandled option {a}")
         i += 1
 
-    if o.target not in ("cpu", "nvidia"):
-        raise UsageError(f"--ocu-target={o.target}: expected cpu or nvidia")
+    if o.target == "intel":
+        # The OpenCL path tuned for Intel GPUs: kernels with warp-wide
+        # operations run 32-wide sub-groups (a CUDA warp), the others 16-wide
+        # (twice the registers per work-item). Same backend: OCU_BACKEND=opencl.
+        os.environ.setdefault("OCU_OPENCL_SUBGROUP", "32")
+        os.environ.setdefault("OCU_OPENCL_SUBGROUP_OTHER", "16")
+        o.target = "opencl"
+    if o.target not in ("cpu", "nvidia", "opencl", "spirv"):
+        raise UsageError(f"--ocu-target={o.target}: expected cpu, nvidia, opencl, intel or spirv")
     for item in o.inputs:   # nvcc: -x applies to every input
         if item[1] is None:
             item[1] = lang_global
+    # CMake identifies a CUDA compiler by compiling CMakeCUDACompilerId.cu:
+    # "NVIDIA" when __NVCC__ is defined. ocu-nvcc is Clang-based and CMake
+    # must use its Clang rules, so that one file does not get the __NVCC__
+    # that every other CUDA compile gets (cuda_runtime.h).
+    if any(os.path.basename(p).startswith("CMakeCUDACompilerId") for p, _ in o.inputs):
+        o.pre += ["-D", "OCU_NO_NVCC_MACRO"]
     return o
 
 
@@ -497,6 +510,43 @@ def host_compilers(o) -> tuple[str, str]:
     return cxx, cc
 
 
+OPENMP_FLAGS = ("-fopenmp", "-qopenmp", "-fiopenmp")
+
+
+def host_openmp(cxx: str, host: list[str]) -> tuple[list[str], list[str]]:
+    """(compile flags, link flags) that make a host -fopenmp build work with a
+    host compiler that does not set up its own OpenMP paths (oneAPI's clang++
+    and icpx without setvars.sh: omp.h and libiomp5.so are outside the default
+    search). The runtime's directory is the one the compiler itself links
+    from; nothing is added when that is a system directory. The result is what
+    setvars.sh's LD_LIBRARY_PATH gives at run time."""
+    if not any(h in OPENMP_FLAGS or h.startswith("-fopenmp=") for h in host):
+        return [], []
+    ext = ".dylib" if sys.platform == "darwin" else ".so"
+    libdir = None
+    for name in ("libiomp5", "libomp", "libgomp"):
+        try:
+            got = subprocess.run([cxx, f"-print-file-name={name}{ext}"],
+                                 capture_output=True, text=True).stdout.strip()
+        except OSError:
+            return [], []
+        if os.path.isabs(got) and os.path.exists(got):
+            libdir = Path(got).resolve().parent
+            break
+    if libdir is None or str(libdir).startswith(("/usr/lib", "/lib", "/usr/local/lib")):
+        return [], []
+    compile_flags = []
+    inc = libdir.parent / "opt" / "compiler" / "include"  # oneAPI's layout
+    if (inc / "omp.h").is_file():
+        compile_flags = ["-isystem", str(inc)]
+    if sys.platform == "darwin":
+        return compile_flags, [f"-Wl,-rpath,{libdir}"]
+    # DT_RPATH, not DT_RUNPATH: the directory also holds oneAPI's libOpenCL,
+    # which the runtime's dlopen then finds; only DT_RPATH also serves that
+    # library's own dependencies (libsvml...), as LD_LIBRARY_PATH would.
+    return compile_flags, ["-Wl,--disable-new-dtags", f"-Wl,-rpath,{libdir}"]
+
+
 def toolkit_libdir() -> Path | None:
     """Our runtime libraries: next to the driver in a toolkit layout
     (<root>/bin/ocu-nvcc, <root>/lib), in an installed prefix, or where
@@ -525,7 +575,8 @@ def toolkit_cpu_loops() -> str | None:
 def runtime_link(libdir: Path, blas: bool, target: str = "cpu") -> list[str]:
     # -lcublas: the cublas_v2.h library built for the same target as the
     # CUDA code (libs/cublas), then the internal BLAS layer.
-    names = ([f"ocu_cublas_{target}", "ocu_blas"] if blas else []) + \
+    lib_target = "opencl" if target == "spirv" else target  # the OpenCL backend runs both
+    names = ([f"ocu_cublas_{lib_target}", "ocu_blas"] if blas else []) + \
         ["ocu_cudart", "ocu_core", "ocu_backend_cpu", "ocu_backend_nvidia", "ocu_backend_opencl", "ocu_backend_metal",
          "ocu_backend_npusim", "ocu_ops_ref"]  # ops_ref after the backends that use it
     files = [str(libdir / f"lib{n}.a") for n in names if (libdir / f"lib{n}.a").is_file()]
@@ -633,11 +684,11 @@ class Driver:
         device = []
         if o.fast_math:
             device += ["-fcuda-approx-transcendentals", "-fgpu-flush-denormals-to-zero"]
-        host = list(o.host)
+        host = list(o.host) + host_openmp(self.cxx, o.host)[0]
         if o.verbose:
             host.append("-v")
         return SimpleNamespace(
-            target=o.target, arch=self.ptx_arch() if o.target == "nvidia" else None,
+            target=o.target, arch=self.ptx_arch() if o.target in ("nvidia", "opencl", "spirv") else None,
             I=[], D=[], O=level, g=o.g or o.G, cache=None, lang=lang, std=o.std,
             pre=list(o.pre), host=host, device=device, deps=deps,
             cxx=self.cxx, cc=self.cc,
@@ -730,7 +781,8 @@ class Driver:
             extra = runtime_link(libdir, want_blas, o.target)
         cmd = [self.cxx, *(["-shared"] if o.shared else []), *o.host,
                *(["-v"] if o.verbose else []),
-               *line, "-o", out, *[f"-L{d}" for d in o.libdirs], *o.linker, *extra]
+               *line, "-o", out, *[f"-L{d}" for d in o.libdirs], *o.linker, *extra,
+               *host_openmp(self.cxx, o.host)[1]]
         return self.run([cmd], out)
 
     def empty_object(self, out: str, work: Path) -> int:

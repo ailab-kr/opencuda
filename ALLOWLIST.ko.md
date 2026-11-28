@@ -32,4 +32,18 @@
 
 | 자료 | 주소 | 추가한 날 |
 |---|---|---|
-| (아직 없음) | | |
+| Khronos OpenCL 3.0 API·OpenCL C 명세, SPIR-V 명세 | https://registry.khronos.org/OpenCL/ , https://registry.khronos.org/SPIR-V/ | 2026-11-26 |
+| Khronos OpenCL 확장 명세: cl_intel_subgroups, cl_intel_subgroup_2d_block_io, cl_intel_subgroup_matrix_multiply_accumulate, cl_intel_unified_shared_memory, cl_khr_integer_dot_product | https://registry.khronos.org/OpenCL/extensions/ | 2026-11-26 |
+| LLVM / Clang 문서(HIP 언어 모드, SPIR-V 백엔드, InferAddressSpaces, BypassSlowDivision) | https://llvm.org/docs/ , https://clang.llvm.org/docs/ | 2026-11-26 |
+| CUB 공개 API 문서(BlockLoad, BlockStore, BlockReduce, WarpReduce) | https://nvidia.github.io/cccl/cub/ | 2026-11-26 |
+| cuBLAS / cuBLASLt API 설명서(함수 설명만) | https://docs.nvidia.com/cuda/cublas/ | 2026-11-26 |
+| bitsandbytes 소스(MIT): 저장 형식을 맞추려고 읽은 NF4 코드 표와 블록 배치(블록 64, f32 absmax, 앞 값이 상위 4비트). 시험 프로그램으로 고치지 않고 빌드 | https://github.com/bitsandbytes-foundation/bitsandbytes | 2026-11-26 |
+| QLoRA 논문(Dettmers 외 2023): NF4 자료형 | https://arxiv.org/abs/2305.14314 | 2026-11-26 |
+| GNU ld 매뉴얼(-rpath, --disable-new-dtags)과 ld.so(8) 매뉴얼 페이지(DT_RPATH·DT_RUNPATH 검색 순서) | https://sourceware.org/binutils/docs/ld/ , https://man7.org/linux/man-pages/man8/ld.so.8.html | 2026-11-27 |
+| Intel oneAPI DPC++/C++ 컴파일러 문서(OpenMP 옵션, libiomp5) | https://www.intel.com/content/www/us/en/docs/dpcpp-cpp-compiler/developer-guide-reference/ | 2026-11-27 |
+| LLVM / Clang 소스(Apache-2.0 WITH LLVM-exception): `clang/lib/Sema/SemaType.cpp`(SPIR-V용 CUDA·HIP 커널의 호출 규약), `clang/lib/CodeGen/Targets/SPIR.cpp`와 `clang/lib/CodeGen/CGCall.cpp`(`setCUDAKernelCallingConvention`), 그리고 이를 쓴 커밋(D114407, #110447). spirv64에서 호스트 코드가 커널을 함수 포인터에 담지 못하는 이유를 찾고 `compiler/spirv/clang-hipspv-kernel-address.patch`를 쓰려고 읽음 | https://github.com/llvm/llvm-project | 2026-11-27 |
+| Khronos OpenCL 확장 명세 cl_intel_device_attribute_query(CL_DEVICE_NUM_SLICES_INTEL, CL_DEVICE_NUM_SUB_SLICES_PER_SLICE_INTEL): Intel GPU의 멀티프로세서 수 | https://registry.khronos.org/OpenCL/extensions/intel/cl_intel_device_attribute_query.html | 2026-11-27 |
+| CUDA Math API 레퍼런스(함수 목록, 인자 형, 특수값; 정확도 수치는 Programming Guide 부록) | https://docs.nvidia.com/cuda/cuda-math-api/ | 2026-11-28 |
+| IEEE 754-2019(반올림 속성, 정확한 0 합의 부호, remainder) | https://standards.ieee.org/ieee/754/6210/ | 2026-11-28 |
+| fdlibm, Sun Microsystems 1993("freely granted"): acosh·asinh·atanh 공식과 계수, sin·cos 커널(기존 장치 수학 라이브러리도 사용) | https://www.netlib.org/fdlibm/ | 2026-11-28 |
+| Knuth, TAOCP 2권(two-sum); Sterbenz, Floating-Point Computation(1974, 정확한 뺄셈); Figueroa, "When is double rounding innocuous?"(1995) | 교과서·논문 | 2026-11-28 |

@@ -139,6 +139,19 @@ class CommandLine(unittest.TestCase):
         nvcc(cpp, "-L", self.dir, "-lh", "-lcudart", "-o", self.dir / "m")
         self.assertEqual(subprocess.run([self.dir / "m"]).returncode, 0)
 
+    def test_host_openmp(self):
+        # nvcc -Xcompiler -fopenmp: omp.h is found, and the program runs without
+        # LD_LIBRARY_PATH with both OpenMP and the GPU working (the OpenMP
+        # runtime's directory must not hide the device's libraries).
+        src = self.dir / "o.cu"
+        src.write_text("#include <omp.h>\n" + KERNEL.replace(
+            "int main() {", "int main() { int n = 0;\n#pragma omp parallel reduction(+:n)\n"
+            " n += 1;\n if (n != omp_get_max_threads()) return 2;"))
+        nvcc("-c", src, "-Xcompiler", "-fopenmp", "-o", self.dir / "o.o")
+        nvcc(self.dir / "o.o", "-Xcompiler", "-fopenmp", "-o", self.dir / "o")
+        env = {k: v for k, v in os.environ.items() if k != "LD_LIBRARY_PATH"}
+        self.assertEqual(subprocess.run([self.dir / "o"], env=env).returncode, 0)
+
     def test_shared_library(self):
         lib = self.dir / "k.cu"
         lib.write_text('__global__ void inc(int *p) { *p += 1; }\n'

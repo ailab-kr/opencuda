@@ -25,6 +25,21 @@
 #define cublasSdot cublasSdot_v2
 #define cublasSnrm2 cublasSnrm2_v2
 #define cublasSgemv cublasSgemv_v2
+#define cublasDaxpy cublasDaxpy_v2
+#define cublasDscal cublasDscal_v2
+#define cublasDdot cublasDdot_v2
+#define cublasDnrm2 cublasDnrm2_v2
+#define cublasScopy cublasScopy_v2
+#define cublasDcopy cublasDcopy_v2
+#define cublasSswap cublasSswap_v2
+#define cublasDswap cublasDswap_v2
+#define cublasSasum cublasSasum_v2
+#define cublasDasum cublasDasum_v2
+#define cublasIsamax cublasIsamax_v2
+#define cublasIdamax cublasIdamax_v2
+#define cublasIsamin cublasIsamin_v2
+#define cublasIdamin cublasIdamin_v2
+#define cublasDgemv cublasDgemv_v2
 #define cublasSgemm cublasSgemm_v2
 #define cublasDgemm cublasDgemm_v2
 

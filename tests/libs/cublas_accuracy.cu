@@ -13,7 +13,9 @@
 // Also checked: padding between columns of C is never written; alpha == 0
 // never reads A and B (they hold inf and NaN); beta == 0 never reads C
 // (it holds NaN); batches, strides, pointer arrays, transposes, host and
-// device pointer modes, streams, status codes.
+// device pointer modes, streams, status codes. geam (both scalars, in place),
+// getrfBatched (P A = L U with |L| <= 1, info for singular matrices) and the
+// Set/Get Matrix/Vector copies (strides, padding untouched, async).
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
@@ -702,7 +704,8 @@ static void test_api_rules()
     // Combinations not computed here: "not supported", never a result.
     const cublasStatus_t NS = CUBLAS_STATUS_NOT_SUPPORTED;
     BLAS_IS(cublasGemmEx(h2, CUBLAS_OP_N, CUBLAS_OP_N, 1, 1, 1, &one, a, CUDA_C_32F, 1, a, CUDA_C_32F, 1, &zero, c, CUDA_C_32F, 1, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), NS);
-    BLAS_IS(cublasGemmEx(h2, CUBLAS_OP_N, CUBLAS_OP_N, 1, 1, 1, &one, a, CUDA_R_8I, 1, a, CUDA_R_8I, 1, &zero, c, CUDA_R_32I, 1, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT), NS);
+    // 8-bit integers into 32-bit ones: computed (test_gemm_i8); other integer outputs are not
+    BLAS_IS(cublasGemmEx(h2, CUBLAS_OP_N, CUBLAS_OP_N, 1, 1, 1, &one, a, CUDA_R_8I, 1, a, CUDA_R_8I, 1, &zero, c, CUDA_R_32F, 1, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT), NS);
     BLAS_IS(cublasGemmEx(h2, CUBLAS_OP_N, CUBLAS_OP_N, 1, 1, 1, &one, a, CUDA_R_16F, 1, a, CUDA_R_16F, 1, &zero, c, CUDA_R_16F, 1, CUBLAS_COMPUTE_16F_PEDANTIC, CUBLAS_GEMM_DEFAULT), NS);
     BLAS_IS(cublasGemmEx(h2, CUBLAS_OP_N, CUBLAS_OP_N, 1, 1, 1, &one, a, CUDA_R_16F, 1, a, CUDA_R_32F, 1, &zero, c, CUDA_R_32F, 1, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), NS);
     BLAS_IS(cublasGemmEx(h2, CUBLAS_OP_N, CUBLAS_OP_N, 1, 1, 1, &one, a, CUDA_R_32F, 1, a, CUDA_R_32F, 1, &zero, c, CUDA_R_16F, 1, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), NS);
@@ -825,10 +828,387 @@ static void test_trsm_batched()
     cudaFree(dp);
 }
 
+// ---- geam: C = alpha op(A) + beta op(B) ----------------------------------
+
+template <class T>
+static cublasStatus_t geam(cublasOperation_t ta, cublasOperation_t tb, int m, int n, const T *al, const T *A, int lda,
+                           const T *be, const T *B, int ldb, T *C, int ldc);
+template <>
+cublasStatus_t geam<float>(cublasOperation_t ta, cublasOperation_t tb, int m, int n, const float *al, const float *A,
+                           int lda, const float *be, const float *B, int ldb, float *C, int ldc)
+{
+    return cublasSgeam(H, ta, tb, m, n, al, A, lda, be, B, ldb, C, ldc);
+}
+template <>
+cublasStatus_t geam<double>(cublasOperation_t ta, cublasOperation_t tb, int m, int n, const double *al,
+                            const double *A, int lda, const double *be, const double *B, int ldb, double *C, int ldc)
+{
+    return cublasDgeam(H, ta, tb, m, n, al, A, lda, be, B, ldb, C, ldc);
+}
+
+template <class T>
+static void run_geam(ty t, const char *group)
+{
+    tally &tl = g_tally[group];
+    const double u = unit_roundoff(t);
+    const double scal[][2] = {{1.5, -0.5}, {0.0, 2.0}, {-2.0, 0.0}, {1.0, 1.0}};
+    for (char ta : {'N', 'T'})
+        for (char tb : {'N', 'T'})
+            for (auto mn : {std::pair<int, int>{1, 1}, {13, 7}, {40, 65}})
+                for (auto &sc : scal) {
+                    const int m = mn.first, n = mn.second;
+                    const int ar = ta == 'N' ? m : n, ac = ta == 'N' ? n : m;
+                    const int br = tb == 'N' ? m : n, bc = tb == 'N' ? n : m;
+                    mat a(t, ar, ac, ar + 1), b(t, br, bc, br + 3), c(t, m, n, m + 2, 7.25);
+                    // alpha == 0 never reads A, beta == 0 never reads B: they hold NaN then.
+                    if (sc[0] == 0) a.fill_value(NAN); else a.fill();
+                    if (sc[1] == 0) b.fill_value(NAN); else b.fill();
+                    c.fill_value(NAN); // C is output only
+                    a.upload(); b.upload(); c.upload();
+                    const T al = T(sc[0]), be = T(sc[1]);
+                    BLAS_OK(geam<T>(op_of(ta), op_of(tb), m, n, &al, (const T *)a.d, a.ld, &be, (const T *)b.d, b.ld,
+                                    (T *)c.d, c.ld));
+                    std::vector<uint8_t> got = c.download();
+                    int bad = 0;
+                    for (int j = 0; j < n; ++j)
+                        for (int i = 0; i < m; ++i) {
+                            const ld x = sc[0] == 0 ? 0 : ld(sc[0]) * (ta == 'N' ? a.at(i, j) : a.at(j, i));
+                            const ld y = sc[1] == 0 ? 0 : ld(sc[1]) * (tb == 'N' ? b.at(i, j) : b.at(j, i));
+                            const ld ref = x + y;
+                            const double r = double(std::fabs(get(t, got, i + size_t(j) * c.ld) - ref) /
+                                                    (3 * u * (std::fabs(x) + std::fabs(y)) + tiny(t)));
+                            ++tl.n;
+                            if (!(r <= 1)) ++bad;
+                            if (r > tl.worst || std::isnan(r)) { tl.worst = r; tl.worst_where = std::string(1, ta) + tb; }
+                        }
+                    for (int j = 0; j < n; ++j) // padding rows untouched
+                        for (int i = m; i < c.ld; ++i) bad += !same_bits(t, got, c.h, i + size_t(j) * c.ld);
+                    ++g_checks;
+                    if (bad) { ++g_fail; tl.bad += bad; std::printf("FAIL %s %c%c m%d n%d a%g b%g: %d\n", group, ta, tb, m, n, sc[0], sc[1], bad); }
+                }
+    // In place: C = A (op N, same ld), and C = B.
+    const int m = 9, n = 6;
+    mat a(t, m, n, m + 1), b(t, m, n, m + 1);
+    a.fill(); b.fill(); a.upload(); b.upload();
+    const T al = T(2), be = T(-1);
+    BLAS_OK(geam<T>(CUBLAS_OP_N, CUBLAS_OP_N, m, n, &al, (const T *)a.d, a.ld, &be, (const T *)b.d, b.ld, (T *)a.d, a.ld));
+    std::vector<uint8_t> ga = a.download();
+    BLAS_OK(geam<T>(CUBLAS_OP_N, CUBLAS_OP_N, m, n, &al, (const T *)a.d, a.ld, &be, (const T *)b.d, b.ld, (T *)b.d, b.ld));
+    std::vector<uint8_t> gb = b.download();
+    int bad = 0;
+    for (int j = 0; j < n; ++j)
+        for (int i = 0; i < m; ++i) {
+            const size_t k = i + size_t(j) * a.ld;
+            const double c1 = 2 * a.at(i, j) - b.at(i, j), c2 = 2 * c1 - b.at(i, j);
+            bad += std::fabs(get(t, ga, k) - c1) > 4 * u * (std::fabs(c1) + 1);
+            bad += std::fabs(get(t, gb, k) - c2) > 8 * u * (std::fabs(c2) + 1);
+        }
+    CHECK(bad == 0);
+    // Device pointer mode for the scalars.
+    T *dsc;
+    CUDA_OK(cudaMalloc(&dsc, 2 * sizeof(T)));
+    const T hs[2] = {T(0.5), T(0.25)};
+    CUDA_OK(cudaMemcpy(dsc, hs, sizeof hs, cudaMemcpyHostToDevice));
+    mat x(t, 4, 3, 4), y(t, 4, 3, 4), z(t, 4, 3, 4);
+    x.fill(); y.fill(); x.upload(); y.upload();
+    BLAS_OK(cublasSetPointerMode(H, CUBLAS_POINTER_MODE_DEVICE));
+    BLAS_OK(geam<T>(CUBLAS_OP_N, CUBLAS_OP_N, 4, 3, dsc, (const T *)x.d, 4, dsc + 1, (const T *)y.d, 4, (T *)z.d, 4));
+    BLAS_OK(cublasSetPointerMode(H, CUBLAS_POINTER_MODE_HOST));
+    std::vector<uint8_t> gz = z.download();
+    bad = 0;
+    for (int i = 0; i < 12; ++i) {
+        const double want = 0.5 * get(t, x.h, i) + 0.25 * get(t, y.h, i);
+        bad += std::fabs(get(t, gz, i) - want) > 3 * u * (std::fabs(want) + 1);
+    }
+    CHECK(bad == 0);
+    cudaFree(dsc);
+    // Status codes.
+    BLAS_IS(geam<T>(CUBLAS_OP_N, CUBLAS_OP_N, -1, 3, &al, (const T *)x.d, 4, &be, (const T *)y.d, 4, (T *)z.d, 4), CUBLAS_STATUS_INVALID_VALUE);
+    BLAS_IS(geam<T>(CUBLAS_OP_N, CUBLAS_OP_N, 4, 3, &al, (const T *)x.d, 3, &be, (const T *)y.d, 4, (T *)z.d, 4), CUBLAS_STATUS_INVALID_VALUE); // lda < m
+    BLAS_IS(geam<T>(CUBLAS_OP_T, CUBLAS_OP_N, 4, 5, &al, (const T *)x.d, 4, &be, (const T *)y.d, 4, (T *)z.d, 4), CUBLAS_STATUS_INVALID_VALUE); // lda < n for op T
+    BLAS_IS(geam<T>(CUBLAS_OP_N, CUBLAS_OP_N, 4, 3, &al, (const T *)x.d, 4, &be, (const T *)y.d, 4, (T *)z.d, 3), CUBLAS_STATUS_INVALID_VALUE); // ldc < m
+    BLAS_OK(geam<T>(CUBLAS_OP_N, CUBLAS_OP_N, 0, 3, &al, (const T *)x.d, 4, &be, (const T *)y.d, 4, (T *)z.d, 4));
+}
+
+static void test_geam()
+{
+    run_geam<float>(ty::f32, "sgeam");
+#ifndef OCU_CUBLAS_NO_FP64
+    run_geam<double>(ty::f64, "dgeam");
+#endif
+}
+
+// ---- getrfBatched: P A = L U, partial pivoting ----------------------------
+
+static void test_getrf_batched()
+{
+    tally &tl = g_tally["sgetrf_batched"];
+    const int count = 3;
+    for (int n : {1, 2, 5, 32, 33})
+        for (bool pivot : {true, false}) {
+            const int lda = n + 1;
+            std::vector<mat *> as;
+            std::vector<void *> pa;
+            for (int q = 0; q < count; ++q) {
+                mat *a = new mat(ty::f32, n, n, lda, 3.5);
+                a->fill();
+                if (!pivot) // no pivoting: make it diagonally dominant
+                    for (int i = 0; i < n; ++i) put(ty::f32, a->h, i + size_t(i) * lda, float(n + 2.0 + rnd(ty::f32)));
+                a->upload();
+                as.push_back(a);
+                pa.push_back(a->d);
+            }
+            void **dpa;
+            int *dpiv, *dinfo;
+            CUDA_OK(cudaMalloc(&dpa, count * sizeof(void *)));
+            CUDA_OK(cudaMalloc(&dpiv, count * n * sizeof(int)));
+            CUDA_OK(cudaMalloc(&dinfo, count * sizeof(int)));
+            CUDA_OK(cudaMemcpy(dpa, pa.data(), count * sizeof(void *), cudaMemcpyHostToDevice));
+            CUDA_OK(cudaMemset(dinfo, 0x55, count * sizeof(int)));
+            BLAS_OK(cublasSgetrfBatched(H, n, (float *const *)dpa, lda, pivot ? dpiv : nullptr, dinfo, count));
+            CUDA_OK(cudaDeviceSynchronize());
+            std::vector<int> piv(count * n, 0), info(count);
+            if (pivot) CUDA_OK(cudaMemcpy(piv.data(), dpiv, piv.size() * sizeof(int), cudaMemcpyDeviceToHost));
+            CUDA_OK(cudaMemcpy(info.data(), dinfo, info.size() * sizeof(int), cudaMemcpyDeviceToHost));
+            int bad = 0;
+            for (int q = 0; q < count; ++q) {
+                bad += info[q] != 0;
+                std::vector<uint8_t> got = as[q]->download();
+                auto F = [&](int i, int j) -> ld { return get(ty::f32, got, i + size_t(j) * lda); };
+                // P A: apply the interchanges in order to the original rows.
+                std::vector<int> row(n);
+                for (int i = 0; i < n; ++i) row[i] = i;
+                for (int i = 0; i < n && pivot; ++i) {
+                    const int p = piv[q * n + i] - 1;
+                    if (p < i || p >= n) { ++bad; continue; } // 1-based, never above the current row
+                    std::swap(row[i], row[p]);
+                }
+                for (int j = 0; j < n; ++j)
+                    for (int i = 0; i < n; ++i) {
+                        ld s = 0, as_ = 0;
+                        for (int k = 0; k <= (i < j ? i : j); ++k) {
+                            const ld l = k == i ? 1 : F(i, k), uu = F(k, j);
+                            s += l * uu; as_ += std::fabs(l * uu);
+                        }
+                        const ld ref = as[q]->at(row[i], j);
+                        const double r = double(std::fabs(s - ref) / (2 * (n + 1) * 0x1p-24 * (as_ + std::fabs(ref)) + 0x1p-149));
+                        ++tl.n;
+                        if (!(r <= 1)) ++bad;
+                        if (r > tl.worst || std::isnan(r)) { tl.worst = r; tl.worst_where = "n" + std::to_string(n); }
+                        if (pivot && i > j && !(std::fabs(F(i, j)) <= 1)) ++bad; // partial pivoting: |L| <= 1
+                    }
+                for (int j = 0; j < n; ++j) // padding row untouched
+                    bad += !same_bits(ty::f32, got, as[q]->h, n + size_t(j) * lda);
+            }
+            ++g_checks;
+            if (bad) { ++g_fail; tl.bad += bad; std::printf("FAIL sgetrf_batched n%d pivot%d: %d\n", n, pivot, bad); }
+            cudaFree(dpa); cudaFree(dpiv); cudaFree(dinfo);
+            for (auto *a : as) delete a;
+        }
+    // Singular: column 2 (1-based 3) is zero below and on the diagonal after
+    // elimination -> info = 3; a zero first column -> info = 1.
+    for (int zero_col : {0, 2}) {
+        const int n = 4;
+        mat a(ty::f32, n, n, n);
+        a.fill();
+        for (int i = 0; i < n; ++i) put(ty::f32, a.h, i + size_t(zero_col) * n, zero_col == 0 ? 0.0 : a.at(i, 0));
+        if (zero_col == 2) // column 2 = column 0: dependent
+            for (int i = 0; i < n; ++i) put(ty::f32, a.h, i + size_t(2) * n, a.at(i, 0));
+        a.upload();
+        void *pa = a.d, **dpa;
+        int *dpiv, *dinfo, info = -1;
+        CUDA_OK(cudaMalloc(&dpa, sizeof(void *)));
+        CUDA_OK(cudaMalloc(&dpiv, n * sizeof(int)));
+        CUDA_OK(cudaMalloc(&dinfo, sizeof(int)));
+        CUDA_OK(cudaMemcpy(dpa, &pa, sizeof(void *), cudaMemcpyHostToDevice));
+        BLAS_OK(cublasSgetrfBatched(H, n, (float *const *)dpa, n, dpiv, dinfo, 1));
+        CUDA_OK(cudaMemcpy(&info, dinfo, sizeof(int), cudaMemcpyDeviceToHost));
+        if (zero_col == 0) CHECK(info == 1);
+        else CHECK(info == 3 || info == 0); // exact zero only if the rounding cancels exactly
+        cudaFree(dpa); cudaFree(dpiv); cudaFree(dinfo);
+    }
+    int *dinfo;
+    CUDA_OK(cudaMalloc(&dinfo, sizeof(int)));
+    BLAS_IS(cublasSgetrfBatched(H, -1, nullptr, 1, nullptr, dinfo, 1), CUBLAS_STATUS_INVALID_VALUE);
+    BLAS_IS(cublasSgetrfBatched(H, 4, nullptr, 3, nullptr, dinfo, 1), CUBLAS_STATUS_INVALID_VALUE); // lda < n
+    BLAS_IS(cublasSgetrfBatched(H, 4, nullptr, 4, nullptr, dinfo, -1), CUBLAS_STATUS_INVALID_VALUE);
+    BLAS_OK(cublasSgetrfBatched(H, 4, nullptr, 4, nullptr, dinfo, 0));
+    cudaFree(dinfo);
+}
+
+// ---- Set/Get Matrix and Vector --------------------------------------------
+
+static void test_set_get()
+{
+    int bad = 0;
+    for (int es : {1, 2, 4, 8}) {
+        const int rows = 5, cols = 3, lda = 7, ldb = 6, ldc = 8;
+        std::vector<uint8_t> A(size_t(lda) * cols * es), C(size_t(ldc) * cols * es, 0xEE), dev_seen(size_t(ldb) * cols * es);
+        for (size_t i = 0; i < A.size(); ++i) A[i] = uint8_t(g_rng());
+        uint8_t *dB;
+        CUDA_OK(cudaMalloc(&dB, dev_seen.size()));
+        CUDA_OK(cudaMemset(dB, 0xCD, dev_seen.size()));
+        BLAS_OK(cublasSetMatrix(rows, cols, es, A.data(), lda, dB, ldb));
+        CUDA_OK(cudaMemcpy(dev_seen.data(), dB, dev_seen.size(), cudaMemcpyDeviceToHost));
+        BLAS_OK(cublasGetMatrix(rows, cols, es, dB, ldb, C.data(), ldc));
+        for (int j = 0; j < cols; ++j)
+            for (int i = 0; i < ldc; ++i)
+                for (int b = 0; b < es; ++b) {
+                    const uint8_t in = A[(i + size_t(j) * lda) * es + b];
+                    if (i < ldb) bad += dev_seen[(i + size_t(j) * ldb) * es + b] != (i < rows ? in : 0xCD);
+                    bad += C[(i + size_t(j) * ldc) * es + b] != (i < rows ? in : 0xEE);
+                }
+        // Vectors: n elements at strides incx (host) and incy (device).
+        const int n = 6, incx = 2, incy = 3;
+        std::vector<uint8_t> x(size_t(n) * incx * es), y(size_t(n) * incx * es, 0x11), dy_seen(size_t(n) * incy * es);
+        for (auto &v : x) v = uint8_t(g_rng());
+        uint8_t *dy;
+        CUDA_OK(cudaMalloc(&dy, dy_seen.size()));
+        CUDA_OK(cudaMemset(dy, 0xAB, dy_seen.size()));
+        cudaStream_t st;
+        CUDA_OK(cudaStreamCreate(&st));
+        BLAS_OK(cublasSetVectorAsync(n, es, x.data(), incx, dy, incy, st));
+        CUDA_OK(cudaStreamSynchronize(st));
+        CUDA_OK(cudaMemcpy(dy_seen.data(), dy, dy_seen.size(), cudaMemcpyDeviceToHost));
+        BLAS_OK(cublasGetVector(n, es, dy, incy, y.data(), incx));
+        for (int i = 0; i < n * incy; ++i)
+            for (int b = 0; b < es; ++b)
+                bad += dy_seen[size_t(i) * es + b] != (i % incy == 0 ? x[size_t(i / incy) * incx * es + b] : 0xAB);
+        for (int i = 0; i < n * incx; ++i)
+            for (int b = 0; b < es; ++b)
+                bad += y[size_t(i) * es + b] != (i % incx == 0 ? x[size_t(i) * es + b] : 0x11);
+        // Async matrix copies, then the plain vector set.
+        std::vector<uint8_t> C2(C.size(), 0xEE);
+        BLAS_OK(cublasSetMatrixAsync(rows, cols, es, A.data(), lda, dB, ldb, st));
+        BLAS_OK(cublasGetMatrixAsync(rows, cols, es, dB, ldb, C2.data(), ldc, st));
+        CUDA_OK(cudaStreamSynchronize(st));
+        bad += C2 != C;
+        std::vector<uint8_t> y2(y.size(), 0x11);
+        BLAS_OK(cublasSetVector(n, es, x.data(), incx, dy, incy));
+        BLAS_OK(cublasGetVectorAsync(n, es, dy, incy, y2.data(), incx, st));
+        CUDA_OK(cudaStreamSynchronize(st));
+        bad += y2 != y;
+        cudaStreamDestroy(st);
+        cudaFree(dB); cudaFree(dy);
+    }
+    CHECK(bad == 0);
+    float h[4] = {}, *d;
+    CUDA_OK(cudaMalloc(&d, sizeof h));
+    BLAS_IS(cublasSetMatrix(-1, 1, 4, h, 1, d, 1), CUBLAS_STATUS_INVALID_VALUE);
+    BLAS_IS(cublasSetMatrix(1, 1, 0, h, 1, d, 1), CUBLAS_STATUS_INVALID_VALUE);
+    BLAS_IS(cublasGetMatrix(1, 1, 4, d, 0, h, 1), CUBLAS_STATUS_INVALID_VALUE);
+    BLAS_IS(cublasSetVector(2, 4, h, 0, d, 1), CUBLAS_STATUS_INVALID_VALUE);
+    BLAS_OK(cublasSetMatrix(0, 3, 4, h, 1, d, 1));
+    cudaFree(d);
+}
+
+// ---- 8-bit integer GEMM ---------------------------------------------------
+// cublasGemmEx with A, B CUDA_R_8I, C CUDA_R_32I, CUBLAS_COMPUTE_32I (and the
+// older CUDA_R_32I compute value): int32 alpha and beta, exact int32 sums.
+// Exact comparison with a host reference in int64 (inputs and k keep every
+// value inside int32). Shapes off the tile sizes, the four transposes, beta
+// 0 (C holds garbage and must not be read) and not, alpha 0 (A and B are not
+// needed), padded leading dimensions (the padding must stay untouched),
+// device pointer mode, and a strided batch.
+static void test_gemm_i8()
+{
+    std::mt19937 rng(77);
+    const int shapes[][3] = {{1, 1, 1}, {7, 5, 3}, {64, 64, 16}, {65, 130, 33}, {129, 63, 257}, {200, 17, 1000}, {3, 300, 64}};
+    const char tr[][2] = {{'N', 'N'}, {'T', 'N'}, {'N', 'T'}, {'T', 'T'}};
+    int32_t *dscal = nullptr;
+    CUDA_OK(cudaMalloc(&dscal, 2 * sizeof(int32_t)));
+    long long bad_total = 0, n_total = 0;
+    for (auto &sh : shapes)
+        for (auto &t : tr)
+            for (int variant = 0; variant < 4; ++variant) {
+                const int m = sh[0], n = sh[1], k = sh[2];
+                const bool ta = t[0] == 'T', tb = t[1] == 'T';
+                const int arows = ta ? k : m, acols = ta ? m : k, brows = tb ? n : k, bcols = tb ? k : n;
+                const int lda = arows + 3, ldb = brows + 1, ldc = m + 2;
+                const int32_t alpha = variant == 2 ? 0 : (variant == 3 ? -3 : 2), beta = variant == 0 ? 0 : 5;
+                const int compute = variant == 1 ? (int)CUDA_R_32I : (int)CUBLAS_COMPUTE_32I;
+                std::vector<int8_t> A((size_t)lda * acols), B((size_t)ldb * bcols);
+                std::vector<int32_t> C((size_t)ldc * n), C0;
+                for (auto &v : A) v = (int8_t)((int)(rng() % 256) - 128);
+                for (auto &v : B) v = (int8_t)((int)(rng() % 256) - 128);
+                for (auto &v : C) v = (int32_t)(rng() % 2001) - 1000;
+                if (beta == 0) for (auto &v : C) v = (int32_t)0x7f7f7f7f; // garbage that must not be read
+                C0 = C;
+                int8_t *dA, *dB; int32_t *dC;
+                CUDA_OK(cudaMalloc(&dA, A.size())); CUDA_OK(cudaMalloc(&dB, B.size())); CUDA_OK(cudaMalloc(&dC, C.size() * 4));
+                CUDA_OK(cudaMemcpy(dA, A.data(), A.size(), cudaMemcpyHostToDevice));
+                CUDA_OK(cudaMemcpy(dB, B.data(), B.size(), cudaMemcpyHostToDevice));
+                CUDA_OK(cudaMemcpy(dC, C.data(), C.size() * 4, cudaMemcpyHostToDevice));
+                const bool devmode = (variant == 3);
+                if (devmode) {
+                    int32_t s[2] = {alpha, beta};
+                    CUDA_OK(cudaMemcpy(dscal, s, sizeof s, cudaMemcpyHostToDevice));
+                    BLAS_OK(cublasSetPointerMode(H, CUBLAS_POINTER_MODE_DEVICE));
+                }
+                BLAS_OK(cublasGemmEx(H, ta ? CUBLAS_OP_T : CUBLAS_OP_N, tb ? CUBLAS_OP_T : CUBLAS_OP_N, m, n, k,
+                                     devmode ? (const void *)dscal : (const void *)&alpha, dA, CUDA_R_8I, lda, dB, CUDA_R_8I, ldb,
+                                     devmode ? (const void *)(dscal + 1) : (const void *)&beta, dC, CUDA_R_32I, ldc,
+                                     (cublasComputeType_t)compute, CUBLAS_GEMM_DEFAULT));
+                if (devmode) BLAS_OK(cublasSetPointerMode(H, CUBLAS_POINTER_MODE_HOST));
+                CUDA_OK(cudaMemcpy(C.data(), dC, C.size() * 4, cudaMemcpyDeviceToHost));
+                long long bad = 0;
+                for (int j = 0; j < n; ++j) {
+                    for (int i = 0; i < m; ++i) {
+                        long long s = 0;
+                        for (int p = 0; p < k; ++p) {
+                            int a = ta ? A[(size_t)p + (size_t)i * lda] : A[(size_t)i + (size_t)p * lda];
+                            int b = tb ? B[(size_t)j + (size_t)p * ldb] : B[(size_t)p + (size_t)j * ldb];
+                            s += (long long)a * b;
+                        }
+                        long long want = (long long)alpha * s + (beta ? (long long)beta * C0[(size_t)i + (size_t)j * ldc] : 0);
+                        bad += C[(size_t)i + (size_t)j * ldc] != (int32_t)want;
+                    }
+                    for (int i = m; i < ldc; ++i) bad += C[(size_t)i + (size_t)j * ldc] != C0[(size_t)i + (size_t)j * ldc]; // padding
+                }
+                ++g_checks;
+                n_total += (long long)m * n;
+                if (bad) { ++g_fail; std::printf("FAIL gemm i8 %dx%dx%d %c%c variant %d: %lld wrong\n", m, n, k, t[0], t[1], variant, bad); }
+                bad_total += bad;
+                CUDA_OK(cudaFree(dA)); CUDA_OK(cudaFree(dB)); CUDA_OK(cudaFree(dC));
+            }
+    // a strided batch of 5, B shared (stride 0)
+    {
+        const int m = 33, n = 20, k = 70, batch = 5;
+        const long long sa = (long long)m * k + 11, sc = (long long)m * n + 7;
+        std::vector<int8_t> A((size_t)sa * batch), B((size_t)k * n);
+        std::vector<int32_t> C((size_t)sc * batch, 0);
+        for (auto &v : A) v = (int8_t)((int)(rng() % 256) - 128);
+        for (auto &v : B) v = (int8_t)((int)(rng() % 256) - 128);
+        int8_t *dA, *dB; int32_t *dC;
+        CUDA_OK(cudaMalloc(&dA, A.size())); CUDA_OK(cudaMalloc(&dB, B.size())); CUDA_OK(cudaMalloc(&dC, C.size() * 4));
+        CUDA_OK(cudaMemcpy(dA, A.data(), A.size(), cudaMemcpyHostToDevice));
+        CUDA_OK(cudaMemcpy(dB, B.data(), B.size(), cudaMemcpyHostToDevice));
+        CUDA_OK(cudaMemcpy(dC, C.data(), C.size() * 4, cudaMemcpyHostToDevice));
+        const int32_t one = 1, zero = 0;
+        BLAS_OK(cublasGemmStridedBatchedEx(H, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k, &one, dA, CUDA_R_8I, m, sa, dB, CUDA_R_8I, k, 0,
+                                           &zero, dC, CUDA_R_32I, m, sc, batch, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
+        CUDA_OK(cudaMemcpy(C.data(), dC, C.size() * 4, cudaMemcpyDeviceToHost));
+        long long bad = 0;
+        for (int q = 0; q < batch; ++q)
+            for (int j = 0; j < n; ++j)
+                for (int i = 0; i < m; ++i) {
+                    long long s = 0;
+                    for (int p = 0; p < k; ++p) s += (long long)A[(size_t)q * sa + i + (size_t)p * m] * B[(size_t)p + (size_t)j * k];
+                    bad += C[(size_t)q * sc + i + (size_t)j * m] != (int32_t)s;
+                }
+        ++g_checks;
+        if (bad) { ++g_fail; std::printf("FAIL gemm i8 strided batch: %lld wrong\n", bad); }
+        CUDA_OK(cudaFree(dA)); CUDA_OK(cudaFree(dB)); CUDA_OK(cudaFree(dC));
+    }
+    CUDA_OK(cudaFree(dscal));
+    std::printf("gemm i8: %lld results exact checks, %lld wrong\n", n_total, bad_total);
+}
+
 int main()
 {
     BLAS_OK(cublasCreate(&H));
     test_api_rules();
+    test_gemm_i8();
     test_sgemm_dgemm_hgemm();
     test_gemm_ex();
     test_batched();
@@ -836,6 +1216,9 @@ int main()
     test_streams();
     test_level1_2();
     test_trsm_batched();
+    test_geam();
+    test_getrf_batched();
+    test_set_get();
     BLAS_OK(cublasDestroy(H));
 
     std::printf("per group: elements checked, failures, worst error / bound\n");

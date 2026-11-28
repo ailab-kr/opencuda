@@ -356,6 +356,35 @@ def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
                 [cxx, f"-std={std}", "-x", "c++-cpp-output", *codegen, *host,
                  "-c", str(rewritten), "-o", str(out)]]
     clang = _llvm_tool("clang++")
+    if args.target == "spirv":
+        # Whole program, device code compiled to SPIR-V (compiler/spirv/cu2spv.py:
+        # Clang in HIP mode for spirv64, LLVM's SPIR-V back end), run by the OpenCL
+        # backend. The host object is the OpenCL path's.
+        path = pinned_cuda_path(work.parent if args.cache is None else Path(args.cache))
+        dev_arch = args.arch or "sm_80"
+        cuda = [clang, "-x", "cuda", f"-std={std}", "-nocudainc", "-nocudalib",
+                f"--cuda-path={path}", f"--cuda-gpu-arch={dev_arch}", *ours,
+                "-D__CUDACC__", "-DOCU_OPENCL_HOST_PASS=1", "-include", str(dirs[0] / "cuda_runtime.h"),
+                "-Wno-unknown-cuda-version", *FP_CONTRACT]
+        img = work / (src.stem + ".spvimg")
+        fat = work / (src.stem + ".ocufat")
+        copy = normalized_copies(src, work / "src")
+        dev_src = src
+        if copy is not None:
+            cuda += ["-iquote", str(src.parent), "-I", str(src.parent)]
+            src = copy
+        flags = [f"-I{i}" for i in args.I] + [f"-D{d}" for d in args.D]
+        for i, p in enumerate(pre):
+            if p.startswith(("-I", "-D")) and len(p) > 2:
+                flags.append(p)
+            elif p in ("-I", "-D", "-isystem", "-iquote") and i + 1 < len(pre):
+                flags.append(("-I" if p != "-D" else "-D") + pre[i + 1])
+        flags += [f"-I{d}" for d in dirs[1:]]
+        return [[sys.executable, str(REPO / "compiler" / "spirv" / "cu2spv.py"), "--arch", dev_arch,
+                 *flags, str(dev_src), "-o", str(img)],
+                ["<container>", str(fat), "opencl", str(img)],
+                [*cuda, "-fPIC", "--cuda-host-only", "-Xclang", "-fcuda-include-gpubinary",
+                 "-Xclang", str(fat), *common, *host, *deps, "-c", str(src), "-o", str(out)]]
     if args.target == "opencl":
         # Whole program: device code translated by compiler/opencl/cu2ocl.py
         # (C++ for OpenCL source, plus SPIR-V when llvm-spirv is there) in
@@ -364,9 +393,12 @@ def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
         # (reported on stderr); launching one fails at run time. A file
         # without kernels gets an image without code.
         path = pinned_cuda_path(work.parent if args.cache is None else Path(args.cache))
+        # The architecture the build asked for (-arch / CMAKE_CUDA_ARCHITECTURES)
+        # picks the program's code paths in both passes; sm_80 when none.
+        dev_arch = args.arch or "sm_80"
         cuda = [clang, "-x", "cuda", f"-std={std}", "-nocudainc", "-nocudalib",
-                f"--cuda-path={path}", "--cuda-gpu-arch=sm_80", *ours,
-                "-D__CUDACC__", "-include", str(dirs[0] / "cuda_runtime.h"),
+                f"--cuda-path={path}", f"--cuda-gpu-arch={dev_arch}", *ours,
+                "-D__CUDACC__", "-DOCU_OPENCL_HOST_PASS=1", "-include", str(dirs[0] / "cuda_runtime.h"),
                 "-Wno-unknown-cuda-version", *FP_CONTRACT]
         img = work / (src.stem + ".oclimg")
         fat = work / (src.stem + ".ocufat")
@@ -376,12 +408,18 @@ def build_commands(args, src: Path, out: Path, work: Path) -> list[list[str]]:
             cuda += ["-iquote", str(src.parent), "-I", str(src.parent)]
             src = copy
         flags = [f"-I{i}" for i in args.I] + [f"-D{d}" for d in args.D]
-        flags += [p for p in pre if (p.startswith("-I") or p.startswith("-D")) and len(p) > 2]
-        return [["env", "OCU_CU2OCL_EMPTY_OK=1", sys.executable,
+        for i, p in enumerate(pre):
+            if p.startswith(("-I", "-D")) and len(p) > 2:
+                flags.append(p)
+            elif p in ("-I", "-D", "-isystem", "-iquote") and i + 1 < len(pre):
+                flags.append(("-I" if p != "-D" else "-D") + pre[i + 1])
+        # the toolkit's library headers (cublas_v2.h ...) for the device pass too
+        flags += [f"-I{d}" for d in dirs[1:]]
+        return [["env", "OCU_CU2OCL_EMPTY_OK=1", f"OCU_CU_DEVICE_ARCH={dev_arch}", sys.executable,
                  str(REPO / "compiler" / "opencl" / "cu2ocl.py"), "--clang", clang, "--keep-going",
                  *flags, str(dev_src), "-o", str(img)],
                 ["<container>", str(fat), "opencl", str(img)],
-                [*cuda, "--cuda-host-only", "-Xclang", "-fcuda-include-gpubinary",
+                [*cuda, "-fPIC", "--cuda-host-only", "-Xclang", "-fcuda-include-gpubinary",
                  "-Xclang", str(fat), *common, *host, *deps, "-c", str(src), "-o", str(out)]]
     if args.target == "nvidia" and not str(out).endswith(".ptx"):
         # Whole program: device code as PTX in our container, embedded in
@@ -482,7 +520,7 @@ def run_commands(commands, env, label: str, print_only: bool = False,
 
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="ocu_cc.py", add_help=True)
-    ap.add_argument("--target", choices=("cpu", "nvidia", "amd", "opencl"), required=True)
+    ap.add_argument("--target", choices=("cpu", "nvidia", "amd", "opencl", "spirv"), required=True)
     ap.add_argument("--arch")
     ap.add_argument("-c", dest="source", required=True)
     ap.add_argument("-o", dest="output", required=True)

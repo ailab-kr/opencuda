@@ -93,7 +93,9 @@ typedef enum ocu_op {
     OCU_OP_RMS_NORM = 4, /* x, [w,] y: per row */
     OCU_OP_SOFTMAX  = 5, /* x, y:      per row, of scale * x */
     OCU_OP_ROPE     = 6, /* x, pos, y: rotary embedding (optional in v1) */
-    OCU_OP_QMATMUL  = 7  /* reserved */
+    OCU_OP_QMATMUL  = 7  /* A, W, absmax, C: C = A dequant(W)^T + beta C, W in bitsandbytes'
+                            NF4 (block 64); A bf16 [M,K], W I8 [N,K/2], absmax F32 [N,K/64],
+                            C F32 [M,N]; p.gemm.beta (optional in v1) */
 } ocu_op;
 
 #define OCU_OP_COUNT 8u /* op values are below this */
@@ -102,6 +104,10 @@ typedef enum ocu_op {
  * GEMM, shape[0] of a row or element-wise output) is the largest; execute
  * may pass fewer rows. */
 #define OCU_OP_FLAG_VAR_ROWS 0x1u
+/* PTR_ARRAY (GEMM): each tensor's data is a device array of shape[0]
+ * pointers, one matrix per batch entry (cublas*Batched); stride[0] is
+ * ignored. A backend that does not take it refuses the descriptor. */
+#define OCU_OP_FLAG_PTR_ARRAY 0x2u
 
 typedef struct ocu_op_desc {
     uint32_t        struct_size; /* sizeof(ocu_op_desc) of the caller */

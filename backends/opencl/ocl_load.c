@@ -67,6 +67,9 @@ static void load_once(void)
     CL_SYM(ReleaseEvent);
 #undef CL_SYM
     *(void **)&a.CreateProgramWithIL = dlsym(lib, "clCreateProgramWithIL");
+    *(void **)&a.GetExtensionFunctionAddressForPlatform = dlsym(lib, "clGetExtensionFunctionAddressForPlatform");
+    *(void **)&a.SetEventCallback = dlsym(lib, "clSetEventCallback");
+    *(void **)&a.EnqueueSVMFree = dlsym(lib, "clEnqueueSVMFree");
     if (!ok) {
         dlclose(lib);
         return;

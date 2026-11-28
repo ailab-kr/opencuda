@@ -183,12 +183,39 @@ cublasStatus_t cublasSdot_v2(cublasHandle_t handle, int n, const float *x, int i
                              const float *y, int incy, float *result);
 cublasStatus_t cublasSnrm2_v2(cublasHandle_t handle, int n, const float *x, int incx,
                               float *result);
+cublasStatus_t cublasDaxpy_v2(cublasHandle_t handle, int n, const double *alpha, const double *x, int incx, double *y,
+                              int incy);
+cublasStatus_t cublasDscal_v2(cublasHandle_t handle, int n, const double *alpha, double *x, int incx);
+cublasStatus_t cublasDdot_v2(cublasHandle_t handle, int n, const double *x, int incx, const double *y, int incy,
+                             double *result);
+cublasStatus_t cublasDnrm2_v2(cublasHandle_t handle, int n, const double *x, int incx, double *result);
+cublasStatus_t cublasScopy_v2(cublasHandle_t handle, int n, const float *x, int incx, float *y, int incy);
+cublasStatus_t cublasDcopy_v2(cublasHandle_t handle, int n, const double *x, int incx, double *y, int incy);
+cublasStatus_t cublasSswap_v2(cublasHandle_t handle, int n, float *x, int incx, float *y, int incy);
+cublasStatus_t cublasDswap_v2(cublasHandle_t handle, int n, double *x, int incx, double *y, int incy);
+cublasStatus_t cublasSasum_v2(cublasHandle_t handle, int n, const float *x, int incx, float *result);
+cublasStatus_t cublasDasum_v2(cublasHandle_t handle, int n, const double *x, int incx, double *result);
+cublasStatus_t cublasIsamax_v2(cublasHandle_t handle, int n, const float *x, int incx, int *result);
+cublasStatus_t cublasIdamax_v2(cublasHandle_t handle, int n, const double *x, int incx, int *result);
+cublasStatus_t cublasIsamin_v2(cublasHandle_t handle, int n, const float *x, int incx, int *result);
+cublasStatus_t cublasIdamin_v2(cublasHandle_t handle, int n, const double *x, int incx, int *result);
+/* x and y of one type (16F, 16BF, 32F, 64F), summed in executionType (32F;
+   64F for 64F data), the result of x's type or 32F */
+cublasStatus_t cublasDotEx(cublasHandle_t handle, int n, const void *x, cudaDataType xType, int incx, const void *y,
+                           cudaDataType yType, int incy, void *result, cudaDataType resultType,
+                           cudaDataType executionType);
+cublasStatus_t cublasDotcEx(cublasHandle_t handle, int n, const void *x, cudaDataType xType, int incx, const void *y,
+                            cudaDataType yType, int incy, void *result, cudaDataType resultType,
+                            cudaDataType executionType);
 
 /* ---- level 2 ------------------------------------------------------------ */
 
 cublasStatus_t cublasSgemv_v2(cublasHandle_t handle, cublasOperation_t trans, int m, int n,
                               const float *alpha, const float *A, int lda, const float *x,
                               int incx, const float *beta, float *y, int incy);
+cublasStatus_t cublasDgemv_v2(cublasHandle_t handle, cublasOperation_t trans, int m, int n, const double *alpha,
+                              const double *A, int lda, const double *x, int incx, const double *beta, double *y,
+                              int incy);
 
 /* ---- level 3 ------------------------------------------------------------ */
 
@@ -232,6 +259,41 @@ cublasStatus_t cublasStrsmBatched(cublasHandle_t handle, cublasSideMode_t side,
                                   cublasDiagType_t diag, int m, int n, const float *alpha,
                                   const float *const A[], int lda, float *const B[], int ldb,
                                   int batchCount);
+
+/* ---- BLAS-like extensions and LAPACK-like functions --------------------- */
+
+cublasStatus_t cublasSgeam(cublasHandle_t handle, cublasOperation_t transa,
+                           cublasOperation_t transb, int m, int n, const float *alpha,
+                           const float *A, int lda, const float *beta, const float *B, int ldb,
+                           float *C, int ldc);
+cublasStatus_t cublasDgeam(cublasHandle_t handle, cublasOperation_t transa,
+                           cublasOperation_t transb, int m, int n, const double *alpha,
+                           const double *A, int lda, const double *beta, const double *B,
+                           int ldb, double *C, int ldc);
+/* LU with partial pivoting (unblocked, one thread block per matrix): for
+   the small matrices batched calls are made for. */
+cublasStatus_t cublasSgetrfBatched(cublasHandle_t handle, int n, float *const A[], int lda,
+                                   int *P, int *info, int batchSize);
+
+/* ---- host <-> device copies (no handle) --------------------------------- */
+
+cublasStatus_t cublasSetMatrix(int rows, int cols, int elemSize, const void *A, int lda,
+                               void *B, int ldb);
+cublasStatus_t cublasGetMatrix(int rows, int cols, int elemSize, const void *A, int lda,
+                               void *B, int ldb);
+cublasStatus_t cublasSetMatrixAsync(int rows, int cols, int elemSize, const void *A, int lda,
+                                    void *B, int ldb, cudaStream_t stream);
+cublasStatus_t cublasGetMatrixAsync(int rows, int cols, int elemSize, const void *A, int lda,
+                                    void *B, int ldb, cudaStream_t stream);
+cublasStatus_t cublasSetVector(int n, int elemSize, const void *x, int incx, void *y,
+                               int incy);
+cublasStatus_t cublasGetVector(int n, int elemSize, const void *x, int incx, void *y,
+                               int incy);
+cublasStatus_t cublasSetVectorAsync(int n, int elemSize, const void *x, int incx, void *y,
+                                    int incy, cudaStream_t stream);
+cublasStatus_t cublasGetVectorAsync(int n, int elemSize, const void *x, int incx, void *y,
+                                    int incy, cudaStream_t stream);
+
 
 #ifdef __cplusplus
 cublasStatus_t cublasHgemm(cublasHandle_t handle, cublasOperation_t transa,
@@ -285,6 +347,36 @@ cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t handle, cublasOperation
                                           cublasGemmAlgo_t algo);
 
 #ifdef __cplusplus
+}
+
+/* C++: the older calls that pass a cudaDataType_t as the compute type. */
+static inline cublasStatus_t cublasGemmEx(cublasHandle_t handle, cublasOperation_t transa, cublasOperation_t transb, int m,
+                                          int n, int k, const void *alpha, const void *A, cudaDataType_t Atype, int lda,
+                                          const void *B, cudaDataType_t Btype, int ldb, const void *beta, void *C,
+                                          cudaDataType_t Ctype, int ldc, cudaDataType_t computeType, cublasGemmAlgo_t algo)
+{
+    return cublasGemmEx(handle, transa, transb, m, n, k, alpha, A, Atype, lda, B, Btype, ldb, beta, C, Ctype, ldc,
+                        (cublasComputeType_t)computeType, algo);
+}
+static inline cublasStatus_t cublasGemmBatchedEx(cublasHandle_t handle, cublasOperation_t transa, cublasOperation_t transb,
+                                                 int m, int n, int k, const void *alpha, const void *const Aarray[],
+                                                 cudaDataType_t Atype, int lda, const void *const Barray[], cudaDataType_t Btype,
+                                                 int ldb, const void *beta, void *const Carray[], cudaDataType_t Ctype, int ldc,
+                                                 int batchCount, cudaDataType_t computeType, cublasGemmAlgo_t algo)
+{
+    return cublasGemmBatchedEx(handle, transa, transb, m, n, k, alpha, Aarray, Atype, lda, Barray, Btype, ldb, beta, Carray,
+                               Ctype, ldc, batchCount, (cublasComputeType_t)computeType, algo);
+}
+static inline cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t handle, cublasOperation_t transa,
+                                                        cublasOperation_t transb, int m, int n, int k, const void *alpha,
+                                                        const void *A, cudaDataType_t Atype, int lda, long long int strideA,
+                                                        const void *B, cudaDataType_t Btype, int ldb, long long int strideB,
+                                                        const void *beta, void *C, cudaDataType_t Ctype, int ldc,
+                                                        long long int strideC, int batchCount, cudaDataType_t computeType,
+                                                        cublasGemmAlgo_t algo)
+{
+    return cublasGemmStridedBatchedEx(handle, transa, transb, m, n, k, alpha, A, Atype, lda, strideA, B, Btype, ldb, strideB,
+                                      beta, C, Ctype, ldc, strideC, batchCount, (cublasComputeType_t)computeType, algo);
 }
 #endif
 

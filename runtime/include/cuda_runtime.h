@@ -17,10 +17,33 @@
 
 #if defined(OCU_CPU_PATH)
 #include "ocu_cuda_lang_cpu.h"
+#elif defined(OCU_SPIRV_PATH)
+#include "ocu_cuda_lang_spirv.h"
 #elif defined(__CUDA__) && !defined(__HIP__)
 #include "ocu_cuda_lang_nvptx.h"
 #elif defined(__HIP__)
 #include "ocu_cuda_lang_amdgcn.h"
+#endif
+#if defined(OCU_CPU_PATH) || defined(OCU_SPIRV_PATH) || defined(__CUDA__) || defined(__HIP__)
+#define OCU_CUDA_LANG_READY 1 /* the path's device language (atomicCAS ...) is declared */
+#endif
+
+/* nvcc defines __NVCC__ (with __CUDACC__) in every pass of a CUDA compile;
+   programs gate __host__ / __device__ on it. ocu-nvcc force-includes this
+   header in each such pass; a plain host compile has no __CUDACC__. */
+#if defined(__CUDACC__) && !defined(__NVCC__) && !defined(OCU_NO_NVCC_MACRO)
+#define __NVCC__ 1
+#endif
+
+/* Programs that build with nvcc call assert() (also in device code) and,
+   in C++, use std::chrono without including <assert.h> or <chrono>
+   themselves (HeCBench moe-align-cuda; ccsd-trpdrv-cuda, nonzero-cuda): a
+   CUDA compile makes them available. */
+#if defined(__CUDACC__)
+#include <assert.h>
+#if defined(__cplusplus)
+#include <chrono>
+#endif
 #endif
 
 /*
@@ -51,6 +74,17 @@ inline cudaError_t launch(const cudaLaunchConfig_t *config, void (*kernel)(P...)
 }
 } // namespace ocu_launch_ex_
 
+#if defined(OCU_SPIRV_PATH) && defined(__HIP_DEVICE_COMPILE__)
+/* The SPIR-V device pass (Clang in HIP mode for spirv64) gives kernels a
+   calling convention in their type, so `void (*)(P...)` does not match a
+   kernel there; host code is parsed in that pass but never generated, so
+   any kernel is accepted (the host pass has the real function above). */
+template <typename F, typename... ActTypes>
+static inline cudaError_t cudaLaunchKernelEx(const cudaLaunchConfig_t *, F, ActTypes &&...)
+{
+    return cudaSuccess;
+}
+#else
 template <typename... ExpTypes, typename... ActTypes>
 static inline cudaError_t cudaLaunchKernelEx(const cudaLaunchConfig_t *config,
                                              void (*kernel)(ExpTypes...), ActTypes &&...args)
@@ -66,5 +100,18 @@ static inline cudaError_t cudaLaunchKernelEx(const cudaLaunchConfig_t *config,
     return ocu_rt_launch_config_done(config);
 }
 #endif
+#endif
 
+/* OpenCL path (compiler/opencl): device code may call assert(); the C
+   library's expansion calls the host function __assert_fail, so both Clang
+   passes get a device-side declaration (the generated OpenCL source checks
+   assert() with its prelude's macro). */
+#if defined(__cplusplus) && defined(__CUDA__) && (defined(OCU_OPENCL_PATH) || defined(OCU_OPENCL_HOST_PASS) || defined(OCU_SPIRV_PATH)) && \
+    !defined(OCU_OPENCL_ASSERT_DECL)
+#define OCU_OPENCL_ASSERT_DECL 1
+__device__ static inline void __assert_fail(const char *, const char *, unsigned int, const char *) {}
+#endif
+
+/* atomicAdd for __half / __nv_bfloat16 when cuda_fp16.h / cuda_bf16.h came first */
+#include "ocu_half_atomics.h"
 #endif /* OCU_CUDA_RUNTIME_H */

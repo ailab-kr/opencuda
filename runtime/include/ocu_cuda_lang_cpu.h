@@ -499,6 +499,18 @@ inline unsigned __brev(unsigned v)
     return r;
 }
 inline int __mul24(int a, int b) { return a * b; }
+/* Byte-wise dot product with accumulate (sm_61), wrapping like the hardware. */
+inline int __dp4a(int a, int b, int c)
+{
+    unsigned r = (unsigned)c;
+    for (int i = 0; i < 32; i += 8) r += (unsigned)((int)(signed char)(a >> i) * (int)(signed char)(b >> i));
+    return (int)r;
+}
+inline unsigned __dp4a(unsigned a, unsigned b, unsigned c)
+{
+    for (int i = 0; i < 32; i += 8) c += ((a >> i) & 255u) * ((b >> i) & 255u);
+    return c;
+}
 inline unsigned __umul24(unsigned a, unsigned b) { return a * b; }
 
 /* ---- device intrinsics shared with the NVPTX path ---------------------------- */
@@ -733,5 +745,12 @@ inline unsigned __activemask()
     return have == 32u ? 0xffffffffu : ((1u << have) - 1u);
 }
 inline void __syncwarp(unsigned m = 0xffffffffu) { ocu_cpu_warp_sync_masked(m); }
+
+/* CUDA's own math functions the C library lacks (ocu_cuda_math_ext.h) */
+#define OCU_MX_Q inline
+#define OCU_MX_HAS_FSUB_RN 1
+#define OCU_MX_HAS_FMAF_RM 1
+#define OCU_MX_NEED_DSQRT_RN 1
+#include "ocu_cuda_math_ext.h"
 
 #endif /* OCU_CUDA_LANG_CPU_H */

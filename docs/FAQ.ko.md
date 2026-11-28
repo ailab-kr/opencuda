@@ -97,7 +97,7 @@ AMD·Intel GPU와 NPU 실기기에서 실제 프로그램을 돌려 낸 수치�
 |---|---|
 | CUDA 그래프 | 스트림 캡처가 "지원 안 함"을 돌려준다 |
 | 텍스처: 하드웨어 텍스처 장치, 밉맵 배열, sRGB, 큐브맵·gather 페치; 서피스 | 텍스처 객체, CUDA 배열, (CPU 경로) 옛 텍스처 참조는 소프트웨어 표본 추출로 동작(카드 `runtime-texture`). 밉맵·sRGB·형식을 바꾸는 보기는 "지원 안 함", 큐브맵·gather 페치와 서피스 API는 선언하지 않음. 엔비디아 경로에서 텍스처 참조는 빌드가 멈추고, Metal 번역기는 텍스처 커널을 커널 단위로 알린다 |
-| cuBLASLt 행렬곱 | 헤더는 있으나 `cublasLtMatmul`은 "지원 안 함" |
+| cuBLASLt 행렬곱 | GEMM 커널 위의 `cublasLtMatmul`: FP32/FP64/FP16/BF16/int8, 열·행 우선, 배치, bias/ReLU/GELU 에필로그. FP8과 기울기 에필로그는 "지원 안 함" |
 | cuDNN, cuFFT, cuRAND, cuSPARSE, NCCL | 없음 |
 | 인라인 PTX 어셈블리 | NVIDIA 경로에서는 그대로 통과한다. 다른 경로는 C++ 대체 코드가 있어야 하고, 없으면 그 커널을 지원 안 함으로 알린다 |
 | Thrust | 아직 없음. 그 바탕이 될 CUB 부분집합은 있다 |

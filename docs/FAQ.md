@@ -97,7 +97,7 @@ The headers declare API level 12.3. llama.cpp builds with its default settings (
 |---|---|
 | CUDA graphs | stream capture returns "not supported" |
 | Textures: hardware texture units, mipmapped arrays, sRGB, cubemap and gather fetches; surfaces | texture objects, CUDA arrays and (CPU path) legacy texture references work, sampled in software (card `runtime-texture`). Mipmaps, sRGB and format-changing views return "not supported"; cubemap and gather fetches and the surface API are not declared. On the NVIDIA path texture references stop the build; the Metal translator reports texture kernels per kernel |
-| cuBLASLt matmul | headers exist, `cublasLtMatmul` returns "not supported" |
+| cuBLASLt matmul | `cublasLtMatmul` on the GEMM kernels: FP32/FP64/FP16/BF16/int8, column- or row-major, batches, bias/ReLU/GELU epilogues; FP8 and the gradient epilogues return "not supported" |
 | cuDNN, cuFFT, cuRAND, cuSPARSE, NCCL | not provided |
 | Inline PTX assembly | passes through on the NVIDIA path; other paths need a C++ equivalent or report the kernel as unsupported |
 | Thrust | not provided yet; the CUB subset it would build on exists |

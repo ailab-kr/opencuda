@@ -25,8 +25,9 @@ llama.cpp의 CUDA 백엔드가 요구하는 이름 중 우리 헤더와 실행 A
 
 - `cuda_bf16.h`: `__nv_bfloat16`/`nv_bfloat16`, `__nv_bfloat162`/`nv_bfloat162`(정렬 4). float에서 가장 가까운 짝수로, float로는 정확히. `_rz`·`_rd`·`_ru` 변환, double에서는 두 번 반올림하지 않음(홀수 반올림을 거쳐서). 사칙·fma(float에서 계산해 한 번 반올림, 24 ≥ 2·8+2이므로 정확한 반올림과 같음), 순서·비순서 비교, 연산자, 수학 함수, 쌍 연산, `make_bfloat162`, `__float22bfloat162_rn`, `__bfloat1622float2`, `__low2bfloat16`, `__high2bfloat16`.
 - `library_types.h`(`cuda_runtime_api.h`가 포함): `cudaDataType_t`/`cudaDataType`과 문서의 `CUDA_R_*`/`CUDA_C_*` 값(`CUDA_R_32F`=0, `CUDA_R_16F`=2, `CUDA_R_16BF`=14, `CUDA_R_8F_E4M3`=28 등).
-- 장치 속성 정책(`cudaGetDeviceProperties`): 계산 능력 5.0(환경변수 `OCU_COMPUTE_CAPABILITY=M.m`으로 바꿀 수 있음), `warpSize`는 백엔드 값, `sharedMemPerBlockOptin`은 CPU·엔비디아에서 48 KiB 이상, `cudaFuncGetAttributes().ptxVersion` = 10·major+minor(< 90), PCI 번호는 합성값(아래).
+- 장치 속성 정책(`cudaGetDeviceProperties`): 계산 능력 5.0(환경변수 `OCU_COMPUTE_CAPABILITY=M.m`으로 바꿀 수 있음), `warpSize`는 백엔드 값, `sharedMemPerBlockOptin`은 CPU·엔비디아에서 48 KiB 이상, `cudaFuncGetAttributes().ptxVersion` = 10·major+minor(< 90), PCI 번호는 합성값(아래). `multiProcessorCount`는 백엔드가 아는 블록 실행 단위 수(엔비디아 SM, Intel GPU는 Xe 코어 = 슬라이스 × 슬라이스당 서브슬라이스), 모르면 1. 환경변수 `OCU_MULTIPROCESSOR_COUNT=N`(N ≥ 1)으로 바꿀 수 있음. llama.cpp는 이 값으로 FlashAttention의 KV 분할과 stream-k 그리드 크기를 정한다.
 - 속성 열거: `cudaDevAttrCooperativeLaunch`(95)와 `cudaDevAttrCooperativeMultiDeviceLaunch`(96)는 늘 0. `cudaDevAttrPciBusId`(33)·`PciDeviceId`(34)·`PciDomainId`(50)는 속성 구조체와 같은 값.
+- SIMD 내장 함수 전부(2026-11-27): 반워드·바이트 단위 abs·absdiff·add·sub(감김·포화)·평균·cmp·set·max·min·neg·sad, 32비트·16x2의 `__vimax3_*`·`__vimin3_*`·`__viaddmax_*`·`__viaddmin_*`·`__vibmax_*`·`__vibmin_*`·`_relu`. 문서가 정하지 않은 곳은 이렇게 읽었다: 포화는 레인의 표현 범위, `__vsads`/`__vsadu`는 레인별 |a-b|의 합 하나, 16x2 술어는 pred_hi가 위쪽 반워드, add-then-max/min의 a+b는 레인 안에서 감김. 시험은 `tests/runtime/rt_simd.cu`.
 - 장치 쪽 내장 함수(CPU 경로·NVPTX 경로 모두): `__vsub4`, `__vcmpne4`, `__isnanf`, `__isinff`, `__ldg`(템플릿, 평범한 읽기). `make_half2`는 `cuda_fp16.h`. 공통 정의는 `ocu_cuda_lang_common.h`.
 - CPU 경로에 추가(NVPTX에는 이미 있었음): `__byte_perm`, `__umulhi`, `__mulhi`, `__float2int_{rn,rz,rd,ru}`, `__double2int_{rn,rz,rd,ru}`, `__syncthreads_{count,and,or}`, `__trap`.
 - `__trap`: CPU 경로에서는 stdout·stderr를 비우고 스레드 위치가 든 메시지를 찍은 뒤 `abort()`. 두 경로 모두 `[[noreturn]]`.
@@ -60,7 +61,7 @@ llama.cpp의 CUDA 백엔드가 요구하는 이름 중 우리 헤더와 실행 A
 10. `CUDA_R_32F=0, CUDA_R_64F=1, CUDA_R_16F=2, CUDA_R_8I=3, CUDA_C_32F=4, CUDA_R_16BF=14, CUDA_R_8F_E4M3=28, CUDA_R_8F_E5M2=29` 등 문서의 모든 값. `cudaDataType_t`와 `cudaDataType`이 같은 형. C와 C++ 양쪽에서 포함됨.
 
 ### 장치 속성 정책 (조사 문서 6.3)
-11. 기본 `major.minor` = 5.0, `warpSize` = 32, `sharedMemPerBlockOptin` ≥ 48 KiB(CPU·NVIDIA), `multiProcessorCount` > 0, `cudaFuncGetAttributes().ptxVersion` < 90. `OCU_COMPUTE_CAPABILITY=8.0`이면 8.0, 잘못된 값("x", "50")은 무시하고 5.0. `cudaDeviceGetAttribute`의 계산 능력 값이 속성 구조체와 같음.
+11. 기본 `major.minor` = 5.0, `warpSize` = 32, `sharedMemPerBlockOptin` ≥ 48 KiB(CPU·NVIDIA), `multiProcessorCount` > 0, `cudaFuncGetAttributes().ptxVersion` < 90. `OCU_COMPUTE_CAPABILITY=8.0`이면 8.0, 잘못된 값("x", "50")은 무시하고 5.0. `cudaDeviceGetAttribute`의 계산 능력 값이 속성 구조체와 같음. `OCU_MULTIPROCESSOR_COUNT=7`이면 `multiProcessorCount`와 `cudaDevAttrMultiProcessorCount`가 7, 잘못된 값("0", "-3", "x", "")은 무시(`tests/runtime/rt_mp_count.cu`).
 12. `cudaDeviceGetAttribute(cudaDevAttrCooperativeLaunch)`와 `...MultiDeviceLaunch`는 0, 잘못된 장치 번호는 `cudaErrorInvalidDevice`. PCI 속성 3개가 구조체의 `pciBusID`·`pciDeviceID`·`pciDomainID`와 같음.
 
 ### 실행 API (CUDA Runtime API, Device Management)

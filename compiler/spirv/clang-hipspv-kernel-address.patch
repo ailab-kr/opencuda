@@ -1,0 +1,109 @@
+From 4414b74daa974082bdcec5cd3126faf4f7fb6070 Mon Sep 17 00:00:00 2001
+From: bruce <unamedkr@gmail.com>
+Date: Fri, 27 Nov 2026 21:45:57 +0900
+Subject: [PATCH] [clang][HIP] Set the kernel CC of HIPSPV kernels in CodeGen,
+ not in the type
+
+When HIP is compiled for SPIR-V other than AMDGCN-flavoured SPIR-V (HIPSPV,
+e.g. --offload=spirv64), Sema gives every __global__ function the
+device_kernel calling convention in its declared type. Host code in the
+device-side compilation then cannot convert a kernel to an ordinary
+function pointer:
+
+  typedef void (*kernel_ptr)(float *);
+  __global__ void k(float *d) { *d = 1; }
+  void host() { kernel_ptr p = k; }
+  // error: cannot initialize a variable of type 'kernel_ptr' with an lvalue
+  // of type 'void (float *) __attribute__((device_kernel))'
+
+(with a kernel template, "incompatible type '<overloaded function type>'").
+llama.cpp's FlashAttention dispatch stores the chosen kernel in such a
+pointer, so none of its FlashAttention kernels build for HIPSPV. #110447
+dropped the same convention from the type for AMDGCN-flavoured SPIR-V
+because it breaks overload resolution; HIPSPV still had it.
+
+CodeGen already applies the kernel convention to HIP kernels on SPIR-V
+(SPIRVTargetCodeGenInfo::setCUDAKernelCallingConvention, and its CIR
+counterpart), as it does on AMDGPU, so the Sema rule is now limited to CUDA
+compiled to SPIR-V (CodeGenCUDASPIRV/kernel-cc.cu relies on it). HIP kernels
+are still emitted as spir_kernel.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TraZ37D76NnXSnpSN7QrSA
+---
+ clang/lib/Sema/SemaType.cpp                   | 12 ++++--
+ .../test/CodeGenHIP/hipspv-kernel-address.cpp | 38 +++++++++++++++++++
+ 2 files changed, 46 insertions(+), 4 deletions(-)
+ create mode 100644 clang/test/CodeGenHIP/hipspv-kernel-address.cpp
+
+diff --git a/clang/lib/Sema/SemaType.cpp b/clang/lib/Sema/SemaType.cpp
+index 0e49975..1a2c040 100644
+--- a/clang/lib/Sema/SemaType.cpp
++++ b/clang/lib/Sema/SemaType.cpp
+@@ -3894,11 +3894,15 @@ static CallingConv getCCForDeclaratorChunk(
+   CallingConv CC = S.Context.getDefaultCallingConvention(FTI.isVariadic,
+                                                          IsCXXInstanceMethod);
+ 
+-  if (S.getLangOpts().CUDA) {
+-    // If we're compiling CUDA/HIP code and targeting HIPSPV we need to make
+-    // sure the kernels will be marked with the right calling convention so that
++  if (S.getLangOpts().CUDA && !S.getLangOpts().HIP) {
++    // If we're compiling CUDA code and targeting SPIR-V we need to make sure
++    // the kernels will be marked with the right calling convention so that
+     // they will be visible by the APIs that ingest SPIR-V. We do not do this
+-    // when targeting AMDGCNSPIRV, as it does not rely on OpenCL.
++    // when targeting AMDGCNSPIRV, as it does not rely on OpenCL. HIP kernels
++    // get the kernel calling convention in CodeGen instead
++    // (setCUDAKernelCallingConvention), as on AMDGPU: in the declared type it
++    // would keep host code from converting a kernel to an ordinary function
++    // pointer.
+     llvm::Triple Triple = S.Context.getTargetInfo().getTriple();
+     if (Triple.isSPIRV() && Triple.getVendor() != llvm::Triple::AMD) {
+       for (const ParsedAttr &AL : D.getDeclSpec().getAttributes()) {
+diff --git a/clang/test/CodeGenHIP/hipspv-kernel-address.cpp b/clang/test/CodeGenHIP/hipspv-kernel-address.cpp
+new file mode 100644
+index 0000000..a5bcbe3
+--- /dev/null
++++ b/clang/test/CodeGenHIP/hipspv-kernel-address.cpp
+@@ -0,0 +1,38 @@
++// RUN: %clang_cc1 -triple spirv64 -x hip -emit-llvm -fcuda-is-device \
++// RUN:   -o - %s | FileCheck %s
++// RUN: %clang_cc1 -triple spirv64-amd-amdhsa -x hip -emit-llvm -fcuda-is-device \
++// RUN:   -o - %s | FileCheck %s
++
++// Host code may take a kernel's address into an ordinary function pointer,
++// as with other targets (for example a table of kernels or a launcher that
++// picks one). On HIPSPV the kernel calling convention is applied in CodeGen,
++// so the kernels are still emitted as SPIR-V kernels.
++
++#define __global__ __attribute__((global))
++
++typedef void (*kernel_ptr)(float *, float);
++
++// CHECK: define {{.*}}spir_kernel void @_Z3fooPff(
++__global__ void foo(float *a, float b) { *a = b; }
++
++// CHECK: define {{.*}}spir_kernel void @_Z3barILi2EEvPff(
++template <int N> __global__ void bar(float *a, float b) { *a = b * N; }
++
++// CHECK: define {{.*}}spir_kernel void @_ZL3bazILb1EEvPff(
++template <bool B> static __global__ void baz(float *a, float b) { *a = B ? b : -b; }
++
++kernel_ptr pick(int i) {
++  kernel_ptr k = foo;
++  if (i == 1)
++    k = bar<2>;
++  else if (i == 2)
++    k = &baz<true>;
++  return k;
++}
++
++template <int N> kernel_ptr pick_t() {
++  kernel_ptr k;
++  k = bar<N>;
++  return k;
++}
++kernel_ptr p2 = pick_t<2>();
+-- 
+2.56.1.windows.1
+

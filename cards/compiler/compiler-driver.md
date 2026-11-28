@@ -26,11 +26,12 @@ cost: { hours: 3.0, ai_usage: 0 }
 - `--version`: 우리 이름, Clang의 버전 줄(그대로 옮김), 헤더가 선언한 CUDA API 수준(12.3). 엔비디아 이름은 쓰지 않는다.
 - 단계: `-c`, `-E`, `-M`/`-MM`, `-MD`/`-MMD`/`-MF`/`-MT`/`-MP`, 링크(기본), `-shared`, `-lib`, `-ptx`(nvidia), `-dc`/`-rdc`/`-dlink`(cpu만: 장치 코드가 이미 호스트 코드), `-dryrun`, `-v`, `-keep`.
 - 경로·매크로: `-I`, `-isystem`, `-include`, `-D`, `-U`, `-L`, `-l`, 응답 파일(`@file`, `-optf`).
+- 미리 정의한 매크로: nvcc처럼 CUDA로 컴파일하는 모든 패스(호스트·장치, 모든 대상)에 `__CUDACC__`와 `__NVCC__`. 프로그램이 `#if defined(__NVCC__) || defined(__HIPCC__)`로 `__host__ __device__`를 붙이거나 비우는 관용구가 그대로 동작한다. `-DOCU_NO_NVCC_MACRO`면 `__NVCC__`를 정의하지 않는다. `__CUDACC_VER_MAJOR__` 등 버전 매크로는 정의하지 않는다. 예외: CMake가 CUDA 컴파일러를 식별하는 파일(`CMakeCUDACompilerId*.cu`)에는 `__NVCC__`를 넣지 않는다. CMake는 `__NVCC__`가 있으면 "NVIDIA"로 식별하고 nvcc 전용 규칙을 쓰는데, 이 컴파일러는 Clang 기반이라 Clang 규칙이 맞다.
 - 코드 생성: `-O0..3`, `-g`, `-G`, `-lineinfo`, `-std=`, `--use_fast_math`(nvidia 장치 코드에 근사 함수·서브노멀 0), `--expt-relaxed-constexpr`, `--extended-lambda`(Clang은 원래 허용).
 - 아키텍처: `-arch`, `-code`, `-gencode`, `--cuda-gpu-arch`. 기록만 하고, nvidia 대상은 Clang이 아는 가장 낮은 것으로 PTX를 만든다(sm_90보다 새 번호는 sm_90 PTX, 드라이버가 GPU용으로 번역).
 - 그대로 넘김: `-Xcompiler`(쉼표와 공백으로 나눔), `-Xlinker`, 호스트 옵션(`-f*`, `-W*`, `-m*`, `-Wl,`, `-Xclang` 등).
 - 받고 무시(`-v`에서 알림): `-Xptxas`, `-Xnvlink`, `-Xfatbin`, `-Xcudafe`, `-compress-mode`, `--threads` 등.
-- 라이브러리 이름: `-lcudart`·`-lcudart_static`·`-lcudadevrt`·`-lcuda` → 우리 실행 라이브러리, `-lcublas` → `ocu_blas`, `-lcublasLt` → 구현 없음(알림, 함수는 링크에서 미해결).
+- 라이브러리 이름: `-lcudart`·`-lcudart_static`·`-lcudadevrt`·`-lcuda` → 우리 실행 라이브러리, `-lcublas`·`-lcublasLt` → `ocu_blas`(cuBLAS와 cuBLASLt가 한 라이브러리).
 - 거절: 공급사 SDK 안의 `-I`/`-isystem`/`-L`, 모르는 옵션, `-cubin`/`-fatbin`/`-cuda`, nvidia 대상의 장치 링크.
 
 ### 툴킷 폴더

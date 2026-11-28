@@ -72,6 +72,51 @@ static image          *g_images;
 static function       *g_functions;
 static variable       *g_variables;
 
+/* Kernels by launch stub: llama.cpp-sized programs register thousands, and
+   every launch looks one up, so a hash table (open addressing) rather than
+   a walk of the list. Guarded by g_lock. */
+static function **g_fn_tab;
+static size_t     g_fn_cap, g_fn_n;
+static size_t fn_slot(const void *stub, size_t cap)
+{
+    uintptr_t h = (uintptr_t)stub;
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33;
+    return (size_t)h & (cap - 1);
+}
+static int fn_tab_put(function *f)
+{
+    if ((g_fn_n + 1) * 2 > g_fn_cap) {
+        size_t cap = g_fn_cap ? g_fn_cap * 2 : 1024;
+        function **t = calloc(cap, sizeof(*t));
+        if (t == NULL) return 0;
+        for (size_t i = 0; i < g_fn_cap; ++i) {
+            if (g_fn_tab[i] == NULL) continue;
+            size_t j = fn_slot(g_fn_tab[i]->stub, cap);
+            while (t[j] != NULL) j = (j + 1) & (cap - 1);
+            t[j] = g_fn_tab[i];
+        }
+        free(g_fn_tab);
+        g_fn_tab = t;
+        g_fn_cap = cap;
+    }
+    size_t j = fn_slot(f->stub, g_fn_cap);
+    /* The newest registration of a stub wins, as the list's head did. */
+    while (g_fn_tab[j] != NULL && g_fn_tab[j]->stub != f->stub) j = (j + 1) & (g_fn_cap - 1);
+    if (g_fn_tab[j] == NULL) g_fn_n++;
+    g_fn_tab[j] = f;
+    return 1;
+}
+static function *fn_tab_get(const void *stub)
+{
+    if (g_fn_cap == 0) return NULL;
+    size_t j = fn_slot(stub, g_fn_cap);
+    while (g_fn_tab[j] != NULL) {
+        if (g_fn_tab[j]->stub == stub) return g_fn_tab[j];
+        j = (j + 1) & (g_fn_cap - 1);
+    }
+    return NULL;
+}
+
 static char *dup_string(const char *s)
 {
     size_t n = strlen(s) + 1;
@@ -145,6 +190,13 @@ int __cudaRegisterFunction(void **handle, const char *host_fun, char *device_fun
     pthread_mutex_lock(&g_lock);
     f->next = g_functions;
     g_functions = f;
+    if (!fn_tab_put(f)) {
+        g_functions = f->next;
+        pthread_mutex_unlock(&g_lock);
+        free(name);
+        free(f);
+        return 1;
+    }
     pthread_mutex_unlock(&g_lock);
     return 0;
 }
@@ -246,8 +298,7 @@ ocu_status ocu_rt_find_kernel(const void *stub, ocu_kernel **kernel, uint32_t *n
                               const size_t **arg_sizes)
 {
     pthread_mutex_lock(&g_lock);
-    function *f = g_functions;
-    while (f != NULL && f->stub != stub) f = f->next;
+    function *f = fn_tab_get(stub);
     if (f == NULL) {
         pthread_mutex_unlock(&g_lock);
         return OCU_ERR_NOT_FOUND;
