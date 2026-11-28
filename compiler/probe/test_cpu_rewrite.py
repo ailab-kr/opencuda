@@ -156,6 +156,21 @@ class PreprocessedTests(unittest.TestCase):
         self.assertIn("static thread_local int t[4];", out)
         self.assertNotIn("__ocu_shared__", out)
 
+    def test_ptx_prefetch_becomes_empty_statement(self):
+        pre = lambda s: rewrite(s, preprocessed=True)[0]
+        self.assertEqual(pre('void f(const void *p) { asm volatile("prefetch.global.L2 [%0];" :: "l"(p)); }'),
+                         "void f(const void *p) { ((void)0); }")
+        # operands may nest parentheses to any depth
+        self.assertEqual(pre('void f(const char *p, int i) { __asm__ __volatile__("prefetch.local.L1 [%0];" : : "l"(p + (i * (4 + 1)))); g(); }'),
+                         "void f(const char *p, int i) { ((void)0); g(); }")
+        # anything else is left for the compiler: other instructions, outputs
+        for src in ('int f(int a, int n) { int r; asm("shl.b32 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(n)); return r; }',
+                    'unsigned f() { unsigned m; asm volatile("activemask.b32 %0;" : "=r"(m)); return m; }'):
+            self.assertEqual(pre(src), src)
+        # only in a preprocessed unit (where the statement is complete)
+        src = 'void f(const void *p) { asm volatile("prefetch.global.L2 [%0];" :: "l"(p)); }'
+        self.assertEqual(rw(src), src)
+
     def test_extern_shared_scope(self):
         # review 5: inside a function a pointer, so casts to other element
         # types work; at namespace scope a per-use lookup

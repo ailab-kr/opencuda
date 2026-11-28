@@ -63,10 +63,28 @@ __global__ void k(float *g) {
 __device__ int f(int n) { return n ? f(n - 1) + 1 : 0; }
 __global__ void k(int *p) { p[0] = f(p[1]); }""", "recursive")
 
-    def test_namespace(self):
+    def test_namespace_type(self):
+        # Functions inside namespaces are translated (Emitted); types are not
+        # yet. Like any type found by name only, one is left out with a
+        # warning, and the Metal compiler stops at the missing name.
+        rc, img, err = translate("""
+namespace ns { struct pair { int a, b; }; }
+__global__ void k(int *p) { ns::pair q = {p[1], p[2]}; p[0] = q.a + q.b; }""")
+        self.assertIn("inside namespaces are not handled yet", err)
+        self.assertIn("// cu2msl: left out pair", img)
+        self.assertNotIn("struct pair", img)
+
+    def test_namespace_device_variable(self):
+        self.refused("""
+namespace ns { __constant__ int c[2] = {1, 2}; }
+__global__ void k(int *p) { p[0] = p[1]; }""", "inside a namespace")
+
+    def test_reserved_suffix(self):
+        # ns::f is emitted as f_ocu0; a program function with that spelling collides
         self.refused("""
 namespace ns { __device__ int f(int n) { return n; } }
-__global__ void k(int *p) { p[0] = ns::f(p[1]); }""", "namespace")
+__device__ int f_ocu0(int n) { return n + 1; }
+__global__ void k(int *p) { p[0] = ns::f(p[1]) + f_ocu0(p[2]); }""", "reserved")
 
     def test_shared_in_device_function(self):
         self.refused("""
@@ -119,6 +137,25 @@ __global__ void k(float *g) {
         self.assertIn("static threadgroup float * at(thread const ocu_context &ocu_ctx, threadgroup float * p, int i)", img)
         self.assertIn("threadgroup float *q = at(ocu_ctx, s, 1);", img)
         self.assertIn("device float *r = at(ocu_ctx, g, 2);", img)
+
+    def test_namespace_function(self):
+        img = self.ok("""
+namespace ns { __device__ int f(int n) { return n; } }
+__device__ int f(int n) { return n + 1; }
+__global__ void k(int *p) { p[0] = ns::f(p[1]) + f(p[2]); }""")
+        self.assertRegex(img, r"p\[0\] = f_ocu\d+\(ocu_ctx, p\[1\]\) \+ f\(ocu_ctx, p\[2\]\);")
+        self.assertRegex(img, r"static int f_ocu\d+\(thread const ocu_context &ocu_ctx, int n\) \{ return n; \}")
+
+    def test_function_template_argument(self):
+        img = self.ok("""
+__device__ float op_add(const float a, const float b) { return a + b; }
+__device__ float op_mul(const float a, const float b) { return a * b; }
+template <float (*bin_op)(const float, const float)>
+__global__ void k(const float *a, const float *b, float *d) { d[threadIdx.x] = bin_op(a[threadIdx.x], b[threadIdx.x]); }
+void host(float *a, float *b, float *d) { k<op_add><<<1, 32>>>(a, b, d); k<op_mul><<<1, 32>>>(a, b, d); }""")
+        self.assertIn("d[threadIdx.x] = op_add(ocu_ctx, a[threadIdx.x], b[threadIdx.x]);", img)
+        self.assertIn("d[threadIdx.x] = op_mul(ocu_ctx, a[threadIdx.x], b[threadIdx.x]);", img)
+        self.assertNotIn("bin_op", img.split("// ---- functions")[1])
 
     def test_template_kernel_instances(self):
         img = self.ok("""

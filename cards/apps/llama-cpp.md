@@ -84,6 +84,8 @@ cmake -S llama.cpp -B build -DCMAKE_TOOLCHAIN_FILE=<toolkit>/cmake/OcuCUDA.cmake
     - 탐욕 64토큰(프롬프트 26토큰): 35번째 생성 토큰 하나가 바뀜 "… on the site of an ancient Roman settlement" → "… an old Roman settlement", 나머지 63토큰은 같음. 고치기 전 판의 탐욕 출력을 teacher forcing하면 그 자리의 고치기 전 로짓 차이가 0.039(17.218 대 17.179)인 거의 동률이고, 생성 구간 KL 평균 1.2e-3은 CPU 경로↔NVIDIA 경로의 같은 모양 차이(8.2e-4)와 같은 크기다(프롬프트 KV 캐시의 마지막 비트 차이가 8비트 활성값 양자화를 거쳐 커짐, `docs/llama-cpp-logit-agreement.md`).
 - 11/13 CPU 백엔드 속도 작업 뒤(카드 `backend-cpu` 메모): 8스레드 프롬프트 7.9 → 19.8 t/s, 생성 0.43 → 1.25 t/s(중앙값), test-backend-ops 15866/15866 그대로, 탐욕 64토큰 생성은 고치기 전과 글자까지 같음. 위의 추정(셔플마다 파이버 전환)은 측정으로 맞았다: 생성 1토큰에 파이버 방문 약 1.5억 번.
 
+- 11/28 Apple arm64 호스트(M3, macOS 15.5, Apple clang 16)의 CPU 경로: 위 구성에 `-DGGML_METAL=OFF`를 더해 `.cu` 전부 컴파일, `llama-bench` 링크(119초, -j6). 고치기 전에는 `common.cuh`의 `asm volatile("prefetch.global.L2 [%0];" :: "l"(p))`에서 "invalid input constraint 'l' in asm"으로 멈췄다(x86-64에서는 부르는 곳이 없어 넘어가던 문장). CPU 경로 재작성이 출력 없는 prefetch PTX를 빈 문장으로 바꾼다. Qwen3-0.6B Q8_0, 4스레드: 프롬프트 32토큰 9.30 t/s, 생성 16토큰 0.27 t/s(1회). x86-64(다른 세션 검토): 전체 ctest 334/334, test-backend-ops 부분집합 4,396/4,396이 고치기 전후 같음.
+
 ## 이의
 
 (없음)

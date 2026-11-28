@@ -323,6 +323,7 @@ class Translator:
         self.textures: dict[str, str] = {}    # legacy texture reference id -> name
         self.dyn_shared: dict[str, str] = {}  # file-scope extern __shared__ array -> element type
         self.items: list[dict] = []           # type / constant declarations, TU order
+        self.user_names: set[str] = set()     # names declared in user files (file or namespace scope)
         self.insts: dict[tuple, Instance] = {}
         self.order: list[Instance] = []
         self.layout: dict[str, tuple[int, int]] = {}
@@ -412,8 +413,21 @@ class Translator:
         tu = json.loads(run(cmd, "syntax tree"))
         annotate_files(tu)
         self.scan(kids(tu))
+        # Names this translation makes up (template instances, functions
+        # from namespaces) end in _ocu<number>. A file-scope declaration of
+        # the program with the same spelling would collide in the emitted
+        # source, so it is refused. (Local names are not checked: the suffix
+        # is reserved, see backends/metal/README.md.)
+        clash = sorted(set(self.spec_names.values()) & self.user_names)
+        if clash:
+            raise TranslateError(f"'{clash[0]}': names ending in _ocu<number> are reserved for this translation")
 
-    def scan(self, decls):
+    def scan(self, decls, ns: str = ""):
+        """`ns`: the enclosing namespaces ("a::b"), empty at file scope.
+        Functions inside a namespace are emitted at file scope under a
+        unique name (calls are rewritten to it); types, constants and
+        variables inside one are not translated yet and stop the kernels
+        that name them."""
         for d in decls:
             k = d.get("kind")
             if d.get("isImplicit"):
@@ -421,32 +435,43 @@ class Translator:
             sp = self.span(d)
             f = sp[0] if sp else bare(d.get("loc", {})).get("file")
             if k == "LinkageSpecDecl":
-                self.scan(kids(d))
+                self.scan(kids(d), ns)
                 continue
             if not self.user_file(f):
                 continue
+            if d.get("name"):
+                self.user_names.add(d["name"])
             attrs = {c.get("kind") for c in kids(d)}
             if k == "NamespaceDecl" and not d.get("name"):
                 self.scan(kids(d))
                 continue
             if k == "NamespaceDecl":
-                for n in walk(d):
-                    if n.get("kind") in ("FunctionDecl", "VarDecl") and \
-                            {c.get("kind") for c in kids(n)} & {"CUDAGlobalAttr", "CUDADeviceAttr", "CUDAConstantAttr"}:
-                        raise TranslateError(f"namespace '{d.get('name', '')}': device code inside namespaces is not handled yet")
+                self.scan(kids(d), (ns + "::" if ns else "") + (d.get("name") or "(anonymous)"))
+                continue
+            if ns and k not in ("FunctionDecl", "CXXMethodDecl", "FunctionTemplateDecl"):
+                names = {d["name"]} if d.get("name") else set()
+                if k == "EnumDecl":
+                    names |= {c["name"] for c in kids(d) if c.get("kind") == "EnumConstantDecl"}
+                if k == "VarDecl" and {c.get("kind") for c in kids(d) if not c.get("implicit")} & \
+                        {"CUDAConstantAttr", "CUDADeviceAttr", "CUDASharedAttr"}:
+                    raise TranslateError(f"namespace '{ns}': device variable '{d.get('name')}' inside a namespace is not handled yet")
+                if names and k in ("VarDecl", "CXXRecordDecl", "RecordDecl", "TypedefDecl", "TypeAliasDecl",
+                                   "EnumDecl", "ClassTemplateDecl"):
+                    self.items.append({"node": d, "names": names, "error":
+                                       f"'{ns}::{d.get('name')}': types and constants inside namespaces are not handled yet"})
                 continue
             if k in ("FunctionDecl", "CXXMethodDecl"):
                 if not attrs & {"CUDAGlobalAttr", "CUDADeviceAttr"}:
                     continue
                 if k == "CXXMethodDecl":
                     raise TranslateError(f"'{d.get('name')}': member functions are not handled yet")
-                self.add_function(d, None)
+                self.add_function(d, None, ns)
             elif k == "FunctionTemplateDecl":
                 fns = [c for c in kids(d) if c.get("kind") == "FunctionDecl"]
                 if not fns or not {c.get("kind") for c in kids(fns[0])} & {"CUDAGlobalAttr", "CUDADeviceAttr"}:
                     continue
                 for s in fns[1:]:
-                    self.add_function(s, d)
+                    self.add_function(s, d, ns)
             elif k == "VarDecl" and re.match(r"\s*(const\s+)?(struct\s+)?texture\s*<", qtype(d)):
                 self.textures[d["id"]] = d["name"]
             elif k == "VarDecl":
@@ -476,7 +501,7 @@ class Translator:
                     item["error"] = f"'{d.get('name')}': class templates are not handled yet"
                 self.items.append(item)
 
-    def add_function(self, d, tmpl):
+    def add_function(self, d, tmpl, ns: str = ""):
         if not any(c.get("kind") == "CompoundStmt" for c in kids(d)):
             return  # a declaration; the definition comes with its body
         self.defs[d["id"]] = d
@@ -489,6 +514,10 @@ class Translator:
             self.spec_names[d["id"]] = f"{d['name']}_ocu{len(self.spec_names)}"
             if d["name"].startswith("operator"):
                 raise TranslateError(f"'{d['name']}': operator templates are not handled yet")
+        elif ns:
+            if d["name"].startswith("operator"):
+                raise TranslateError(f"'{ns}::{d['name']}': operators inside namespaces are not handled yet")
+            self.spec_names[d["id"]] = f"{d['name']}_ocu{len(self.spec_names)}"
         if any(c.get("kind") == "CUDAGlobalAttr" for c in kids(d)):
             self.kernels.append(d)
 
@@ -675,12 +704,28 @@ class Translator:
         while callee is not None and callee.get("kind") in ("ImplicitCastExpr", "ParenExpr"):
             callee = kids(callee)[0] if kids(callee) else None
         inst = None
+        # A call through a function-valued template parameter (`bin_op(a, b)`
+        # with `template <float (*bin_op)(float, float)>`): in an
+        # instantiation the callee is the function the argument names, so the
+        # call is rewritten to a direct call of that function.
+        subst = None
+        if callee is not None and callee.get("kind") == "SubstNonTypeTemplateParmExpr":
+            target = kids(callee)[-1] if kids(callee) else None
+            while target is not None and target.get("kind") in ("ImplicitCastExpr", "ParenExpr", "UnaryOperator"):
+                if target.get("kind") == "UnaryOperator" and target.get("opcode") != "&":
+                    break
+                target = kids(target)[0] if kids(target) else None
+            if target is not None and target.get("kind") == "DeclRefExpr" and \
+                    target.get("referencedDecl", {}).get("kind") == "FunctionDecl":
+                subst, callee = callee, target
         if callee is not None and callee.get("kind") == "DeclRefExpr":
             ref = callee.get("referencedDecl", {})
             st["callees"].add(callee["id"])
             if ref.get("name") in self.UNAVAILABLE:
                 raise TranslateError(f"'{st['fname']}': {self.UNAVAILABLE[ref['name']]} is not available on {self.TARGET}")
             d = self.defs.get(ref.get("id"))
+            if d is None and subst is not None:
+                raise TranslateError(f"'{st['fname']}': template argument '{ref.get('name')}' is not a device function this translation knows")
             if d is not None:
                 params = [c for c in kids(d) if c.get("kind") == "ParmVarDecl"]
                 args = ch[1:]
@@ -698,8 +743,8 @@ class Translator:
                 st["callees_inst"].append(inst)
                 if e.get("kind") == "CallExpr":
                     lo, hi = st["body"]
-                    cb, ce = self.edit_span(callee, st, "a call")
-                    if d["id"] in self.spec_names:
+                    cb, ce = self.edit_span(subst or callee, st, "a call")
+                    if d["id"] in self.spec_names or subst is not None:
                         st["edits"].append((cb, ce, inst.name))
                     if not d["name"].startswith("operator"):
                         t = st["text"]
@@ -764,6 +809,8 @@ class Translator:
                     raise TranslateError(f"'{d['name']}': double is not available on {self.CHIP}")
                 out.append(f"typedef {at} {name};")
             else:
+                if (a.get("decl") or {}).get("kind") == "FunctionDecl":
+                    continue  # a function: calls through it are rewritten (call())
                 if "value" not in a:
                     raise TranslateError(f"'{d['name']}': template argument for '{name}' is not an integer")
                 pt = qtype(p)
