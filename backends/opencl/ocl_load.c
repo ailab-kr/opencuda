@@ -83,3 +83,17 @@ const ocl_api *ocl_load(void)
     pthread_once(&g_once, load_once);
     return g_loaded;
 }
+
+/* Experiment (OCU_OPENCL_DEVICE_USM=1): device memory from Intel USM device
+   allocations. Pointer arguments, copies, fills and the indirect-access list
+   then go through the cl_intel_unified_shared_memory entry points, which take
+   the same arguments in the same order (and SVM pointers too on Intel's
+   driver). Called once, while the devices are listed. */
+void ocl_api_use_usm(void *set_arg_mem_pointer, void *enqueue_memcpy, void *enqueue_memfill)
+{
+    if (g_loaded == NULL || set_arg_mem_pointer == NULL || enqueue_memcpy == NULL || enqueue_memfill == NULL) return;
+    *(void **)&g_api.SetKernelArgSVMPointer = set_arg_mem_pointer;
+    *(void **)&g_api.EnqueueSVMMemcpy = enqueue_memcpy;
+    *(void **)&g_api.EnqueueSVMMemFill = enqueue_memfill;
+    g_api.usm_device_memory = 1;
+}

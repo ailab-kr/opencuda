@@ -56,6 +56,10 @@ typedef struct ocl_dev_entry {
        kernels reach directly (CUDA's mapped pinned memory); NULL = malloc */
     ocl_host_mem_alloc_intel    usm_host_alloc;
     ocl_mem_blocking_free_intel usm_host_free;
+    /* experiment (OCU_OPENCL_DEVICE_USM=1): device memory as USM device
+       allocations instead of SVM buffers; NULL = SVM */
+    ocl_device_mem_alloc_intel  usm_dev_alloc;
+    ocl_mem_blocking_free_intel usm_dev_free;
     pthread_once_t warp_once;
 } ocl_dev_entry;
 
@@ -241,6 +245,25 @@ static void enumerate_once(void)
                     *(void **)&e->usm_host_alloc = a->GetExtensionFunctionAddressForPlatform(plats[p], "clHostMemAllocINTEL");
                     *(void **)&e->usm_host_free = a->GetExtensionFunctionAddressForPlatform(plats[p], "clMemBlockingFreeINTEL");
                     if (e->usm_host_alloc == NULL || e->usm_host_free == NULL) e->usm_host_alloc = NULL, e->usm_host_free = NULL;
+                }
+            }
+            /* Device memory as USM device allocations where the driver has them
+               (OCU_OPENCL_DEVICE_USM=0: SVM buffers as before). On an Arc Pro B70
+               they reach twice the bandwidth of coarse-grained SVM buffers
+               (BabelStream triad 535 -> 1101 GB/s, as chipStar on Level Zero). */
+            if (has_word(ext, "cl_intel_unified_shared_memory") && a->GetExtensionFunctionAddressForPlatform != NULL &&
+                !(getenv("OCU_OPENCL_DEVICE_USM") != NULL && getenv("OCU_OPENCL_DEVICE_USM")[0] == '0')) {
+                void *(*gx)(cl_platform_id, const char *) = a->GetExtensionFunctionAddressForPlatform;
+                void *set_arg = gx(plats[p], "clSetKernelArgMemPointerINTEL");
+                void *cpy = gx(plats[p], "clEnqueueMemcpyINTEL"), *fill = gx(plats[p], "clEnqueueMemFillINTEL");
+                *(void **)&e->usm_dev_alloc = gx(plats[p], "clDeviceMemAllocINTEL");
+                *(void **)&e->usm_dev_free = gx(plats[p], "clMemBlockingFreeINTEL");
+                if (e->usm_dev_alloc == NULL || e->usm_dev_free == NULL || set_arg == NULL || cpy == NULL || fill == NULL) {
+                    e->usm_dev_alloc = NULL;
+                    e->usm_dev_free = NULL;
+                } else {
+                    ocl_api_use_usm(set_arg, cpy, fill);
+                    if (verbose()) fprintf(stderr, "ocu opencl: device memory as USM device allocations (OCU_OPENCL_DEVICE_USM=0: SVM)\n");
                 }
             }
             pthread_once_t once = PTHREAD_ONCE_INIT;
@@ -445,7 +468,7 @@ static ocu_status ocl_dev_close(ocu_device *d)
     ocu_status st = ocl_queue_destroy(d->sync_q);
     for (size_t i = 0; i < d->count; ++i) {
         if (d->allocs[i].pinned_host) d->entry->usm_host_free(d->ctx, d->allocs[i].base);
-        else if (d->allocs[i].usm) d->entry->usm_free(d->ctx, d->allocs[i].base);
+        else if (d->allocs[i].usm) (d->entry->usm_free ? d->entry->usm_free : d->entry->usm_dev_free)(d->ctx, d->allocs[i].base);
         else a->SVMFree(d->ctx, d->allocs[i].base);
     }
     free(d->allocs);
@@ -662,6 +685,17 @@ static ocu_status alloc_svm(ocu_device *d, size_t bytes, cl_svm_mem_flags flags,
        alignment beyond their largest data type (0 = that one), so the
        block is made larger and the address aligned up inside it. */
     if (bytes > SIZE_MAX - 256) return OCU_ERR_OUT_OF_MEMORY;
+    if (flags == 0 && d->entry->usm_dev_alloc != NULL) { /* OCU_OPENCL_DEVICE_USM=1 */
+        cl_int err = CL_SUCCESS;
+        char *p = d->entry->usm_dev_alloc(d->ctx, d->entry->device, NULL, bytes, 256, &err);
+        if (p == NULL || err != CL_SUCCESS) return OCU_ERR_OUT_OF_MEMORY;
+        if (!table_add(d, p, bytes, p, true)) {
+            d->entry->usm_dev_free(d->ctx, p);
+            return OCU_ERR_OUT_OF_MEMORY;
+        }
+        *ptr = p;
+        return OCU_OK;
+    }
     char *base = a->SVMAlloc(d->ctx, CL_MEM_READ_WRITE | flags, bytes + 256, 0);
     if (base == NULL) return OCU_ERR_OUT_OF_MEMORY;
     char *p = base + ((256 - ((uintptr_t)base & 255)) & 255);
@@ -712,7 +746,7 @@ static ocu_status ocl_mem_free_impl(ocu_device *d, void *ptr)
     bool usm;
     char *base = table_remove(d, ptr, &usm);
     if (base == NULL) return OCU_ERR_INVALID_VALUE;
-    if (usm) d->entry->usm_free(d->ctx, base);
+    if (usm) (d->entry->usm_free ? d->entry->usm_free : d->entry->usm_dev_free)(d->ctx, base);
     else ocl_load()->SVMFree(d->ctx, base);
     return OCU_OK;
 }
@@ -1329,7 +1363,7 @@ static cl_int set_svm_ptrs(ocu_kernel *k, ocu_device *d)
             err = CL_OUT_OF_HOST_MEMORY;
         } else {
             for (size_t i = 0; i < n; ++i) ptrs[i] = d->allocs[i].ptr;
-            if (n > 0) err = a->SetKernelExecInfo(k->k, CL_KERNEL_EXEC_INFO_SVM_PTRS, n * sizeof(void *), ptrs);
+            if (n > 0) err = a->SetKernelExecInfo(k->k, ocl_load()->usm_device_memory ? CL_KERNEL_EXEC_INFO_USM_PTRS_INTEL : CL_KERNEL_EXEC_INFO_SVM_PTRS, n * sizeof(void *), ptrs);
             free(ptrs);
             if (err == CL_SUCCESS) k->svm_gen = d->gen;
         }
@@ -1724,7 +1758,7 @@ static ocu_status ocl_kernel_launch_impl(ocu_queue *q, ocu_kernel *k, const ocu_
             err = CL_OUT_OF_HOST_MEMORY;
         } else {
             for (size_t i = 0; i < n; ++i) ptrs[i] = d->allocs[i].ptr;
-            if (n > 0) err = a->SetKernelExecInfo(k->k, CL_KERNEL_EXEC_INFO_SVM_PTRS, n * sizeof(void *), ptrs);
+            if (n > 0) err = a->SetKernelExecInfo(k->k, ocl_load()->usm_device_memory ? CL_KERNEL_EXEC_INFO_USM_PTRS_INTEL : CL_KERNEL_EXEC_INFO_SVM_PTRS, n * sizeof(void *), ptrs);
             free(ptrs);
         }
         pthread_mutex_unlock(&d->lock);
@@ -3009,7 +3043,7 @@ static ocu_status ops_execute(ocu_op_plan *pl, ocu_queue *q, const ocu_tensor *t
         if (ptrs == NULL) err = CL_OUT_OF_HOST_MEMORY;
         else {
             for (size_t j = 0; j < na; ++j) ptrs[j] = d->allocs[j].ptr;
-            if (na > 0) err = a->SetKernelExecInfo(kern, CL_KERNEL_EXEC_INFO_SVM_PTRS, na * sizeof(void *), ptrs);
+            if (na > 0) err = a->SetKernelExecInfo(kern, ocl_load()->usm_device_memory ? CL_KERNEL_EXEC_INFO_USM_PTRS_INTEL : CL_KERNEL_EXEC_INFO_SVM_PTRS, na * sizeof(void *), ptrs);
             free(ptrs);
         }
         pthread_mutex_unlock(&d->lock);

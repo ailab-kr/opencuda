@@ -173,7 +173,14 @@ typedef struct ocl_api {
     cl_int (*EnqueueSVMFree)(cl_command_queue, cl_uint, void *[],
                              void (*)(cl_command_queue, cl_uint, void *[], void *), void *, cl_uint,
                              const cl_event *, cl_event *);
+    /* 1 when ocl_api_use_usm switched pointer arguments, copies and fills to
+       the Intel USM entry points */
+    int usm_device_memory;
 } ocl_api;
+
+void ocl_api_use_usm(void *set_arg_mem_pointer, void *enqueue_memcpy, void *enqueue_memfill);
+typedef void *(*ocl_device_mem_alloc_intel)(cl_context, cl_device_id, const cl_ulong *, size_t, cl_uint, cl_int *);
+#define CL_KERNEL_EXEC_INFO_USM_PTRS_INTEL 0x4203
 
 /* cl_intel_unified_shared_memory (Khronos extension registry) */
 #define CL_DEVICE_HOST_MEM_CAPABILITIES_INTEL 0x4190
