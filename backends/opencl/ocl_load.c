@@ -84,8 +84,8 @@ const ocl_api *ocl_load(void)
     return g_loaded;
 }
 
-/* Experiment (OCU_OPENCL_DEVICE_USM=1): device memory from Intel USM device
-   allocations. Pointer arguments, copies, fills and the indirect-access list
+/* Device memory from Intel USM device allocations (the default where the
+   driver has them; OCU_OPENCL_DEVICE_USM=0 keeps SVM buffers). Pointer arguments, copies, fills and the indirect-access list
    then go through the cl_intel_unified_shared_memory entry points, which take
    the same arguments in the same order (and SVM pointers too on Intel's
    driver). Called once, while the devices are listed. */

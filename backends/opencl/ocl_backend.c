@@ -39,7 +39,20 @@ typedef struct ocl_alloc {
     char  *base;  /* what clSVMAlloc returned (ptr is aligned up from it) */
     bool   usm;   /* a USM allocation (cl_intel_unified_shared_memory) */
     bool   pinned_host; /* a USM host allocation from host_alloc_pinned */
+    bool   device;      /* device memory from mem_alloc (may go to the free-block cache) */
+    size_t cap;         /* bytes usable from ptr (>= size: a reused cached block) */
 } ocl_alloc;
+
+/* Freed device memory kept for reuse (OCU_OPENCL_ALLOC_CACHE=0: none).
+   mem_free has waited for every queue of the device, so nothing in flight
+   uses a cached block; programs that allocate and free in a loop then pay
+   for the driver's allocation once. */
+#define CACHE_MAX_BLOCKS 256
+typedef struct ocl_cached {
+    char  *ptr, *base;
+    size_t cap;
+    bool   usm;
+} ocl_cached;
 
 typedef struct ocl_dev_entry {
     cl_platform_id platform;
@@ -56,8 +69,8 @@ typedef struct ocl_dev_entry {
        kernels reach directly (CUDA's mapped pinned memory); NULL = malloc */
     ocl_host_mem_alloc_intel    usm_host_alloc;
     ocl_mem_blocking_free_intel usm_host_free;
-    /* experiment (OCU_OPENCL_DEVICE_USM=1): device memory as USM device
-       allocations instead of SVM buffers; NULL = SVM */
+    /* device memory as USM device allocations instead of SVM buffers (the
+       default where the driver has them; OCU_OPENCL_DEVICE_USM=0); NULL = SVM */
     ocl_device_mem_alloc_intel  usm_dev_alloc;
     ocl_mem_blocking_free_intel usm_dev_free;
     pthread_once_t warp_once;
@@ -73,6 +86,9 @@ struct ocu_device {
     uint64_t          allocated;
     uint64_t          gen;      /* bumped when the allocation table changes */
     struct ocu_queue *queues;   /* every queue of the device (mem_free waits for them) */
+    ocl_cached        cache[CACHE_MAX_BLOCKS]; /* freed device blocks, oldest first (under lock) */
+    size_t            ncache;
+    uint64_t          cache_bytes, cache_limit; /* cache_limit 0: no cache */
 };
 
 struct ocu_queue {
@@ -440,6 +456,11 @@ static ocu_status ocl_dev_open(uint32_t index, ocu_device **out)
         return err == CL_OUT_OF_HOST_MEMORY ? OCU_ERR_OUT_OF_MEMORY : OCU_ERR_INVALID_DEVICE;
     }
     pthread_mutex_init(&d->lock, NULL);
+    {   /* free-block cache: up to 1/8 of the device memory, at most 4 GiB */
+        const char *e = getenv("OCU_OPENCL_ALLOC_CACHE");
+        uint64_t lim = d->entry->info.total_memory_bytes / 8;
+        d->cache_limit = e != NULL && e[0] == '0' ? 0 : lim < (4ull << 30) ? lim : (4ull << 30);
+    }
     ocu_status st = ocl_queue_create(d, &d->sync_q);
     if (st != OCU_OK) {
         a->ReleaseContext(d->ctx);
@@ -449,6 +470,68 @@ static ocu_status ocl_dev_open(uint32_t index, ocu_device **out)
     }
     *out = d;
     return OCU_OK;
+}
+
+/* ---- free-block cache (device memory) -------------------------------------------- */
+
+static void release_block(ocu_device *d, char *base, bool usm)
+{
+    if (usm) (d->entry->usm_free ? d->entry->usm_free : d->entry->usm_dev_free)(d->ctx, base);
+    else ocl_load()->SVMFree(d->ctx, base);
+}
+
+/* Give every cached block back to the driver. */
+static void cache_drain(ocu_device *d)
+{
+    pthread_mutex_lock(&d->lock);
+    for (size_t i = 0; i < d->ncache; ++i) release_block(d, d->cache[i].base, d->cache[i].usm);
+    d->ncache = 0;
+    d->cache_bytes = 0;
+    pthread_mutex_unlock(&d->lock);
+}
+
+/* A cached block for `bytes` (at most a quarter plus 4 KiB larger), newest
+   first; false if none. */
+static bool cache_take(ocu_device *d, size_t bytes, ocl_cached *out)
+{
+    bool found = false;
+    pthread_mutex_lock(&d->lock);
+    for (size_t i = d->ncache; i-- > 0;) {
+        size_t cap = d->cache[i].cap;
+        if (cap >= bytes && cap - bytes <= bytes / 4 + 4096) {
+            *out = d->cache[i];
+            memmove(&d->cache[i], &d->cache[i + 1], (d->ncache - i - 1) * sizeof(d->cache[0]));
+            d->ncache--;
+            d->cache_bytes -= cap;
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&d->lock);
+    return found;
+}
+
+/* Keep a freed block (the oldest ones go back to the driver to stay in the
+   limits), or give it back when it is too large to keep. */
+static void cache_put(ocu_device *d, char *ptr, char *base, size_t cap, bool usm)
+{
+    if (d->cache_limit == 0 || cap > d->cache_limit / 4) {
+        release_block(d, base, usm);
+        return;
+    }
+    pthread_mutex_lock(&d->lock);
+    size_t drop = 0;
+    uint64_t bytes = d->cache_bytes;
+    while (drop < d->ncache && (d->ncache - drop == CACHE_MAX_BLOCKS || bytes + cap > d->cache_limit)) {
+        bytes -= d->cache[drop].cap;
+        release_block(d, d->cache[drop].base, d->cache[drop].usm);
+        drop++;
+    }
+    memmove(&d->cache[0], &d->cache[drop], (d->ncache - drop) * sizeof(d->cache[0]));
+    d->ncache -= drop;
+    d->cache[d->ncache++] = (ocl_cached){ptr, base, cap, usm};
+    d->cache_bytes = bytes + cap;
+    pthread_mutex_unlock(&d->lock);
 }
 
 /* Wait for the work of every queue of the device. */
@@ -466,6 +549,7 @@ static ocu_status ocl_dev_close(ocu_device *d)
     const ocl_api *a = ocl_load();
     finish_all(d);
     ocu_status st = ocl_queue_destroy(d->sync_q);
+    cache_drain(d);
     for (size_t i = 0; i < d->count; ++i) {
         if (d->allocs[i].pinned_host) d->entry->usm_host_free(d->ctx, d->allocs[i].base);
         else if (d->allocs[i].usm) (d->entry->usm_free ? d->entry->usm_free : d->entry->usm_dev_free)(d->ctx, d->allocs[i].base);
@@ -598,7 +682,13 @@ static ocu_status ocl_queue_destroy(ocu_queue *q)
 
 /* ---- allocation table ------------------------------------------------------------ */
 
+static bool table_add_ex(ocu_device *d, char *ptr, size_t size, char *base, bool usm, bool device, size_t cap);
 static bool table_add(ocu_device *d, char *ptr, size_t size, char *base, bool usm)
+{
+    return table_add_ex(d, ptr, size, base, usm, false, size);
+}
+
+static bool table_add_ex(ocu_device *d, char *ptr, size_t size, char *base, bool usm, bool device, size_t cap)
 {
     pthread_mutex_lock(&d->lock);
     bool ok = true;
@@ -618,6 +708,8 @@ static bool table_add(ocu_device *d, char *ptr, size_t size, char *base, bool us
         d->allocs[d->count].base = base;
         d->allocs[d->count].usm = usm;
         d->allocs[d->count].pinned_host = false;
+        d->allocs[d->count].device = device;
+        d->allocs[d->count].cap = cap;
         d->count++;
         d->gen++;
         d->allocated += size;
@@ -646,11 +738,6 @@ static char *table_remove_kind(ocu_device *d, const char *ptr, bool *usm, bool p
     }
     pthread_mutex_unlock(&d->lock);
     return found;
-}
-
-static char *table_remove(ocu_device *d, const char *ptr, bool *usm)
-{
-    return table_remove_kind(d, ptr, usm, false);
 }
 
 /* Is [p, p + n) inside one allocation? */
@@ -685,26 +772,48 @@ static ocu_status alloc_svm(ocu_device *d, size_t bytes, cl_svm_mem_flags flags,
        alignment beyond their largest data type (0 = that one), so the
        block is made larger and the address aligned up inside it. */
     if (bytes > SIZE_MAX - 256) return OCU_ERR_OUT_OF_MEMORY;
-    if (flags == 0 && d->entry->usm_dev_alloc != NULL) { /* OCU_OPENCL_DEVICE_USM=1 */
-        cl_int err = CL_SUCCESS;
-        char *p = d->entry->usm_dev_alloc(d->ctx, d->entry->device, NULL, bytes, 256, &err);
-        if (p == NULL || err != CL_SUCCESS) return OCU_ERR_OUT_OF_MEMORY;
-        if (!table_add(d, p, bytes, p, true)) {
-            d->entry->usm_dev_free(d->ctx, p);
+    bool device = flags == 0;
+    if (device) {
+        ocl_cached c;
+        if (cache_take(d, bytes, &c)) {
+            if (!table_add_ex(d, c.ptr, bytes, c.base, c.usm, true, c.cap)) {
+                release_block(d, c.base, c.usm);
+                return OCU_ERR_OUT_OF_MEMORY;
+            }
+            *ptr = c.ptr;
+            return OCU_OK;
+        }
+    }
+    for (int attempt = 0;; ++attempt) {
+        char *p = NULL, *base = NULL;
+        bool usm = device && d->entry->usm_dev_alloc != NULL; /* device memory as USM device allocations */
+        if (usm) {
+            cl_int err = CL_SUCCESS;
+            p = base = d->entry->usm_dev_alloc(d->ctx, d->entry->device, NULL, bytes, 256, &err);
+            if (err != CL_SUCCESS) p = base = NULL;
+        } else {
+            base = a->SVMAlloc(d->ctx, CL_MEM_READ_WRITE | flags, bytes + 256, 0);
+            if (base != NULL) p = base + ((256 - ((uintptr_t)base & 255)) & 255);
+        }
+        if (p == NULL) {
+            /* the cache may hold what the driver is missing */
+            bool had = false;
+            pthread_mutex_lock(&d->lock);
+            had = d->ncache > 0;
+            pthread_mutex_unlock(&d->lock);
+            if (attempt == 0 && had) {
+                cache_drain(d);
+                continue;
+            }
+            return OCU_ERR_OUT_OF_MEMORY;
+        }
+        if (!table_add_ex(d, p, bytes, base, usm, device, bytes)) {
+            release_block(d, base, usm);
             return OCU_ERR_OUT_OF_MEMORY;
         }
         *ptr = p;
         return OCU_OK;
     }
-    char *base = a->SVMAlloc(d->ctx, CL_MEM_READ_WRITE | flags, bytes + 256, 0);
-    if (base == NULL) return OCU_ERR_OUT_OF_MEMORY;
-    char *p = base + ((256 - ((uintptr_t)base & 255)) & 255);
-    if (!table_add(d, p, bytes, base, false)) {
-        a->SVMFree(d->ctx, base);
-        return OCU_ERR_OUT_OF_MEMORY;
-    }
-    *ptr = p;
-    return OCU_OK;
 }
 
 static ocu_status ocl_mem_alloc_impl(ocu_device *d, size_t bytes, void **ptr)
@@ -743,11 +852,23 @@ static ocu_status ocl_mem_free_impl(ocu_device *d, void *ptr)
     if (d == NULL) return OCU_ERR_INVALID_HANDLE;
     if (ptr == NULL) return OCU_OK;
     finish_all(d);
-    bool usm;
-    char *base = table_remove(d, ptr, &usm);
-    if (base == NULL) return OCU_ERR_INVALID_VALUE;
-    if (usm) (d->entry->usm_free ? d->entry->usm_free : d->entry->usm_dev_free)(d->ctx, base);
-    else ocl_load()->SVMFree(d->ctx, base);
+    ocl_alloc e;
+    bool found = false;
+    pthread_mutex_lock(&d->lock);
+    for (size_t i = 0; i < d->count; ++i) {
+        if (d->allocs[i].ptr == ptr && !d->allocs[i].pinned_host) {
+            e = d->allocs[i];
+            d->allocated -= e.size;
+            d->allocs[i] = d->allocs[--d->count];
+            d->gen++;
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&d->lock);
+    if (!found) return OCU_ERR_INVALID_VALUE;
+    if (e.device) cache_put(d, e.ptr, e.base, e.cap, e.usm);
+    else release_block(d, e.base, e.usm);
     return OCU_OK;
 }
 
