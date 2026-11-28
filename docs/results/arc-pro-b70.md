@@ -42,21 +42,39 @@ for every program, so that all of them are measured with one toolkit.
 
 | status | OpenCuda | chipStar 1.3.0 |
 |---|---|---|
-| pass | **206** | 161 |
+| pass | **205** | 161 |
 | ran | 118 | 111 |
-| fail | 17 | 9 |
+| fail | 18 | 9 |
 | crash | 25 | 18 |
 | timeout | 16 | 15 |
 | build_fail | **153** | 228 |
 | no_data | 35 | 28 |
 
-- Programs that run to the end (pass or ran): **OpenCuda 324, chipStar 272**.
-  Both: 252; only OpenCuda: 72; only chipStar: 20.
-- Speed where both run to the end (247 programs above 0.05 s): the geometric
+- Programs that run to the end (pass or ran): **OpenCuda 323, chipStar 272**.
+  Both: 251; only OpenCuda: 72; only chipStar: 21.
+- Speed where both run to the end (246 programs above 0.05 s): the geometric
   mean of chipStar time / OpenCuda time is 0.98 (above 1: OpenCuda faster).
-  OpenCuda is more than 10% faster on 71, more than 10% slower on 90, within
+  OpenCuda is more than 10% faster on 71, more than 10% slower on 89, within
   10% on 86. This is the toolkit at the start of the run; see the next two
   sections for what changed since.
+### Output cross-check
+
+Status words are what each program prints about itself; 118 OpenCuda
+programs print neither PASS nor FAIL. `tools/bench/hecbench_xcheck.py`
+compares the numbers two runs printed, timings left out. Over the 252
+programs both toolchains ran to the end, OpenCuda's output and chipStar's
+agree on 221 and 10 print no numbers to compare; of the 21 others most
+differ in timings the filter did not catch, random results or rounding.
+Two are OpenCuda errors:
+
+- segsort-cuda: OpenCuda's run printed `[NOT PASSED] checking keys: #err =
+  11360688 (33.86% #nnz)`; the status rule read the `PASSED` in it as a pass.
+  It is counted as `fail` above (it was `pass` before this check), and the
+  rule now takes `NOT PASS` for a failure.
+- lrn-cuda: the checksums differ (forward 0.0025 against 0.005, backward 0
+  against 0.500008).
+
+Both are being looked into.
 ### Performance work after the run
 
 Measured on the same GPU as same-session A/B runs (the setting on and off),

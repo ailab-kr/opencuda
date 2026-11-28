@@ -30,17 +30,25 @@ GPU는 다른 작업과 함께 쓰는 장비라, 측정은 모두 GPU에 다른 
 
 | 상태 | OpenCuda | chipStar 1.3.0 |
 |---|---|---|
-| pass | **206** | 161 |
+| pass | **205** | 161 |
 | ran | 118 | 111 |
-| fail | 17 | 9 |
+| fail | 18 | 9 |
 | crash | 25 | 18 |
 | timeout | 16 | 15 |
 | build_fail | **153** | 228 |
 | no_data | 35 | 28 |
 
-- 끝까지 도는 프로그램(pass 또는 ran): **OpenCuda 324, chipStar 272**. 둘 다 252, OpenCuda만 72, chipStar만 20.
-- 둘 다 끝까지 도는 프로그램의 속도(0.05초 넘는 247개): chipStar 시간 / OpenCuda 시간의 기하평균 0.98(1보다 크면 OpenCuda가 빠름). OpenCuda가 10% 넘게 빠른 것 71, 10% 넘게 느린 것 90, 10% 안 86. 실행 시작 때의 툴킷이다. 그 뒤 바뀐 것은 다음 두 절에 있다.
+- 끝까지 도는 프로그램(pass 또는 ran): **OpenCuda 323, chipStar 272**. 둘 다 251, OpenCuda만 72, chipStar만 21.
+- 둘 다 끝까지 도는 프로그램의 속도(0.05초 넘는 246개): chipStar 시간 / OpenCuda 시간의 기하평균 0.98(1보다 크면 OpenCuda가 빠름). OpenCuda가 10% 넘게 빠른 것 71, 10% 넘게 느린 것 89, 10% 안 86. 실행 시작 때의 툴킷이다. 그 뒤 바뀐 것은 다음 두 절에 있다.
 
+### 출력 교차 확인
+
+상태 판정은 각 프로그램이 스스로 찍는 말에 기댄다. OpenCuda 프로그램 118개는 PASS도 FAIL도 찍지 않는다. `tools/bench/hecbench_xcheck.py`는 두 실행이 찍은 숫자를 시간 값을 빼고 비교한다. 두 도구가 모두 끝까지 돌린 252개에서 OpenCuda와 chipStar의 출력은 221개가 같고 10개는 비교할 숫자가 없다. 나머지 21개는 대부분 필터가 못 거른 시간 값, 난수 결과, 반올림 차이다. 둘은 OpenCuda의 오류다.
+
+- segsort-cuda: OpenCuda 실행이 `[NOT PASSED] checking keys: #err = 11360688 (33.86% #nnz)`를 찍었는데, 상태 규칙이 그 안의 `PASSED`를 통과로 읽었다. 위 표에서는 `fail`로 센다(이 확인 전에는 `pass`). 규칙은 이제 `NOT PASS`를 실패로 본다.
+- lrn-cuda: 체크섬이 다르다(forward 0.0025 대 0.005, backward 0 대 0.500008).
+
+둘 다 원인을 보고 있다.
 ### 실행 뒤의 성능 작업
 
 같은 GPU에서 같은 세션 A/B(설정 켬·끔)로, 실행과 같이 `make run`을 쟀다. 두 변경 모두 `main`에 있다.
