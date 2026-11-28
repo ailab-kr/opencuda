@@ -38,7 +38,14 @@ cost: { hours: 1.5, ai_usage: 0 }
   - own minimal helper headers in `compiler/metal/compat/` (`helper_cuda.h`, `helper_timer.h`, empty GL/OpenMP stubs, `vector_types.h`), searched after the program's own `-I` directories (cfd 7)
   - `__constant__ float3` globals are `packed_float3` in the module buffer (12-byte host layout) (cfd 2)
   - struct-typed `__constant__` globals without an initializer, and pointer fields spelled through a macro (heartwall)
-- [ ] Still failing: double (policy open), texture use (hybridsort 3, kmeans 1, leukocyte 2, mummergpu 2), mummergpu (driver-API names, old literal syntax), pointer-to-pointer arguments, namespaces/class templates (dwt2d 4)
+- [x] Namespaces and function-valued template arguments (2026-11-28, `tests/metal/test_cu2msl.py` 25/25 on Apple M3; reviewed on x86-64 by another session: full ctest 334/334 before and after, 8 extra checks of its own):
+  - a device function inside a namespace (nested, anonymous, a template inside one) is emitted at file scope as `<name>_ocu<N>` and its calls are rewritten; two namespaces with the same function name get two names
+  - types and constants inside a namespace are left out with a warning, like any declaration found by name only; a `__device__`/`__constant__` variable inside a namespace is refused
+  - `template <float (*op)(float, float)>`: each instance calls the argument function directly; an argument without a body is refused
+  - a program declaration spelled like a generated name (`f_ocu0`) is refused ("reserved")
+  - `OCU_METAL_ARCH` selects the architecture device code is read for (default sm_80)
+- [ ] llama.cpp `ggml-cuda` at `0fb8f15` (host side, `OCU_METAL_ARCH=sm_50`, 74 files, `--keep-going`; kernel template instances counted each): 0 files before (every file failed in Clang at sm_80), 53 files / 307 instances with `OCU_METAL_ARCH`, 56 files / 589 instances with the two items above, 1,342 instances skipped. `msl_check` only; not compiled by Metal, not run. Main reasons left: member function calls 451, a constexpr function that calls itself (`calc_nwarps`, stops `mul_mat_vec_q`) 271, template parameter packs (`k_bin_bcast`) 228, string literals 226, address of a function chosen by a constexpr function 83, conditional pointers into two address spaces (`soft_max_f32`) 20.
+- [ ] Still failing: double (policy open), texture use (hybridsort 3, kmeans 1, leukocyte 2, mummergpu 2), mummergpu (driver-API names, old literal syntax), pointer-to-pointer arguments, class templates and types inside namespaces (dwt2d 4, not re-counted after the namespace change)
 
 ## 메모
 
