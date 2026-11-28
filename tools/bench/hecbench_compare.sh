@@ -31,7 +31,9 @@ for b in $(ls $H | grep -- '-cuda$'); do
     d=$OUT/work/$tool/$b; rm -rf $d; mkdir -p $(dirname $d); cp -r $H/$b $d
     ( cd $d
       if [ $tool = ocu ]; then
-        source $OCU_ENV >/dev/null; export OCU_BACKEND=opencl
+        # OCU_TARGET too: 16 HeCBench Makefiles do not pass EXTRA_CFLAGS on
+        # to the compiler (they would otherwise get CPU-target builds)
+        source $OCU_ENV >/dev/null; export OCU_BACKEND=opencl OCU_TARGET=spirv
         CCV="ocu-nvcc"; EX="--ocu-target=spirv"
       else
         export PATH=$CHIPSTAR/bin:$PATH LD_LIBRARY_PATH=$CHIPSTAR/lib CHIP_LOGLEVEL=err
