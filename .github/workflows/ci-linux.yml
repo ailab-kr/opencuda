@@ -37,7 +37,9 @@ jobs:
       - name: Install toolchains
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake ninja-build python3 clang
+          sudo apt-get install -y --no-install-recommends cmake ninja-build python3 clang clang-19
+          # with Clang 18 the CUDA device pass failed on GCC 14's <limits> (__float128)
+          echo /usr/lib/llvm-19/bin >> "$GITHUB_PATH"
       - name: Configure
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
@@ -81,7 +83,9 @@ jobs:
       - name: Install toolchains
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake ninja-build python3 clang
+          sudo apt-get install -y --no-install-recommends cmake ninja-build python3 clang clang-19
+          # with Clang 18 the CUDA device pass failed on GCC 14's <limits> (__float128)
+          echo /usr/lib/llvm-19/bin >> "$GITHUB_PATH"
       - name: Configure
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
